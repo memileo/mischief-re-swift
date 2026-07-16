@@ -8,7 +8,7 @@ Swift port of [**mischief-re** by m1el](https://github.com/m1el/mischief-re) (fo
 
 [Blender GP import plugin.](https://github.com/memileo/mischief_gp_importer)
 #### **artparser:**  *macOS 12+ and Linux*
-Command line tool that outputs json print of an .art-file. An addition in this port is phase unwrapping for the pen pressure, which produce a mostly correct result. <small>(Still some issue corner cases. Mostly seen in short/dot-type strokes and art files saved with the lossy compress option and then resaved as uncompressed.)</small>
+Command line tool that outputs json print of an .art-file. An addition in this port is phase unwrapping for the pen pressure, which produce a mostly correct result. <small>(Still some issue corner cases. Mostly seen in short/dot-type strokes and art files saved with the lossy compress option and then resaved without it.)</small>
 
 ```
 Usage: ./artparser <input_file>
@@ -46,18 +46,18 @@ App that contains a quick look extension to preview .art files. Select a file in
 # Compile:
 
 **artparser:**
-1. ```git clone mischief-re-swift```
+1. ```git clone https://github.com/memileo/mischief-re-swift.git```
 2. ```cd mischief-re-swift/Sources/ArtParser```
 3. ```swiftc -whole-module-optimization -O artparser.swift lzunpack.swift EmptyArtData.swift PressureEval.swift -o artparser```
 
 **art2png:**
-1. ```git clone mischief-re-swift```
+1. ```git clone https://github.com/memileo/mischief-re-swift.git```
 2.  ```cd mischief-re-swift```
 3. ```swift build -c release```
 4. Binary and resource bundle compiles to .build/release/
 
 **ArtQuickLook:**
-1. ```git clone mischief-re-swift```
+1. ```git clone https://github.com/memileo/mischief-re-swift.git```
 2. Open the Xcode project in mischief-re-swift/ArtQuickLook
 3. First build **ArtRenderShaders** scheme
 4. Second build **ArtQuickLook** scheme
