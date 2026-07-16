@@ -1,13 +1,12 @@
 #### AI Disclaimer: In large part copy-paste coded with various LLMs.
-Licence: MIT
 
-<img src="256 6.png" style="display: block; margin-left: 18%; "/>
+<img width="256" height="256" alt="ArtQuickLook icon" src="https://github.com/user-attachments/assets/c6a6d8d0-b173-4a05-a013-69ba5b35be25" />
 
 # art2png    ∙     ArtQuickLook    ∙    artparser swift
 
-Swift fork of [**mischief-re** by m1el](https://github.com/m1el/mischief-re) (for parsing Mischief .art files), as well as a Quick Look Preview extension and command line rendering tool.
+Swift port of [**mischief-re** by m1el](https://github.com/m1el/mischief-re) (for parsing Mischief .art files), as well as a Quick Look Preview extension and command line rendering tool.
 
-[Blender GP import plugin.]()
+[Blender GP import plugin.](https://github.com/memileo/mischief_gp_importer)
 #### **artparser:**  *macOS 12+ and Linux*
 Command line tool that outputs json print of an .art-file. An addition in this port is phase unwrapping for the pen pressure, which produce a mostly correct result. <small>(Still some issue corner cases. Mostly seen in short/dot-type strokes and art files saved with the lossy compress option and then resaved as uncompressed.)</small>
 
@@ -28,7 +27,7 @@ Pipe to less or similar (or try a faster terminal emulator) if the print appears
 Command line tool that renders to PNG using various techniques or exports to JSON.
 **On macOS:** CoreGraphics CPU stamp rendering, Metal stamp rendering, Metal SDF-shape rendering (default if supported). Layer compositing currently only happens on CPU.
 **On Linux:** currently only renders with Cairo via CoreGraphics translation layer Silica and is very slow.
-Used in this Blender Grease Pencil-importer addon that also can import Rnote files - works on both macOS an Linux. [mischief_gp_importer]()
+Used in this Blender Grease Pencil-importer addon that also can import Rnote files - works on both macOS an Linux. [mischief_gp_importer](https://github.com/memileo/mischief_gp_importer)
 
 ```
 Usage: art2png [--option value] <input.art>
