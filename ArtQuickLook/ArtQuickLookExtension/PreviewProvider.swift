@@ -32,26 +32,33 @@ class PreviewProvider: NSViewController, QLPreviewingController {
             return
         }
         
-        // Calculate the scale based on the main screen width.
+        // 1. Get the screen's visible dimensions in POINTS (excluding dock/menu bar)
+        let screenFrame = NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        let screenWidthPts = screenFrame.width
+        let screenHeightPts = screenFrame.height
+        
+    
+        // 2. Calculate native PIXELS for the renderer so it draws at full Retina density
         let backingScaleFactor = NSScreen.main?.backingScaleFactor ?? 1.0
-        let screenWidth = CGFloat(NSScreen.main?.frame.size.width ?? CGFloat(1920)) * CGFloat(backingScaleFactor)
-        let scale: CGFloat = (screenWidth / 1920 * 10).rounded() / 10 // round to circumvent scale crash bug
-
-        // Screen height
-        let screenHeight = Double(NSScreen.main?.frame.size.height ?? 1080) * Double(backingScaleFactor)
-        let height: Double = Double(1920 / screenWidth) * screenHeight
+        let screenWidthPx = screenWidthPts * backingScaleFactor
+        let screenHeightPx = screenHeightPts * backingScaleFactor
         
+        // 3. Original Renderer math (now safely using native pixels)
+        let scale: CGFloat = (screenWidthPx / 1920.0 * 10).rounded() / 10
+        let height: CGFloat = (1920.0 / screenWidthPx) * screenHeightPx
         
-        let canvasSize = CGSize(width: screenWidth, height: height)
+        let canvasSize = CGSize(width: 1920, height: height)
         let renderer = Renderer(canvasSize: canvasSize, scale: scale, forceCPU: false)
         let resultImage = renderer.render(art: art)
         
-        // If renderer returns nil, show a clear diagnostic test image so we still see something
         let cgImageToShow: CGImage
         if let r = resultImage {
             cgImageToShow = r
         } else {
-            guard let test = makeTestImage(w: Int(canvasSize.width), h: Int(canvasSize.height), color: .systemPink) else {
+            // Ensure the test image matches the intended render resolution
+            let pixelWidth = Int(canvasSize.width * scale)
+            let pixelHeight = Int(canvasSize.height * scale)
+            guard let test = makeTestImage(w: pixelWidth, h: pixelHeight, color: .systemPink) else {
                 handler(NSError(domain: "ArtRenderer", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to create test image"]))
                 return
             }
@@ -61,14 +68,20 @@ class PreviewProvider: NSViewController, QLPreviewingController {
         DispatchQueue.main.async {
             self.view.subviews.forEach { $0.removeFromSuperview() }
             
-            let image = NSImage(cgImage: cgImageToShow,
-                                size: NSSize(width: cgImageToShow.width,
-                                             height: cgImageToShow.height))
+            // 4. Calculate the LOGICAL size to display in POINTS.
+            // Cap it at 1920 points, but shrink it if the screen is smaller (e.g., 1440pts)
+            let displayWidthPts = min(screenWidthPts, 1920)
+            // Maintain the exact aspect ratio calculated above
+            let displayHeightPts = displayWidthPts * (height / 1920.0)
+            let logicalSize = NSSize(width: displayWidthPts, height: displayHeightPts)
+            
+            // 5. Wrap the high-res CGImage in an NSImage with the LOGICAL point size
+            let image = NSImage(cgImage: cgImageToShow, size: logicalSize)
             
             let iv = NSImageView()
             iv.translatesAutoresizingMaskIntoConstraints = false
             iv.image = image
-            iv.imageScaling = .NSScaleProportionally
+            iv.imageScaling = .scaleProportionallyUpOrDown
             iv.wantsLayer = true
             iv.layer?.masksToBounds = true
             
@@ -81,8 +94,8 @@ class PreviewProvider: NSViewController, QLPreviewingController {
                 iv.bottomAnchor.constraint(equalTo: self.view.bottomAnchor)
             ])
             
-            // preferredContentSize is only a *hint*
-            self.preferredContentSize = image.size
+            // preferredContentSize is only a *hint*, but now it's a perfectly sized hint
+            self.preferredContentSize = logicalSize
             
             handler(nil)
         }
