@@ -42,7 +42,10 @@ Usage: art2png [--option value] <input.art>
 ```
 
 ## **ArtQuickLook:** *macOS 12+*
-App that contains a quick look extension to preview .art files. Select a file in Finder and press spacebar to render a preview.
+App that contains a quick look extension to preview .art files. Select a file in Finder and press spacebar to get a preview.
+
+<img width="382" height="253" alt="preview-screencap_03" src="https://github.com/user-attachments/assets/72a38959-64f8-4062-bd98-827fc7fbf74d" />
+
 
 # Compile:
 
