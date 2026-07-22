@@ -68,34 +68,35 @@ class PreviewProvider: NSViewController, QLPreviewingController {
         DispatchQueue.main.async {
             self.view.subviews.forEach { $0.removeFromSuperview() }
             
-            // 4. Calculate the LOGICAL size to display in POINTS.
-            // Cap it at 1920 points, but shrink it if the screen is smaller (e.g., 1440pts)
-            let displayWidthPts = min(screenWidthPts, 1920)
-            // Maintain the exact aspect ratio calculated above
-            let displayHeightPts = displayWidthPts * (height / 1920.0)
-            let logicalSize = NSSize(width: displayWidthPts, height: displayHeightPts)
+            // 1. Replace NSImageView with a basic NSView
+            let imageView = NSView()
+            imageView.translatesAutoresizingMaskIntoConstraints = false
+            imageView.wantsLayer = true
             
-            // 5. Wrap the high-res CGImage in an NSImage with the LOGICAL point size
-            let image = NSImage(cgImage: cgImageToShow, size: logicalSize)
+            // 2. Assign the CGImage directly to the layer
+            imageView.layer?.contents = cgImageToShow
             
-            let iv = NSImageView()
-            iv.translatesAutoresizingMaskIntoConstraints = false
-            iv.image = image
-            iv.imageScaling = .scaleProportionallyUpOrDown
-            iv.wantsLayer = true
-            iv.layer?.masksToBounds = true
+            // 3. .resizeAspect scales the image proportionally to fit the view bounds.
+            // It acts exactly like .scaleProportionallyUpOrDown, but at the GPU level.
+            imageView.layer?.contentsGravity = .resizeAspect
+            imageView.layer?.masksToBounds = true
             
-            self.view.addSubview(iv)
+            // 4. Crucial for Retina: Tell the layer how many pixels per point to use
+            // so it maps the 2x backing pixels to the 1x logical points perfectly.
+            let backingScaleFactor = NSScreen.main?.backingScaleFactor ?? 1.0
+            imageView.layer?.contentsScale = backingScaleFactor
+            
+            self.view.addSubview(imageView)
             
             NSLayoutConstraint.activate([
-                iv.leadingAnchor.constraint(equalTo: self.view.leadingAnchor),
-                iv.trailingAnchor.constraint(equalTo: self.view.trailingAnchor),
-                iv.topAnchor.constraint(equalTo: self.view.topAnchor),
-                iv.bottomAnchor.constraint(equalTo: self.view.bottomAnchor)
+                imageView.leadingAnchor.constraint(equalTo: self.view.leadingAnchor),
+                imageView.trailingAnchor.constraint(equalTo: self.view.trailingAnchor),
+                imageView.topAnchor.constraint(equalTo: self.view.topAnchor),
+                imageView.bottomAnchor.constraint(equalTo: self.view.bottomAnchor)
             ])
             
-            // preferredContentSize is only a *hint*, but now it's a perfectly sized hint
-            self.preferredContentSize = logicalSize
+            // Tell QuickLook the natural size is 1920x...
+            self.preferredContentSize = canvasSize
             
             handler(nil)
         }
