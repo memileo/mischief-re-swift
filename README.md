@@ -1,6 +1,7 @@
 #### AI Disclaimer: In large part copy-paste coded with various LLMs.
-
+<picture>
 <img width="256" height="256" alt="ArtQuickLook icon" src="https://github.com/user-attachments/assets/c6a6d8d0-b173-4a05-a013-69ba5b35be25" />
+</picture>
 
 # art2png    ∙     ArtQuickLook    ∙    artparser swift
 
@@ -44,8 +45,9 @@ Usage: art2png [--option value] <input.art>
 ## **ArtQuickLook:** *macOS 12+*
 App that contains a quick look extension to preview .art files. Select a file in Finder and press spacebar to get a preview.
 
+<picture>
 <img width="382" height="253" alt="preview-screencap_03" src="https://github.com/user-attachments/assets/72a38959-64f8-4062-bd98-827fc7fbf74d" />
-
+</picture>
 
 # Compile:
 
