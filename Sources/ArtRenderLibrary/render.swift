@@ -1163,7 +1163,7 @@ public final class Renderer {
         }
         
         let layerTransform = transformFromMatrix(matrix)
-        let artToDevice = CGAffineTransformConcat(baseTransform, layerTransform)
+        let artToDevice = CGAffineTransformConcat(layerTransform, baseTransform)
         
         // Create a temporary context for this layer
         let layerContext = createBitmapContext(size: canvasSize, scale: scale)
@@ -4252,13 +4252,6 @@ public final class Renderer {
         #endif
     }
     
-    func applyHorizontalMirrorToRawPoints(_ raw: [Point], canvasHeight: CGFloat) -> [Point] {
-        return raw.map { p in
-            // if raw coordinates are Int/Float in same coordinate space as canvas
-            let mirroredY = Float(canvasHeight) - p.y
-            return Point(x: p.x, y: mirroredY, p: p.p)
-        }
-    }
 }
 
 // MARK: - Test Function with Background Applied AFTER Strokes. Remove?
