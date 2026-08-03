@@ -124,7 +124,8 @@ inline SDFResult sdSplineSegment(float2 p, float2 p0, float2 p1, float2 p2, floa
     }
     
     float2 p_curve = getSplinePos(p0, p1, p2, p3, t);
-    float current_radius = mix(ra, rb, smoothstep(0.0f, 1.0f, t));
+//    float current_radius = mix(ra, rb, smoothstep(0.0f, 1.0f, t));
+    float current_radius = mix(ra, rb, t);
     
     float dist = fast::length(p - p_curve) - current_radius;
     
@@ -139,27 +140,20 @@ inline SDFResult sdSplineSegment(float2 p, float2 p0, float2 p1, float2 p2, floa
 inline SDFResult sdSoftEnvelopeSpline(float2 p, float2 p0, float2 p1, float2 p2, float2 p3, float ra, float rb) {
     float strokeSDF = 1e20f;
     float best_t = 0.0f;
-    const int SAMPLES = 5;
-    
-    // Lower k to tighten the silhouette and prevent bulging
-    float k = max(ra, rb) * 0.04f;
-    if (k < 1e-5f) k = 1e-5f;
+    const int SAMPLES = 9;
     
     for (int i = 0; i <= SAMPLES; i++) {
         float t = float(i) / float(SAMPLES);
         float2 p_curve = getSplinePos(p0, p1, p2, p3, t);
         
-        float radius = (mix(ra, rb, t) - k) * 1.028;
+        // Exact mathematical radius, matching Shape 0 and Shape 1
+        float radius = mix(ra, rb, t);
         float d_sample = fast::length(p - p_curve) - radius;
         
-        if (i == 0) {
+        // Simple minimum is perfectly continuous across segments and has no bulge
+        if (d_sample < strokeSDF) {
             strokeSDF = d_sample;
             best_t = t;
-        } else {
-            float h = fast::clamp(0.5f + 0.5f * (d_sample - strokeSDF) / k, 0.0f, 1.0f);
-            float w = 1.0f - h;
-            best_t = mix(best_t, t, w);
-            strokeSDF = mix(d_sample, strokeSDF, h) - k * h * (1.0f - h);
         }
     }
     
@@ -313,7 +307,9 @@ kernel void segmentAACompositeKernel(
             maxCoverage = stamped;
 #ifdef DEBUG_SEGMENT_COLORS
             float rand = fract(sin(float(segIdx) * 12.9898) * 43758.5453);
-            debugColor = float3(rand, fract(rand * 1.3), fract(rand * 1.7));
+//            debugColor = float3(rand, fract(rand * 1.3), fract(rand * 1.7));
+            
+            debugColor = float3( (seg.segmentType + 0.002) / 2, (seg.segmentType + 0.002) / 2, (seg.segmentType + 0.002) / 2  );
 #endif
         }
     }
@@ -389,7 +385,8 @@ kernel void segmentNoiseCompositeKernel(
             t = res.t;
         }
         
-        float radius = mix(seg.radius0, seg.radius1, smoothstep(0.0f, 1.0f, t));
+//        float radius = mix(seg.radius0, seg.radius1, smoothstep(0.0f, 1.0f, t));
+        float radius = mix(seg.radius0, seg.radius1, t);
         float opacity = mix(seg.opacity0, seg.opacity1, t);
         
         float dist = signedDist + radius;

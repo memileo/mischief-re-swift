@@ -1666,12 +1666,12 @@ class MetalRenderer {
         // Marker capsule extends ±4r along the 45° axis from each spline point.
         // Projection onto x/y ≈ ±2√2·r, plus the radius itself for thickness.
         // Total padding ≈ (1 + 2√2) · maxRadius ≈ 3.83 · maxRadius.
-        let paddingScale: Float = isMarker ? (1.0 + 2.0 * sqrt(2.0)) : 1.0
+        let paddingScale: Float = isMarker ? (1.0 + 2.0 * sqrt(2.0)) : 1.4 // extra padding for noise strokes 1.4 from 1.0, not sure if needed
         
         // --- PASS 1: Count overlaps per tile ---
         for seg in segments {
             let maxRadius = max(seg.radius0, seg.radius1)
-            let padding = maxRadius * paddingScale
+            let padding = (maxRadius * paddingScale) + 1.0 // Added +1.0 for AA. Might not be needed
             
             let minX = min(seg.p1.x, seg.p2.x) - padding
             let maxX = max(seg.p1.x, seg.p2.x) + padding
@@ -1710,7 +1710,7 @@ class MetalRenderer {
         
         for (i, seg) in segments.enumerated() {
             let maxRadius = max(seg.radius0, seg.radius1)
-            let padding = maxRadius * paddingScale
+            let padding = (maxRadius * paddingScale) + 1.0 // Added +1.0 for AA. Might not be needed
             
             let minX = min(seg.p1.x, seg.p2.x) - padding
             let maxX = max(seg.p1.x, seg.p2.x) + padding

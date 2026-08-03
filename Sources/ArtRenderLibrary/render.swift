@@ -2492,13 +2492,13 @@ public final class Renderer {
     // Exact mathematical subdivision of a Catmull-Rom span (CGPoint)
     func subdivideCRPoint(_ span: CRPointSpan) -> (CRPointSpan, CRPointSpan) {
         let p0 = span.p0, p1 = span.p1, p2 = span.p2, p3 = span.p3
-
+        
         // Convert CR to Bezier
         let b0 = p1
         let b1 = CGPoint(x: p1.x + (p2.x - p0.x) / 6.0, y: p1.y + (p2.y - p0.y) / 6.0)
         let b2 = CGPoint(x: p2.x - (p3.x - p1.x) / 6.0, y: p2.y - (p3.y - p1.y) / 6.0)
         let b3 = p2
-
+        
         // De Casteljau split at t=0.5
         let m01 = CGPoint(x: (b0.x + b1.x) / 2.0, y: (b0.y + b1.y) / 2.0)
         let m12 = CGPoint(x: (b1.x + b2.x) / 2.0, y: (b1.y + b2.y) / 2.0)
@@ -2506,55 +2506,52 @@ public final class Renderer {
         let m012 = CGPoint(x: (m01.x + m12.x) / 2.0, y: (m01.y + m12.y) / 2.0)
         let m123 = CGPoint(x: (m12.x + m23.x) / 2.0, y: (m12.y + m23.y) / 2.0)
         let m = CGPoint(x: (m012.x + m123.x) / 2.0, y: (m012.y + m123.y) / 2.0)
-
-        // Left Bezier: b0, m01, m012, m
-        // Right Bezier: m, m123, m23, b3
-
+        
         // Convert Left Bezier back to CR
-        let l_p0 = CGPoint(x: 2.0 * b0.x - m01.x, y: 2.0 * b0.y - m01.y)
+        let l_p0 = CGPoint(x: m.x - 6.0 * (m01.x - b0.x), y: m.y - 6.0 * (m01.y - b0.y))
         let l_p1 = b0
         let l_p2 = m
-        let l_p3 = CGPoint(x: m.x + 6.0 * (m.x - m012.x), y: m.y + 6.0 * (m.y - m012.y))
+        let l_p3 = CGPoint(x: b0.x + 6.0 * (m.x - m012.x), y: b0.y + 6.0 * (m.y - m012.y))
         let left = CRPointSpan(p0: l_p0, p1: l_p1, p2: l_p2, p3: l_p3)
-
+        
         // Convert Right Bezier back to CR
-        let r_p0 = CGPoint(x: m.x - 6.0 * (m123.x - m.x), y: m.y - 6.0 * (m123.y - m.y))
+        let r_p0 = CGPoint(x: b3.x - 6.0 * (m123.x - m.x), y: b3.y - 6.0 * (m123.y - m.y))
         let r_p1 = m
         let r_p2 = b3
-        let r_p3 = CGPoint(x: 2.0 * b3.x - m23.x, y: 2.0 * b3.y - m23.y)
+        let r_p3 = CGPoint(x: m.x + 6.0 * (b3.x - m23.x), y: m.y + 6.0 * (b3.y - m23.y))
         let right = CRPointSpan(p0: r_p0, p1: r_p1, p2: r_p2, p3: r_p3)
-
+        
         return (left, right)
     }
     
     // Exact mathematical subdivision of a Catmull-Rom span (CGFloat)
     func subdivideCRScalar(_ span: CRScalarSpan) -> (CRScalarSpan, CRScalarSpan) {
         let s0 = span.s0, s1 = span.s1, s2 = span.s2, s3 = span.s3
-
+        
         let b0 = s1
         let b1 = s1 + (s2 - s0) / 6.0
         let b2 = s2 - (s3 - s1) / 6.0
         let b3 = s2
-
+        
         let m01 = (b0 + b1) / 2.0
         let m12 = (b1 + b2) / 2.0
         let m23 = (b2 + b3) / 2.0
         let m012 = (m01 + m12) / 2.0
         let m123 = (m12 + m23) / 2.0
         let m = (m012 + m123) / 2.0
-
-        let l_s0 = 2.0 * b0 - m01
+        
+        let l_s0 = m - 6.0 * (m01 - b0)
         let l_s1 = b0
         let l_s2 = m
-        let l_s3 = m + 6.0 * (m - m012)
+        let l_s3 = b0 + 6.0 * (m - m012)
         let left = CRScalarSpan(s0: l_s0, s1: l_s1, s2: l_s2, s3: l_s3)
-
-        let r_s0 = m - 6.0 * (m123 - m)
+        
+        let r_s0 = b3 - 6.0 * (m123 - m)
         let r_s1 = m
         let r_s2 = b3
-        let r_s3 = 2.0 * b3 - m23
+        let r_s3 = m + 6.0 * (b3 - m23)
         let right = CRScalarSpan(s0: r_s0, s1: r_s1, s2: r_s2, s3: r_s3)
-
+        
         return (left, right)
     }
     
@@ -2613,7 +2610,13 @@ public final class Renderer {
         
         if !needsSubdivide || depth > 8 {
             let r_max = max(r1, r2)
-            let shape2_max_len = 5.0 * max(0.0, (r_max - 0.82) * abs(r1 - r2))
+            
+            // Changed from 1.5 to 1.0 for more overlap.
+            // This allows the shader to use a simple `min` instead of `smin`,
+            let shape2_max_len = min(
+                5.0 * max(0.0, (r_max - 0.82) * abs(r1 - r2)),
+                1.0 * r_max
+            )
             
             var segmentType: UInt32 = 0
             if h_chord <= shape2_max_len || h_chord < 1.0 {
