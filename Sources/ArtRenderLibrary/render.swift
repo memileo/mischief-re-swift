@@ -2633,6 +2633,12 @@ public final class Renderer {
     }
     
     func flattenAndBuild(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRScalarSpan, seed: UInt32, depth: Int = 0, into segments: inout [GPUSplineSegment], isPolyline: Bool) {
+        
+        if isPolyline {
+            flattenPolyline(span: span, rSpan: rSpan, oSpan: oSpan, seed: seed, into: &segments)
+            return
+        }
+        
         let p0 = span.p0, p1 = span.p1, p2 = span.p2, p3 = span.p3
         let r1 = rSpan.s1, r2 = rSpan.s2
         let o1 = oSpan.s1, o2 = oSpan.s2
@@ -2648,7 +2654,6 @@ public final class Renderer {
         var needsSubdivide = false
         if h_chord > 500.0 { needsSubdivide = true }
         if !isSafeAngle(v0, v1) || !isSafeAngle(v1, v2) { needsSubdivide = true }
-        if isPolyline { needsSubdivide = false }
         
         if !needsSubdivide || depth > 8 {
             let r_max = max(r1, r2)
@@ -2663,7 +2668,7 @@ public final class Renderer {
             var segmentType: UInt32 = 0
             if h_chord <= shape2_max_len || h_chord < 1.0 {
                 segmentType = 2
-            } else if isStraightAngle(v0, v1) && isStraightAngle(v1, v2) || isPolyline {
+            } else if isStraightAngle(v0, v1) && isStraightAngle(v1, v2) {
                 segmentType = 0
             } else {
                 segmentType = 1
@@ -2689,6 +2694,62 @@ public final class Renderer {
         
         flattenAndBuild(span: leftP, rSpan: leftR, oSpan: leftO, seed: seed, depth: depth + 1, into: &segments, isPolyline: isPolyline)
         flattenAndBuild(span: rightP, rSpan: rightR, oSpan: rightO, seed: seed, depth: depth + 1, into: &segments, isPolyline: isPolyline)
+    }
+    
+    func flattenPolyline(
+        span: CRPointSpan,
+        rSpan: CRScalarSpan,
+        oSpan: CRScalarSpan,
+        seed: UInt32,
+        into segments: inout [GPUSplineSegment]
+    ) {
+        let p1 = span.p1, p2 = span.p2
+        let dx = p2.x - p1.x, dy = p2.y - p1.y
+        let len = hypot(dx, dy)
+        
+        // 1. Base target length on the maximum radius of this span
+        let r_max = max(rSpan.s1, rSpan.s2)
+        
+        // 2. Determine how many radii long a segment should be.
+        // Adjust this multiplier based on visual testing (e.g. 2.0 to 8.0).
+        let radiusMultiplier: CGFloat = 0.5
+        
+        // We use max(..., 4.0) as a hard floor to prevent infinite subdivisions
+        // or millions of segments if the radius is 0 or extremely small.
+        let targetLen = max(4.0, r_max * radiusMultiplier)
+        
+        let n = max(1, Int((len / targetLen).rounded(.up)))
+        let invN = 1.0 / CGFloat(n)
+        
+        // 3. Emit segments
+        for i in 0..<n {
+            let t0 = CGFloat(i) * invN
+            let t1 = CGFloat(i + 1) * invN
+            
+            let a = CGPoint(x: p1.x + dx * t0, y: p1.y + dy * t0)
+            let b = CGPoint(x: p1.x + dx * t1, y: p1.y + dy * t1)
+            
+            // Straight extrapolation for tangent hints
+            let a0 = CGPoint(x: 2 * a.x - b.x, y: 2 * a.y - b.y)
+            let b3 = CGPoint(x: 2 * b.x - a.x, y: 2 * b.y - a.y)
+            
+            // Linearly interpolate radius and opacity
+            let r0 = rSpan.s1 + (rSpan.s2 - rSpan.s1) * t0
+            let r1 = rSpan.s1 + (rSpan.s2 - rSpan.s1) * t1
+            let o0 = oSpan.s1 + (oSpan.s2 - oSpan.s1) * t0
+            let o1 = oSpan.s1 + (oSpan.s2 - oSpan.s1) * t1
+            
+            segments.append(GPUSplineSegment(
+                p0: SIMD2<Float>(Float(a0.x), Float(a0.y)),
+                p1: SIMD2<Float>(Float(a.x),  Float(a.y)),
+                p2: SIMD2<Float>(Float(b.x),  Float(b.y)),
+                p3: SIMD2<Float>(Float(b3.x), Float(b3.y)),
+                radius0: Float(r0), radius1: Float(r1),
+                opacity0: Float(o0), opacity1: Float(o1),
+                segmentType: 0,
+                noiseSeed: seed
+            ))
+        }
     }
 #endif
 //    func flattenSpan(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRScalarSpan, depth: Int = 0, into points: inout [FlatPoint]) {

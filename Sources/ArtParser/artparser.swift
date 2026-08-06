@@ -1408,7 +1408,7 @@ public struct ArtParser {
         let actionCount = Int(readUInt32LE())
         
         // Validate action count to prevent excessive memory usage
-        if actionCount < 0 || actionCount > 100000 {
+        if actionCount < 0 || actionCount > 2_000_000 {
             print("Warning: Invalid action count \(actionCount), resetting to 0")
             actions = []
             return
