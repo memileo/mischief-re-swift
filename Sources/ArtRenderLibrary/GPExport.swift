@@ -135,7 +135,7 @@ extension Renderer {
                 let stampStepPx = targetStepInDevicePx / totalArtToDeviceScale
 
                 let splinePoints = buildResampledStrokeWithSpline(
-                    stroke.points, stepPx: stampStepPx, samplesPerSegment: 6, gamma: 1.0
+                    stroke.points, stepPx: stampStepPx, samplesPerSegment: 6, gamma: 1.0, isPolyline: stroke.isPolyline
                 )
                 let resampledArt: [ResampledPoint] = splinePoints.map { p in
                     ResampledPoint(x: CGFloat(p.x), y: CGFloat(p.y), p: p.p)

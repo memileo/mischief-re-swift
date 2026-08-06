@@ -1447,11 +1447,52 @@ public final class Renderer {
                         points: rawPoints,
                         pen: currentPen,
                         penMatrixScale: penMatrixScale,
-                        penMatrixAffine: currentPen.penMatrixAffine
+                        penMatrixAffine: currentPen.penMatrixAffine,
+                        isPolyline: false
                     )
 //                    if let first = rawPoints.first, let last = rawPoints.last {
 //                        print("[P][stroke record] points=\(rawPoints.count) p.first=\(first.p) p.last=\(last.p) pen.opacity=\(currentPen.opacity) pen.opacityMin=\(currentPen.opacityMin)")
 //                    }
+                    
+                    layerStrokes.append(rec)
+                }
+            
+            case "polyline" :
+                if let pts = action["points"] as? [[String: Any]], !pts.isEmpty {
+                    // Parse points
+                    func toFloat(_ v: Any?) -> Float {
+                        if let f = v as? Float { return f }
+                        if let d = v as? Double { return Float(d) }
+                        if let i = v as? Int { return Float(i) }
+                        if let s = v as? String, let d = Double(s) { return Float(d) }
+                        return 0.0
+                    }
+                    
+                    func toInt(_ v: Any?) -> Int {
+                        if let i = v as? Int { return i }
+                        if let f = v as? Float { return Int(f) }
+                        if let d = v as? Double { return Int(d) }
+                        if let s = v as? String, let d = Int(s) { return d }
+                        return 0
+                    }
+                    
+                    let rawPoints: [Point] = pts.map { dict in
+                        let x = toFloat(dict["x"])
+                        let y = toFloat(dict["y"])
+                        let p = toFloat(dict["p"])
+                        //                        print("[P][raw point] x=\(x) y=\(y) p(raw)=\(p)")
+                        return Point(x: x, y: y, p: p)
+                    }
+                    
+                    // Create StrokeRecord
+                    let rec = StrokeRecord(
+                        points: rawPoints,
+                        pen: currentPen,
+                        penMatrixScale: penMatrixScale,
+                        penMatrixAffine: currentPen.penMatrixAffine,
+                        isPolyline: true
+                    )
+//                    print("POLYLINE")
                     
                     layerStrokes.append(rec)
                 }
@@ -1583,7 +1624,7 @@ public final class Renderer {
                         let pSpan = CRPointSpan(p0: pts[i-1], p1: pts[i], p2: pts[i+1], p3: pts[i+2])
                         let rSpan = CRScalarSpan(s0: rads[i-1], s1: rads[i], s2: rads[i+1], s3: rads[i+2])
                         let oSpan = CRScalarSpan(s0: opas[i-1], s1: opas[i], s2: opas[i+1], s3: opas[i+2])
-                        flattenAndBuild(span: pSpan, rSpan: rSpan, oSpan: oSpan, seed: seed, depth: 0, into: &segmentsForStroke)
+                        flattenAndBuild(span: pSpan, rSpan: rSpan, oSpan: oSpan, seed: seed, depth: 0, into: &segmentsForStroke, isPolyline: stroke.isPolyline)
                     }
                     
                     segmentGroups.append((segments: segmentsForStroke, color: color, isEraser: stroke.pen.isEraser, isMarker: stroke.pen.isMarker))
@@ -1645,7 +1686,7 @@ public final class Renderer {
                     var resampledArt: [ResampledPoint] = []
                     
 //                    if useSplineGeometryForLayer {
-                        let splinePoints: [Point] = buildResampledStrokeWithSpline(stroke.points, stepPx: stampStepPx, samplesPerSegment: 6, gamma: 1.0)
+                    let splinePoints: [Point] = buildResampledStrokeWithSpline(stroke.points, stepPx: stampStepPx, samplesPerSegment: 6, gamma: 1.0, isPolyline: stroke.isPolyline)
                         resampledArt = splinePoints.map { p in
                             ResampledPoint(x: CGFloat(p.x), y: CGFloat(p.y), p: p.p)
                         }
@@ -1828,7 +1869,7 @@ public final class Renderer {
             
             var resampledArt: [ResampledPoint] = []
             
-                let splinePoints: [Point] = buildResampledStrokeWithSpline(stroke.points, stepPx: stampStepPx, samplesPerSegment: 6, gamma: 1.0)
+            let splinePoints: [Point] = buildResampledStrokeWithSpline(stroke.points, stepPx: stampStepPx, samplesPerSegment: 6, gamma: 1.0, isPolyline: stroke.isPolyline)
                 resampledArt = splinePoints.map { p in
                     ResampledPoint(x: CGFloat(p.x), y: CGFloat(p.y), p: p.p)
                 }
@@ -2591,7 +2632,7 @@ public final class Renderer {
         return dot * dot > len1Sq * len2Sq * 0.998
     }
     
-    func flattenAndBuild(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRScalarSpan, seed: UInt32, depth: Int = 0, into segments: inout [GPUSplineSegment]) {
+    func flattenAndBuild(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRScalarSpan, seed: UInt32, depth: Int = 0, into segments: inout [GPUSplineSegment], isPolyline: Bool) {
         let p0 = span.p0, p1 = span.p1, p2 = span.p2, p3 = span.p3
         let r1 = rSpan.s1, r2 = rSpan.s2
         let o1 = oSpan.s1, o2 = oSpan.s2
@@ -2607,6 +2648,7 @@ public final class Renderer {
         var needsSubdivide = false
         if h_chord > 500.0 { needsSubdivide = true }
         if !isSafeAngle(v0, v1) || !isSafeAngle(v1, v2) { needsSubdivide = true }
+        if isPolyline { needsSubdivide = false }
         
         if !needsSubdivide || depth > 8 {
             let r_max = max(r1, r2)
@@ -2621,7 +2663,7 @@ public final class Renderer {
             var segmentType: UInt32 = 0
             if h_chord <= shape2_max_len || h_chord < 1.0 {
                 segmentType = 2
-            } else if isStraightAngle(v0, v1) && isStraightAngle(v1, v2) {
+            } else if isStraightAngle(v0, v1) && isStraightAngle(v1, v2) || isPolyline {
                 segmentType = 0
             } else {
                 segmentType = 1
@@ -2645,8 +2687,8 @@ public final class Renderer {
         let (leftR, rightR) = subdivideCRScalar(rSpan)
         let (leftO, rightO) = subdivideCRScalar(oSpan)
         
-        flattenAndBuild(span: leftP, rSpan: leftR, oSpan: leftO, seed: seed, depth: depth + 1, into: &segments)
-        flattenAndBuild(span: rightP, rSpan: rightR, oSpan: rightO, seed: seed, depth: depth + 1, into: &segments)
+        flattenAndBuild(span: leftP, rSpan: leftR, oSpan: leftO, seed: seed, depth: depth + 1, into: &segments, isPolyline: isPolyline)
+        flattenAndBuild(span: rightP, rSpan: rightR, oSpan: rightO, seed: seed, depth: depth + 1, into: &segments, isPolyline: isPolyline)
     }
 #endif
 //    func flattenSpan(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRScalarSpan, depth: Int = 0, into points: inout [FlatPoint]) {
@@ -2744,7 +2786,7 @@ public final class Renderer {
     
     
     // Build dense sampled polyline from Catmull-Rom segments and sample pressures along the same param t
-    func buildSplineSamples(_ pts: [Point], samplesPerSegment: Int)
+    func buildSplineSamples(_ pts: [Point], samplesPerSegment: Int, isPolyline: Bool)
     -> (positions: [CGPoint], pressures: [Float])
     {
         // Not enough points → return as-is
@@ -2778,6 +2820,10 @@ public final class Renderer {
             }
             
             return (pos, press)
+        }
+        
+        if isPolyline {
+            return (gpts, pressures)
         }
         
         // Pad ends for standard Catmull-Rom
@@ -2874,7 +2920,7 @@ public final class Renderer {
     
     // Full pipeline: spline -> dense samples -> arc-length table -> uniform sampling
     // Optimized resampling with early rejection and bounds checking
-    func buildResampledStrokeWithSpline(_ raw: [Point], stepPx: CGFloat, samplesPerSegment: Int = 6, gamma: Float = 1.0) -> [Point] {
+    func buildResampledStrokeWithSpline(_ raw: [Point], stepPx: CGFloat, samplesPerSegment: Int = 6, gamma: Float = 1.0, isPolyline: Bool) -> [Point] {
         guard raw.count > 1 else { return raw }
         
         // Add debug print for input pressure range
@@ -2913,7 +2959,7 @@ public final class Renderer {
         }
         
         // Early rejection for degenerate strokes
-        let (poly, pressures) = buildSplineSamples(clamped, samplesPerSegment: samplesPerSegment)
+        let (poly, pressures) = buildSplineSamples(clamped, samplesPerSegment: samplesPerSegment, isPolyline: isPolyline)
         guard poly.count > 1 else {
 //            monitor.endTimer("resampling")
             return clamped
@@ -4323,4 +4369,5 @@ struct StrokeRecord {
     var pen: PenInfo
     var penMatrixScale: CGFloat
     var penMatrixAffine: CGAffineTransform?
+    var isPolyline: Bool
 }
