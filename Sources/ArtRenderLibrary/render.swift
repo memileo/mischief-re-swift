@@ -1540,51 +1540,41 @@ public final class Renderer {
                     let cosA = cos(angle)
                     let sinA = sin(angle)
                     
-                    // translate(cx, cy) -> rotate(angle) -> translate(-rx/2, -ry/2)
                     let tx = -rx / 2.0
                     let ty = -ry / 2.0
                     
-                    let segments = 24
+                    // Generate points directly on the true ellipse.
+                    let segments = 128 // 96
                     let twoPi: Float = 2.0 * .pi
                     
-                    var ring: [Point] = []
-                    ring.reserveCapacity(segments)
+                    var pts: [Point] = []
+                    pts.reserveCapacity(segments + 1)
                     for i in 0..<segments {
                         let t = Float(i) / Float(segments) * twoPi
-                        
-                        // 1. Base ellipse point at origin (0,0)
                         let ex = rx * cos(t)
                         let ey = ry * sin(t)
                         
-                        // 2. Pre-rotation translate (tx, ty)
                         let ox = ex + tx
                         let oy = ey + ty
                         
-                        // 3. Rotate by angle
                         let rotX = ox * cosA - oy * sinA
                         let rotY = ox * sinA + oy * cosA
                         
-                        // 4. Translate to cx, cy
-                        let px = cx + rotX
-                        let py = cy + rotY
-                        
-                        ring.append(Point(x: px, y: py, p: 1.0))
+                        pts.append(Point(x: cx + rotX, y: cy + rotY, p: 1.0))
                     }
                     
-                    // Closed Catmull-Rom wrap:
-                    var pts: [Point] = []
-                    pts.reserveCapacity(segments + 3)
-                    pts.append(ring[ring.count - 1])
-                    pts.append(contentsOf: ring)
-                    pts.append(ring[0])
-                    pts.append(ring[1])
+                    // Explicitly close the loop for the polyline renderer
+                    if let firstPt = pts.first {
+                        pts.append(firstPt)
+                    }
                     
+                    // Render as a dense polyline
                     let rec = StrokeRecord(
                         points: pts,
                         pen: currentPen,
                         penMatrixScale: penMatrixScale,
                         penMatrixAffine: currentPen.penMatrixAffine,
-                        isPolyline: false
+                        isPolyline: true
                     )
                     layerStrokes.append(rec)
                 }
