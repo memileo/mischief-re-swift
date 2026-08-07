@@ -1171,7 +1171,6 @@ public final class Renderer {
         
         // Collect all strokes for this layer
         var layerStrokes: [StrokeRecord] = []
-        var vectorActions: [([String: Any])] = []
         
         // Process actions for this layer
         var currentPen = defaultPenInfo()
@@ -1497,8 +1496,98 @@ public final class Renderer {
                     layerStrokes.append(rec)
                 }
                 
-            case "rect", "ellipse":
-                vectorActions.append(action)
+            case "rect":
+                if let x = action["x"] as? Float,
+                   let y = action["y"] as? Float,
+                   let w = action["w"] as? Float,
+                   let h = action["h"] as? Float {
+                    let angle = action["angle"] as? Float ?? 0.0
+                    let cosA = cos(angle)
+                    let sinA = sin(angle)
+                    
+                    let halfW = w * 0.5
+                    let halfH = h * 0.5
+                    let localCorners: [(Float, Float)] = [
+                        (-halfW, -halfH),
+                        ( halfW, -halfH),
+                        ( halfW,  halfH),
+                        (-halfW,  halfH),
+                        (-halfW, -halfH)
+                    ]
+                    
+                    let pts: [Point] = localCorners.map { (dx, dy) in
+                        let rx = dx * cosA - dy * sinA
+                        let ry = dx * sinA + dy * cosA
+                        return Point(x: x + rx, y: y + ry, p: 1.0)
+                    }
+                    
+                    let rec = StrokeRecord(
+                        points: pts,
+                        pen: currentPen,
+                        penMatrixScale: penMatrixScale,
+                        penMatrixAffine: currentPen.penMatrixAffine,
+                        isPolyline: true
+                    )
+                    layerStrokes.append(rec)
+                }
+                
+            case "ellipse":
+                if let cx = action["cx"] as? Float,
+                   let cy = action["cy"] as? Float,
+                   let rx = action["rx"] as? Float,
+                   let ry = action["ry"] as? Float {
+                    let angle = action["angle"] as? Float ?? 0.0
+                    let cosA = cos(angle)
+                    let sinA = sin(angle)
+                    
+                    // translate(cx, cy) -> rotate(angle) -> translate(-rx/2, -ry/2)
+                    let tx = -rx / 2.0
+                    let ty = -ry / 2.0
+                    
+                    let segments = 24
+                    let twoPi: Float = 2.0 * .pi
+                    
+                    var ring: [Point] = []
+                    ring.reserveCapacity(segments)
+                    for i in 0..<segments {
+                        let t = Float(i) / Float(segments) * twoPi
+                        
+                        // 1. Base ellipse point at origin (0,0)
+                        let ex = rx * cos(t)
+                        let ey = ry * sin(t)
+                        
+                        // 2. Pre-rotation translate (tx, ty)
+                        let ox = ex + tx
+                        let oy = ey + ty
+                        
+                        // 3. Rotate by angle
+                        let rotX = ox * cosA - oy * sinA
+                        let rotY = ox * sinA + oy * cosA
+                        
+                        // 4. Translate to cx, cy
+                        let px = cx + rotX
+                        let py = cy + rotY
+                        
+                        ring.append(Point(x: px, y: py, p: 1.0))
+                    }
+                    
+                    // Closed Catmull-Rom wrap:
+                    var pts: [Point] = []
+                    pts.reserveCapacity(segments + 3)
+                    pts.append(ring[ring.count - 1])
+                    pts.append(contentsOf: ring)
+                    pts.append(ring[0])
+                    pts.append(ring[1])
+                    
+                    let rec = StrokeRecord(
+                        points: pts,
+                        pen: currentPen,
+                        penMatrixScale: penMatrixScale,
+                        penMatrixAffine: currentPen.penMatrixAffine,
+                        isPolyline: false
+                    )
+                    layerStrokes.append(rec)
+                }
                 
             default:
                 break
@@ -1624,7 +1713,7 @@ public final class Renderer {
                         let pSpan = CRPointSpan(p0: pts[i-1], p1: pts[i], p2: pts[i+1], p3: pts[i+2])
                         let rSpan = CRScalarSpan(s0: rads[i-1], s1: rads[i], s2: rads[i+1], s3: rads[i+2])
                         let oSpan = CRScalarSpan(s0: opas[i-1], s1: opas[i], s2: opas[i+1], s3: opas[i+2])
-                        flattenAndBuild(span: pSpan, rSpan: rSpan, oSpan: oSpan, seed: seed, depth: 0, into: &segmentsForStroke, isPolyline: stroke.isPolyline)
+                        flattenAndBuild(span: pSpan, rSpan: rSpan, oSpan: oSpan, seed: seed, depth: 0, into: &segmentsForStroke, isPolyline: stroke.isPolyline, isMarker: stroke.pen.isMarker)
                     }
                     
                     segmentGroups.append((segments: segmentsForStroke, color: color, isEraser: stroke.pen.isEraser, isMarker: stroke.pen.isMarker))
@@ -1644,7 +1733,6 @@ public final class Renderer {
                 print("Segment rendering failed: \(error)")
                 return renderLayerWithCPU(
                     strokes: layerStrokes,
-                    vectorActions: vectorActions,
                     artToDevice: artToDevice,
                     context: layerContext,
                     art: art
@@ -1808,7 +1896,6 @@ public final class Renderer {
                 // Fall back to CPU rendering for this layer
                 return renderLayerWithCPU(
                     strokes: layerStrokes,
-                    vectorActions: vectorActions,
                     artToDevice: artToDevice,
                     context: layerContext,
                     art: art
@@ -1818,7 +1905,6 @@ public final class Renderer {
             // No Metal renderer, no strokes, no layer texture, or GPU rendering disabled - use CPU rendering
             return renderLayerWithCPU(
                 strokes: layerStrokes,
-                vectorActions: vectorActions,
                 artToDevice: artToDevice,
                 context: layerContext,
                 art: art
@@ -1827,7 +1913,6 @@ public final class Renderer {
         #else
         return renderLayerWithCPU(
             strokes: layerStrokes,
-            vectorActions: vectorActions,
             artToDevice: artToDevice,
             context: layerContext,
             art: art
@@ -1838,7 +1923,6 @@ public final class Renderer {
     // CPU Fallback Function
     private func renderLayerWithCPU(
         strokes: [StrokeRecord],
-        vectorActions: [[String: Any]],
         artToDevice: CGAffineTransform,
         context: CGContext,
         art: ArtParser
@@ -1931,33 +2015,7 @@ public final class Renderer {
                 )
             }
         }
-        
-        // Render vector actions
-        for action in vectorActions {
-            let actionName = action["action_name"] as? String ?? ""
-            
-            context.saveGState()
-            context.concatenate(artToDevice)
-            
-            if actionName == "rect",
-               let x = action["x"] as? Float,
-               let y = action["y"] as? Float,
-               let width = action["w"] as? Float,
-               let height = action["h"] as? Float,
-               let angle = action["angle"] as? Float {
-                renderRect(x: CGFloat(x), y: CGFloat(y), width: CGFloat(width), height: CGFloat(height), angle: CGFloat(angle), pen: defaultPenInfo(), in: context)
-            } else if actionName == "ellipse",
-                      let cx = action["cx"] as? Float,
-                      let cy = action["cy"] as? Float,
-                      let rx = action["rx"] as? Float,
-                      let ry = action["ry"] as? Float,
-                      let angle = action["angle"] as? Float {
-                renderEllipse(cx: CGFloat(cx), cy: CGFloat(cy), rx: CGFloat(rx), ry: CGFloat(ry), angle: CGFloat(angle), pen: defaultPenInfo(), in: context)
-            }
-            
-            context.restoreGState()
-        }
-        
+                
         // Render embedded images
         context.saveGState()
         
@@ -2632,7 +2690,7 @@ public final class Renderer {
         return dot * dot > len1Sq * len2Sq * 0.998
     }
     
-    func flattenAndBuild(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRScalarSpan, seed: UInt32, depth: Int = 0, into segments: inout [GPUSplineSegment], isPolyline: Bool) {
+    func flattenAndBuild(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRScalarSpan, seed: UInt32, depth: Int = 0, into segments: inout [GPUSplineSegment], isPolyline: Bool, isMarker: Bool) {
         
         if isPolyline {
             flattenPolyline(span: span, rSpan: rSpan, oSpan: oSpan, seed: seed, into: &segments)
@@ -2653,6 +2711,7 @@ public final class Renderer {
         
         var needsSubdivide = false
         if h_chord > 500.0 { needsSubdivide = true }
+        if isMarker && h_chord > 10.0 { needsSubdivide = true }
         if !isSafeAngle(v0, v1) || !isSafeAngle(v1, v2) { needsSubdivide = true }
         
         if !needsSubdivide || depth > 8 {
@@ -2692,8 +2751,8 @@ public final class Renderer {
         let (leftR, rightR) = subdivideCRScalar(rSpan)
         let (leftO, rightO) = subdivideCRScalar(oSpan)
         
-        flattenAndBuild(span: leftP, rSpan: leftR, oSpan: leftO, seed: seed, depth: depth + 1, into: &segments, isPolyline: isPolyline)
-        flattenAndBuild(span: rightP, rSpan: rightR, oSpan: rightO, seed: seed, depth: depth + 1, into: &segments, isPolyline: isPolyline)
+        flattenAndBuild(span: leftP, rSpan: leftR, oSpan: leftO, seed: seed, depth: depth + 1, into: &segments, isPolyline: isPolyline, isMarker: isMarker)
+        flattenAndBuild(span: rightP, rSpan: rightR, oSpan: rightO, seed: seed, depth: depth + 1, into: &segments, isPolyline: isPolyline, isMarker: isMarker)
     }
     
     func flattenPolyline(
