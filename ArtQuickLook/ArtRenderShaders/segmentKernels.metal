@@ -4,6 +4,7 @@ using namespace metal;
 
 // Uncomment to see individual segments colored randomly
 // #define DEBUG_SEGMENT_COLORS
+// #define DEBUG_CUT_PASTE
 
 // Updated to 64 bytes to hold the 4 Catmull-Rom control points
 struct GPUSplineSegment {
@@ -30,6 +31,47 @@ struct SDFResult {
     float dist;
     float t;
 };
+
+// MARK: - Rectangle SDF (axis-aligned, used for cut + paste mask)
+
+//inline float sdAxisAlignedRect(float2 p, float2 center, float2 halfExtents) {
+//    float2 d = abs(p - center) - halfExtents;
+//    return length(max(d, float2(0.0))) + min(max(d.x, d.y), 0.0);
+//}
+
+// New SDF function for a rotated/skewed box
+float sdOrientedBox(float2 p, float4 center, float4 axisX, float4 axisY) {
+    float2 d = p - center.xy;
+    float lenX = length(axisX.xy);
+    float lenY = length(axisY.xy);
+    
+    if (lenX < 0.0001f || lenY < 0.0001f) return 1e6f;
+    
+    float2 normX = axisX.xy / lenX;
+    float2 normY = axisY.xy / lenY;
+    
+    // Project point onto local axes
+    float lx = dot(d, normX);
+    float ly = dot(d, normY);
+    
+    // Subtract half-extents
+    float2 q = abs(float2(lx, ly)) - float2(lenX, lenY);
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
+}
+
+static inline float2 applyRow(float4 r0, float4 r1, float2 p) {
+    return float2(r0.x*p.x + r0.y*p.y + r0.z,
+                  r1.x*p.x + r1.y*p.y + r1.z);
+}
+static inline float rectMask(float2 p, float4 rect, float edgeWidth) {
+    float2 minP = rect.xy, maxP = rect.xy + rect.zw;
+    float2 d  = max(max(minP - p, p - maxP), 0.0f);
+    float outS = length(d);
+    float inS  = min(min(p.x - minP.x, maxP.x - p.x),
+                     min(p.y - minP.y, maxP.y - p.y));
+    return 1.0f - smootherstep(-edgeWidth, edgeWidth, outS - inS);
+}
+
 
 // Uneven Capsule shape by Inigo Quilez, MIT Lincesed
 // https://www.shadertoy.com/view/4lcBWn
@@ -178,7 +220,7 @@ inline float sdEvenCapsule(float2 pos, float2 pa, float2 pb, float r) {
 //   axis = (1, -1) / √2
 // Capsule length = 4 × diameter = 8r; half-length = 4r.
 inline float sdSlantedMarkerStamp(float2 p, float2 center, float r) {
-    constexpr float2 axis = float2(0.70710678f, -0.70710678f);
+    constexpr float2 axis = float2(-0.70710678f, -0.70710678f);
     float halfLen = 3.0f * r;            // length = 6r from center = 4 × diameter
     float2 pa = center - axis * halfLen;
     float2 pb = center + axis * halfLen;
@@ -448,4 +490,427 @@ kernel void segmentNoiseCompositeKernel(
         }
         target.write(dst, gid);
     }
+}
+
+// MARK: - Paste Layer and Cut Composite Kernels
+
+kernel void segmentPasteLayerAACompositeKernel(
+                                               const device Params              &params       [[buffer(0)]],
+                                               const device GPUSplineSegment    *segments     [[buffer(1)]],
+                                               const device TileIndex           *tileIndices  [[buffer(2)]],
+                                               const device uint32_t            *tileList     [[buffer(3)]],
+                                               const device PasteLayerMeta      &meta         [[buffer(4)]],
+                                               const device PasteMask           *pasteMasks   [[buffer(5)]],
+                                               texture2d<float, access::read_write> target    [[texture(0)]],
+                                               uint2 gid [[thread_position_in_grid]])
+{
+    uint w = target.get_width();
+    uint h = target.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    
+    uint2 tileID     = gid / params.tileSize;
+    uint tileIndex   = tileID.y * params.tilesPerRow + tileID.x;
+    TileIndex tIdx   = tileIndices[tileIndex];
+    
+    // dst GPU → original source GPU (via meta.invAffine = destinationToSourceGPU)
+    float2 dstPos = float2(gid) + float2(0.5f, 0.5f);
+    
+    float2 srcPos = float2(
+                           meta.row0.x * dstPos.x +
+                           meta.row0.y * dstPos.y +
+                           meta.row0.z,
+                           
+                           meta.row1.x * dstPos.x +
+                           meta.row1.y * dstPos.y +
+                           meta.row1.z
+                           );
+    
+    // dst GPU → src GPU → selection frame
+    float maskAlpha = 1.0f;
+#ifdef DEBUG_CUT_PASTE
+    if (meta.maskCount >= 1u) {
+        float2 selectionPos = applyRow(pasteMasks[0].inv0, pasteMasks[0].inv1, srcPos);
+        float2 minP = pasteMasks[0].rect.xy;
+        float2 maxP = minP + pasteMasks[0].rect.zw;
+        float2 d   = max(max(minP - selectionPos, selectionPos - maxP), 0.0f);
+        float  out = length(d);
+        float  inX = min(selectionPos.x - minP.x, maxP.x - selectionPos.x);
+        float  inY = min(selectionPos.y - minP.y, maxP.y - selectionPos.y);
+        float  sd  = out - min(inX, inY);
+        
+        float4 dbg = target.read(gid);
+        if (sd < -meta.edgeWidth)      dbg = float4(0.0, 0.0, 1.0, 1.0);
+        else if (sd < meta.edgeWidth)  dbg = float4(0.0, 1.0, 0.0, 1.0);
+        else return;
+        target.write(dbg, gid);
+        return;
+    }
+#else
+    for (uint mi = 0u; mi < meta.maskCount; ++mi) {
+        float2 selectionPos = applyRow(pasteMasks[mi].inv0, pasteMasks[mi].inv1, srcPos);
+        float m = rectMask(selectionPos, pasteMasks[mi].rect, meta.edgeWidth);
+        maskAlpha *= (pasteMasks[mi].flags.x > 0.5f) ? (1.0f - m) : m;
+    }
+    if (maskAlpha < 0.001f) return;
+#endif
+    
+    float maxCoverage = 0.0f;
+    float t = 0.0f;
+    
+    for (uint i = 0; i < tIdx.count; ++i) {
+        uint segIdx = tileList[tIdx.start + i];
+        GPUSplineSegment seg = segments[segIdx];
+        
+        float signedDist = 1e6f;
+        float segT = 0.0f;
+        
+        if (params.isMarker) {
+            if (seg.segmentType == 0) {
+                SDFResult res = sdSlantedMarkerStraight(srcPos, seg.p1, seg.p2,
+                                                        seg.radius0, seg.radius1);
+                signedDist = res.dist; segT = res.t;
+            } else {
+                SDFResult res = sdSlantedMarkerSpline(srcPos, seg.p0, seg.p1,
+                                                      seg.p2, seg.p3,
+                                                      seg.radius0, seg.radius1);
+                signedDist = res.dist; segT = res.t;
+            }
+        } else if (seg.segmentType == 0) {
+            SDFResult res = sdUnevenCapsule(srcPos, seg.p1, seg.p2,
+                                            seg.radius0, seg.radius1);
+            signedDist = res.dist; segT = res.t;
+        } else if (seg.segmentType == 1) {
+            SDFResult res = sdSplineSegment(srcPos, seg.p0, seg.p1, seg.p2,
+                                            seg.p3, seg.radius0, seg.radius1);
+            signedDist = res.dist; segT = res.t;
+        } else if (seg.segmentType == 2) {
+            SDFResult res = sdSoftEnvelopeSpline(srcPos, seg.p0, seg.p1, seg.p2,
+                                                 seg.p3, seg.radius0, seg.radius1);
+            signedDist = res.dist; segT = res.t;
+        }
+        
+        float opacity = mix(seg.opacity0, seg.opacity1, segT);
+        float detInv = meta.row0.x * meta.row1.y - meta.row0.y * meta.row1.x;
+        float shrink = sqrt(abs(detInv));        // source px per device px (geometric-mean approx)
+        float edgeWidth = 0.94f * shrink;
+        float bias = 0.5f * shrink;
+        float adjustedDist = signedDist + bias;
+        float cov = 1.0f - smootherstep(-edgeWidth, edgeWidth, adjustedDist);
+        float stamped = cov * opacity;
+        if (stamped > maxCoverage) { maxCoverage = stamped; t = segT; }
+    }
+    
+    if (maxCoverage < 0.001f) return;
+    
+    float finalAlpha = maxCoverage * params.penColor.a * maskAlpha;
+    float4 dst = target.read(gid);
+    float3 srcPremul = params.penColor.rgb * finalAlpha;
+    
+    if (params.isEraser) {
+        dst.rgb *= (1.0f - finalAlpha);
+        dst.a   *= (1.0f - finalAlpha);
+    } else {
+        dst.rgb = srcPremul + dst.rgb * (1.0f - finalAlpha);
+        dst.a   = finalAlpha + dst.a * (1.0f - finalAlpha);
+    }
+    target.write(dst, gid);
+}
+
+kernel void segmentPasteLayerNoiseCompositeKernel(
+                                                  const device Params              &params       [[buffer(0)]],
+                                                  const device GPUSplineSegment    *segments     [[buffer(1)]],
+                                                  const device TileIndex           *tileIndices  [[buffer(2)]],
+                                                  const device uint32_t            *tileList     [[buffer(3)]],
+                                                  const device PasteLayerMeta      &meta         [[buffer(4)]],
+                                                  const device PasteMask           *pasteMasks   [[buffer(5)]],
+                                                  texture2d<float, access::read_write> target    [[texture(0)]],
+                                                  texture2d<float, access::sample>  noiseTex     [[texture(1)]],
+                                                  sampler noiseSampler [[sampler(0)]],
+                                                  uint2 gid [[thread_position_in_grid]])
+{
+    uint w = target.get_width();
+    uint h = target.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    
+    uint2 tileID     = gid / params.tileSize;
+    uint tileIndex   = tileID.y * params.tilesPerRow + tileID.x;
+    TileIndex tIdx   = tileIndices[tileIndex];
+    
+    // dst GPU → original source GPU
+    float2 dstPos = float2(gid) + float2(0.5f, 0.5f);
+    
+    float2 srcPos = float2(
+                           meta.row0.x * dstPos.x +
+                           meta.row0.y * dstPos.y +
+                           meta.row0.z,
+                           
+                           meta.row1.x * dstPos.x +
+                           meta.row1.y * dstPos.y +
+                           meta.row1.z
+                           );
+    
+    // dst GPU → src GPU → selection frame
+    float maskAlpha = 1.0f;
+#ifdef DEBUG_CUT_PASTE
+    if (meta.maskCount >= 1u) {
+        float2 selectionPos = applyRow(pasteMasks[0].inv0, pasteMasks[0].inv1, srcPos);
+        float2 minP = pasteMasks[0].rect.xy;
+        float2 maxP = minP + pasteMasks[0].rect.zw;
+        float2 d   = max(max(minP - selectionPos, selectionPos - maxP), 0.0f);
+        float  out = length(d);
+        float  inX = min(selectionPos.x - minP.x, maxP.x - selectionPos.x);
+        float  inY = min(selectionPos.y - minP.y, maxP.y - selectionPos.y);
+        float  sd  = out - min(inX, inY);
+        
+        float4 dbg = target.read(gid);
+        if (sd < -meta.edgeWidth)      dbg = float4(0.0, 0.0, 1.0, 1.0);
+        else if (sd < meta.edgeWidth)  dbg = float4(0.0, 1.0, 0.0, 1.0);
+        else return;
+        target.write(dbg, gid);
+        return;
+    }
+#else
+    for (uint mi = 0u; mi < meta.maskCount; ++mi) {
+        float2 selectionPos = applyRow(pasteMasks[mi].inv0, pasteMasks[mi].inv1, srcPos);
+        float m = rectMask(selectionPos, pasteMasks[mi].rect, meta.edgeWidth);
+        maskAlpha *= (pasteMasks[mi].flags.x > 0.5f) ? (1.0f - m) : m;
+    }
+    if (maskAlpha < 0.001f) return;
+#endif
+    
+    
+    float maxCoverage = 0.0f;
+#ifdef DEBUG_SEGMENT_COLORS
+    float3 debugColor = float3(0.0);
+#endif
+    
+    for (uint i = 0; i < tIdx.count; ++i) {
+        uint segIdx = tileList[tIdx.start + i];
+        GPUSplineSegment seg = segments[segIdx];
+        
+        float signedDist = 1e6f;
+        float t = 0.0f;
+        
+        if (seg.segmentType == 0) {
+            SDFResult res = sdUnevenCapsule(srcPos, seg.p1, seg.p2, seg.radius0, seg.radius1);
+            signedDist = res.dist;
+            t = res.t;
+        } else if (seg.segmentType == 1) {
+            SDFResult res = sdSplineSegment(srcPos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+            signedDist = res.dist;
+            t = res.t;
+        } else if (seg.segmentType == 2) {
+            SDFResult res = sdSoftEnvelopeSpline(srcPos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+            signedDist = res.dist;
+            t = res.t;
+        }
+        
+        float radius  = mix(seg.radius0, seg.radius1, t);
+        float opacity = mix(seg.opacity0, seg.opacity1, t);
+        
+        float dist = signedDist + radius;
+        
+        if (isnan(dist) || isnan(signedDist)) {
+            continue;
+        }
+        
+        float nd = dist / (max(radius, 1.0f) * 1.1f);
+        
+        float covPencil = 1.0f;
+        if (nd > 0.08f) {
+            float tSoft = clamp((nd - 0.1f) / 0.9f, 0.0f, 1.0f);
+            float scurve = tSoft * tSoft * (3.0f - 2.0f * tSoft);
+            covPencil = 1.0f - pow(scurve, 0.9f);
+        }
+        
+        float tAir = clamp(nd * 0.8f, 0.0f, 1.0f);
+        float covAirbrush = (1.0f - tAir);
+        covAirbrush = covAirbrush * covAirbrush;
+        
+        float softness = saturate((radius - 4.0f) / 800.0f);
+        float cov = mix(covPencil, covAirbrush, softness);
+        
+        float stamped = cov * opacity;
+        
+        if (stamped > maxCoverage) {
+            maxCoverage = stamped;
+#ifdef DEBUG_SEGMENT_COLORS
+            float rand = fract(sin(float(segIdx) * 12.9898) * 43758.5453);
+            debugColor = float3(rand, fract(rand * 1.3), fract(rand * 1.7));
+#endif
+        }
+    }
+    
+    if (maxCoverage < 0.001f) return;
+    
+    float noiseVal = 1.0f;
+    if (noiseTex.get_width() > 0) {
+        float2 noiseUV = fract(float2(gid) / (float(noiseTex.get_width()) * params.noiseScale));
+        noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
+    }
+    
+    float inverted = 1.0f - maxCoverage;
+    float noiseAdd = (maxCoverage * 0.94f) + noiseVal;
+    float finalAlpha = (1.0f - saturate(inverted / noiseAdd)) * maskAlpha;
+    finalAlpha *= params.penColor.a;
+    
+    if (finalAlpha > 0.0001f) {
+        float4 dst = target.read(gid);
+        
+#ifdef DEBUG_SEGMENT_COLORS
+        float3 srcPremultiplied = debugColor * finalAlpha;
+#else
+        float3 srcPremultiplied = params.penColor.rgb * finalAlpha;
+#endif
+        
+        if (params.isEraser) {
+            dst.rgb = dst.rgb * (1.0f - finalAlpha);
+            dst.a = dst.a * (1.0f - finalAlpha);
+        } else {
+            dst.rgb = srcPremultiplied + dst.rgb * (1.0f - finalAlpha);
+            dst.a = finalAlpha + dst.a * (1.0f - finalAlpha);
+        }
+        target.write(dst, gid);
+    }
+}
+
+
+#ifdef DEBUG_CUT_PASTE
+kernel void segmentCutCompositeKernel(
+                                      const device CutMeta &meta [[buffer(0)]],
+                                      texture2d<float, access::read_write> target [[texture(0)]],
+                                      uint2 gid [[thread_position_in_grid]])
+{
+    uint w = target.get_width();
+    uint h = target.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    
+    float2 dstPos = float2(gid) + float2(0.5f, 0.5f);
+    
+    // Apply the current cut transform.
+    float2 p = float2(
+                      meta.row0.x * dstPos.x + meta.row0.y * dstPos.y + meta.row0.z,
+                      meta.row1.x * dstPos.x + meta.row1.y * dstPos.y + meta.row1.z
+                      );
+    
+    float2 minP = float2(meta.rect.x, meta.rect.y);
+    float2 maxP = minP + float2(meta.rect.z, meta.rect.w);
+    
+    float2 d   = max(max(minP - p, p - maxP), 0.0f);
+    float  out = length(d);
+    float  inX = min(p.x - minP.x, maxP.x - p.x);
+    float  inY = min(p.y - minP.y, maxP.y - p.y);
+    float  sd  = out - min(inX, inY);
+    
+    // Outside rect:           alpha = 0  (transparent / no write)
+    // Inside rect by > edge:  alpha = 1  (solid RED)
+    // Feather band:           alpha = .5 (solid GREEN so you can see the band)
+    float4 dst = target.read(gid);
+    if (sd < -meta.edgeWidth) {
+        dst = float4(1.0, 0.0, 0.0, 1.0);          // solid red — interior
+    } else if (sd < meta.edgeWidth) {
+        dst = float4(0.0, 1.0, 0.0, 1.0);          // solid green — feather band
+    } else {
+        return;                                    // outside — don't touch
+    }
+    target.write(dst, gid);
+}
+#else
+kernel void segmentCutCompositeKernel(
+                                      const device CutMeta &meta [[buffer(0)]],
+                                      texture2d<float, access::read_write> target [[texture(0)]],
+                                      uint2 gid [[thread_position_in_grid]]
+                                      )
+{
+  uint w = target.get_width();
+  uint h = target.get_height();
+
+  if (gid.x >= w || gid.y >= h) {
+      return;
+  }
+
+  float2 dstPos =
+  float2(gid) + float2(0.5f, 0.5f);
+
+  float2 p = float2(
+                    meta.row0.x * dstPos.x +
+                    meta.row0.y * dstPos.y +
+                    meta.row0.z,
+
+                    meta.row1.x * dstPos.x +
+                    meta.row1.y * dstPos.y +
+                    meta.row1.z
+                    );
+
+  float2 minP = float2(
+                       meta.rect.x,
+                       meta.rect.y
+                       );
+
+  float2 maxP = minP + float2(
+                              meta.rect.z,
+                              meta.rect.w
+                              );
+
+  float2 d = max(
+                 max(
+                     minP - p,
+                     p - maxP
+                     ),
+                 0.0f
+                 );
+
+  float outside = length(d);
+
+  float insideX = min(
+                      p.x - minP.x,
+                      maxP.x - p.x
+                      );
+
+  float insideY = min(
+                      p.y - minP.y,
+                      maxP.y - p.y
+                      );
+
+  float signedDistance =
+  outside - min(insideX, insideY);
+
+  float alpha =
+  1.0f -
+  smootherstep(
+               -meta.edgeWidth,
+               meta.edgeWidth,
+               signedDistance
+               );
+
+  if (alpha < 0.001f) {
+      return;
+  }
+
+  float4 dst = target.read(gid);
+
+  dst.rgb *= (1.0f - alpha);
+  dst.a   *= (1.0f - alpha);
+
+  target.write(dst, gid);
+}
+#endif
+
+
+kernel void mergeFlattenCompositeKernel(
+                                        texture2d<float, access::read>       srcTex  [[texture(0)]],
+                                        texture2d<float, access::read_write> target  [[texture(1)]],
+                                        constant float &opacity                      [[buffer(0)]],
+                                        uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
+    
+    float4 src = srcTex.read(gid);
+    float sa = saturate(src.a * opacity);
+    if (sa <= 0.0f) return;
+    
+    float4 dst = target.read(gid);
+    dst.rgb = src.rgb * opacity + dst.rgb * (1.0f - sa);   // src is premultiplied
+    dst.a   = sa + dst.a * (1.0f - sa);
+    target.write(dst, gid);
 }

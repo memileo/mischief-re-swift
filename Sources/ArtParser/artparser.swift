@@ -320,6 +320,16 @@ struct CodableAction: Codable {
     let opacityMin: Float?
     let isEraser: Bool?
     let points: [StrokePoint]?
+    let fromLayer: Int?
+    let rect: [Float]?
+    let ellipse: [Float]?
+    let selectionRect: [Float]?
+    let matrix1: [[Float]]?
+    let zoom1: Float?
+    let matrix2: [[Float]]?
+    let zoom2: Float?
+    let opacitySrc: Float?   // for merge_layer
+    let opacityDst: Float?   // for merge_layer
     
     enum CodingKeys: String, CodingKey {
         case layer = "layer"
@@ -348,6 +358,16 @@ struct CodableAction: Codable {
         case opacityMin = "opacity_min"
         case isEraser = "is_eraser"
         case points = "points"
+        case fromLayer = "from_layer"
+        case rect = "rect"
+        case ellipse = "ellipse"
+        case selectionRect = "selection_rect"
+        case matrix1 = "matrix_1"
+        case zoom1 = "zoom_1"
+        case matrix2 = "matrix_2"
+        case zoom2 = "zoom_2"
+        case opacitySrc = "opacity_src"
+        case opacityDst = "opacity_dst"
     }
     
     init(from action: [String: Any]) {
@@ -393,6 +413,17 @@ struct CodableAction: Codable {
         } else {
             self.points = nil
         }
+        
+        self.fromLayer = action["from_layer"] as? Int
+        self.rect = action["rect"] as? [Float]
+        self.ellipse = action["ellipse"] as? [Float]
+        self.selectionRect = action["selection_rect"] as? [Float]
+        self.matrix1 = action["matrix_1"] as? [[Float]]
+        self.zoom1 = action["zoom_1"] as? Float
+        self.matrix2 = action["matrix_2"] as? [[Float]]
+        self.zoom2 = action["zoom_2"] as? Float
+        self.opacitySrc = action["opacity_src"] as? Float
+        self.opacityDst = action["opacity_dst"] as? Float
     }
     
     func toDictionary() -> [String: Any] {
@@ -495,6 +526,46 @@ struct CodableAction: Codable {
         
         if let points = points {
             dict["points"] = points.map { $0.toDictionary() }
+        }
+        
+        if let fromLayer = fromLayer {
+            dict["from_layer"] = fromLayer
+        }
+        
+        if let rect = rect {
+            dict["rect"] = rect
+        }
+        
+        if let ellipse = ellipse {
+            dict["ellipse"] = ellipse
+        }
+        
+        if let selectionRect = selectionRect {
+            dict["selection_rect"] = selectionRect
+        }
+        
+        if let matrix1 = matrix1 {
+            dict["matrix_1"] = matrix1.toMatrixString()
+        }
+        
+        if let zoom1 = zoom1 {
+            dict["zoom_1"] = zoom1
+        }
+        
+        if let matrix2 = matrix2 {
+            dict["matrix_2"] = matrix2.toMatrixString()
+        }
+        
+        if let zoom2 = zoom2 {
+            dict["zoom_2"] = zoom2
+        }
+        
+        if let opacitySrc = opacitySrc {
+            dict["opacity_src"] = opacitySrc
+        }
+        
+        if let opacityDst = opacityDst {
+            dict["opacity_dst"] = opacityDst
         }
         
         return dict
@@ -652,6 +723,12 @@ struct CodableArtData: Codable {
                             actionParts.append("'\(key)': \(String(format: "%.17g", doubleValue))")
                         } else if let boolValue = value as? Bool {
                             actionParts.append("'\(key)': \(boolValue)")
+                        } else if let arrayValue = value as? [Float] {
+                            // Format the float array nicely
+                            let arrayString = arrayValue.map { String(format: "%.6g", $0) }.joined(separator: ", ")
+                            actionParts.append("'\(key)': [\(arrayString)]")
+                        } else if let arrayValue = value as? [UInt8] {
+                            actionParts.append("'\(key)': [\(arrayValue.map { String($0) }.joined(separator: ", "))]")
                         }
                     }
                 }
@@ -1414,45 +1491,23 @@ public struct ArtParser {
             return
         }
         
-        // Pre-allocate the actions array with capacity
         actions = []
         actions.reserveCapacity(actionCount)
         
-        for i in 0..<actionCount {
-            // Check if we have enough data for at least the action header (8 bytes)
-            guard byteCursor + 8 <= rawData.count else {
-                print("Warning: Not enough data for action \(i) header")
-                break
-            }
-            
-            // Parse layer and action_id
-            let layer = Int(readUInt32LE())
-            let actionId = Int(readUInt32LE())
-            
+        // Helper function to parse the payload of a single action
+        func parseActionPayload(layer: Int, actionId: Int) -> [String: Any] {
             var action: [String: Any] = [
                 "layer": layer,
                 "action_id": actionId
             ]
             
-            // Parse action-specific data with bounds checking
             switch actionId {
             case 0x01:
                 action["action_name"] = "stroke"
-                
-                // Check if we have enough data for point count
-                guard byteCursor + 4 <= rawData.count else {
-                    print("Warning: Not enough data for stroke point count in action \(i)")
-                    break
-                }
+                guard byteCursor + 4 <= rawData.count else { break }
                 let pointCount = Int(readUInt32LE())
+                if pointCount < 0 || pointCount > 100000 { break }
                 
-                // Validate point count to prevent excessive memory usage
-                if pointCount < 0 || pointCount > 100000 {
-                    print("Warning: Invalid point count \(pointCount) in action \(i)")
-                    break
-                }
-                
-                // Pre-allocate arrays with capacity
                 var xs: [Float] = []
                 var ys: [Float] = []
                 var rawPs: [Int] = []
@@ -1461,16 +1516,10 @@ public struct ArtParser {
                 rawPs.reserveCapacity(pointCount)
                 
                 // Read first point (absolute coordinates)
-                guard byteCursor + 12 <= rawData.count else {
-                    print("Warning: Not enough data for first stroke point in action \(i)")
-                    break
-                }
-                
+                guard byteCursor + 12 <= rawData.count else { break }
                 let x0 = readFloat()
                 let y0 = readFloat()
                 let p0Float = readFloat()
-                
-                // Store coordinates
                 xs.append(x0)
                 ys.append(y0)
                 
@@ -1481,36 +1530,23 @@ public struct ArtParser {
                 let firstPRaw = Int(p0Float * 4096.0)
                 rawPs.append(firstPRaw)
                 
-                // Read remaining points (delta encoded)
                 var x = x0
                 var y = y0
-                
-                for j in 1..<pointCount {
-                    // Check if we have enough data for this point
-                    guard byteCursor + 5 <= rawData.count else {
-                        print("Warning: Not enough data for stroke point \(j) in action \(i)")
-                        break
-                    }
-                    
+                for _ in 1..<pointCount {
+                    guard byteCursor + 5 <= rawData.count else { break }
                     let tmp = readUInt32LE()
                     let byt = readByte()
                     
                     // Extract dx (14 bits, signed)
                     var dx = Int(tmp & 0x3fff)
-                    if (tmp & (1 << 14)) != 0 {
-                        dx = -dx
-                    }
+                    if (tmp & (1 << 14)) != 0 { dx = -dx }
                     
                     // Extract dy (14 bits, signed)
                     var dy = Int((tmp >> 15) & 0x3fff)
-                    if (tmp & (1 << 29)) != 0 {
-                        dy = -dy
-                    }
+                    if (tmp & (1 << 29)) != 0 { dy = -dy }
                     
                     // Extract pressure (2 bits from tmp + 8 bits from byt)
                     let pRaw = Int((tmp >> 30) | (UInt32(byt) << 2))
-                    
-                    // Update coordinates
                     x += Float(Double(dx) / 32.0)
                     y += Float(Double(dy) / 32.0)
                     
@@ -1531,229 +1567,147 @@ public struct ArtParser {
                     didCull = 1
                 }
                 
-                // Unwrap pressure sequence
                 let unwrappedPs = unwrapPressureSequence(rawPs: rawPs)
+                let normalizedPs = unwrappedPs.map { Float($0) / 4095.0 }
                 
-//                let normalizedPs = normalizePressure(unwrapped: unwrappedPs) // fix dots
-                let normalizedPs = unwrappedPs.map { Float($0) / 4095.0 } // normalization without short stroke fix
+                //            print("rawPs: ", rawPs)
+                //
+                //            for p in rawPs {
+                //                print("rawPs p: ", p)
+                //            }
                 
-//                print("rawPs: ", rawPs)
-
-//                for p in rawPs {
-//                    print("rawPs p: ", p)
-//                }
-                
-                // Create points with unwrapped pressure values
                 var points: [[String: Any]] = []
                 points.reserveCapacity(pointCount - didCull)
-                
                 for i in 0..<(pointCount - didCull) {
-                    var point: [String: Any] = [:]
-                    point["x"] = xs[i]
-                    point["y"] = ys[i]
-                    point["p"] = normalizedPs[i]
-                    points.append(point)
+                    points.append(["x": xs[i], "y": ys[i], "p": normalizedPs[i]])
                 }
-                
                 action["points"] = points
                 
             case 0x02:
                 action["action_name"] = "polyline"
                 action["points"] = readPolyline(count: 2)
-                
             case 0x03:
                 action["action_name"] = "polyline"
-                guard byteCursor + 4 <= rawData.count else {
-                    print("  Error: Not enough data for polyline count")
-                    break
-                }
+                guard byteCursor + 4 <= rawData.count else { break }
                 let count = Int(readUInt32LE())
                 action["points"] = readPolyline(count: count)
-                
             case 0x04:
                 action["action_name"] = "polyline"
-                guard byteCursor + 4 <= rawData.count else {
-                    print("  Error: Not enough data for polyline count")
-                    break
-                }
+                guard byteCursor + 4 <= rawData.count else { break }
                 let count = Int(readUInt32LE())
                 action["points"] = readPolyline(count: count)
-                
             case 0x05:
                 action["action_name"] = "rect"
-                guard byteCursor + 20 <= rawData.count else {
-                    print("  Error: Not enough data for rect parameters")
-                    break
-                }
+                guard byteCursor + 20 <= rawData.count else { break }
                 let floats = readFloatArray(count: 5)
                 action["x"] = floats[0]
                 action["y"] = floats[1]
                 action["w"] = floats[2]
                 action["h"] = floats[3]
                 action["angle"] = floats[4]
-                
             case 0x06:
                 action["action_name"] = "ellipse"
-                guard byteCursor + 20 <= rawData.count else {
-                    print("  Error: Not enough data for ellipse parameters")
-                    break
-                }
+                guard byteCursor + 20 <= rawData.count else { break }
                 let floats = readFloatArray(count: 5)
-                let cx = floats[0] + floats[2] / 4.0
-                let cy = floats[1] + floats[3] / 4.0
-                let rx = floats[2] / 2.0
-                let ry = floats[3] / 2.0
-                let angle = floats[4]
-                action["cx"] = cx
-                action["cy"] = cy
-                action["rx"] = rx
-                action["ry"] = ry
-                action["angle"] = angle
-                
+                action["cx"] = floats[0] + floats[2] / 4.0
+                action["cy"] = floats[1] + floats[3] / 4.0
+                action["rx"] = floats[2] / 2.0
+                action["ry"] = floats[3] / 2.0
+                action["angle"] = floats[4]
             case 0x07:
                 action["action_name"] = "draw_image"
-                guard byteCursor + 28 <= rawData.count else {
-                    print("  Error: Not enough data for draw_image parameters")
-                    break
-                }
-                let dstCenter = readFloatArray(count: 2)
-                let dstSize = readFloatArray(count: 2)
-                let unknown = readUInt32LE()
-                let srcSize = readUInt32Array(count: 2)
-                let imageId = readUInt32LE()
-                action["dst_center"] = dstCenter
-                action["dst_size"] = dstSize
-                action["unknown"] = unknown
-                action["src_size"] = srcSize
-                action["image_id"] = imageId
-                
+                guard byteCursor + 28 <= rawData.count else { break }
+                action["dst_center"] = readFloatArray(count: 2)
+                action["dst_size"] = readFloatArray(count: 2)
+                action["unknown"] = readUInt32LE()
+                action["src_size"] = readUInt32Array(count: 2)
+                action["image_id"] = readUInt32LE()
             case 0x08:
                 action["action_name"] = "unknown_08"
-                guard byteCursor + 4 <= rawData.count else {
-                    print("  Error: Not enough data for unknown_08 parameter")
-                    break
-                }
+                guard byteCursor + 4 <= rawData.count else { break }
                 action["argument"] = Int(readUInt32LE())
-                
             case 0x0C:
                 action["action_name"] = "merge_layer"
-                guard byteCursor + 76 <= rawData.count else {
-                    print("  Error: Not enough data for merge_layer parameters")
-                    break
-                }
-                let fromLayer = Int(readUInt32LE())
-                let opacitySrc = readFloat()
-                let opacityDst = readFloat()
-                let matrix = readFloatMatrix(rows: 4, columns: 4)
-                let zoom = readFloat()
-                action["from_layer"] = fromLayer
-                action["opacity_src"] = opacitySrc
-                action["opacity_dst"] = opacityDst
-                action["matrix"] = matrix
-                action["zoom"] = zoom
-                
+                guard byteCursor + 80 <= rawData.count else { break } // Increased to 80
+                action["from_layer"] = Int(readUInt32LE())
+                action["opacity_src"] = readFloat()
+                action["opacity_dst"] = readFloat()
+                action["matrix"] = readFloatMatrix(rows: 4, columns: 4)
+                action["zoom"] = readFloat()
             case 0x0D:
                 action["action_name"] = "layer_matrix"
-                guard byteCursor + 68 <= rawData.count else {
-                    print("  Error: Not enough data for layer_matrix parameters")
-                    break
-                }
-                let matrix = readFloatMatrix(rows: 4, columns: 4)
-                let zoom = readFloat()
-                action["matrix"] = matrix
-                action["zoom"] = zoom
-                
+                guard byteCursor + 68 <= rawData.count else { break }
+                action["matrix"] = readFloatMatrix(rows: 4, columns: 4)
+                action["zoom"] = readFloat()
             case 0x0E:
                 action["action_name"] = "cut"
-                guard byteCursor + 16 <= rawData.count else {
-                    print("  Error: Not enough data for cut parameters")
-                    break
-                }
-                let rect = readFloatArray(count: 4)
-                action["rect"] = rect
-                
+                guard byteCursor + 16 <= rawData.count else { break }
+                action["selection_rect"] = readFloatArray(count: 4)
             case 0x0F:
                 action["action_name"] = "paste_layer"
-                guard byteCursor + 148 <= rawData.count else {
-                    print("  Error: Not enough data for paste_layer parameters")
-                    break
-                }
-                let fromLayer = Int(readUInt32LE())
-                let rect = readFloatArray(count: 4)
-                let matrix1 = readFloatMatrix(rows: 4, columns: 4)
-                let zoom1 = readFloat()
-                let matrix2 = readFloatMatrix(rows: 4, columns: 4)
-                let zoom2 = readFloat()
-                action["from_layer"] = fromLayer
-                action["rect"] = rect
-                action["matrix_1"] = matrix1
-                action["zoom_1"] = zoom1
-                action["matrix_2"] = matrix2
-                action["zoom_2"] = zoom2
-                
+                guard byteCursor + 156 <= rawData.count else { break } // Increased to 156
+                action["from_layer"] = Int(readUInt32LE())
+                action["selection_rect"] = readFloatArray(count: 4)
+                action["matrix_1"] = readFloatMatrix(rows: 4, columns: 4)
+                action["zoom_1"] = readFloat()
+                action["matrix_2"] = readFloatMatrix(rows: 4, columns: 4)
+                action["zoom_2"] = readFloat()
             case 0x33:
                 action["action_name"] = "pen_matrix"
-                guard byteCursor + 68 <= rawData.count else {
-                    print("  Error: Not enough data for pen_matrix parameters")
-                    break
-                }
-                let matrix = readFloatMatrix(rows: 4, columns: 4)
-                let zoom = readFloat()
-                action["matrix"] = matrix
-                action["zoom"] = zoom
-                
+                guard byteCursor + 68 <= rawData.count else { break }
+                action["matrix"] = readFloatMatrix(rows: 4, columns: 4)
+                action["zoom"] = readFloat()
             case 0x34:
                 action["action_name"] = "pen_properties"
-                guard byteCursor + 28 <= rawData.count else {
-                    print("  Error: Not enough data for pen_properties parameters")
-                    break
-                }
-                let type = Int(readUInt32LE())
-                let noise = readFloat()
-                let size = readFloat()
-                let sizeMin = readFloat()
-                let opacity = readFloat()
-                let opacityMin = readFloat()
-                action["type"] = type
-                action["noise"] = noise
-                action["size"] = size
-                action["size_min"] = sizeMin
-                action["opacity"] = opacity
-                action["opacity_min"] = opacityMin
-                
+                guard byteCursor + 24 <= rawData.count else { break }
+                action["type"] = Int(readUInt32LE())
+                action["noise"] = readFloat()
+                action["size"] = readFloat()
+                action["size_min"] = readFloat()
+                action["opacity"] = readFloat()
+                action["opacity_min"] = readFloat()
             case 0x35:
                 action["action_name"] = "pen_color"
-                guard byteCursor + 3 <= rawData.count else {
-                    print("  Error: Not enough data for pen_color")
-                    break
-                }
+                guard byteCursor + 3 <= rawData.count else { break }
                 action["color"] = readColor()
-                
             case 0x36:
                 action["action_name"] = "is_eraser"
-                guard byteCursor + 4 <= rawData.count else {
-                    print("  Error: Not enough data for is_eraser parameter")
-                    break
-                }
-                let isEraser = readUInt32LE()
-                action["is_eraser"] = isEraser != 0
-                
+                guard byteCursor + 4 <= rawData.count else { break }
+                action["is_eraser"] = readUInt32LE() != 0
             default:
                 action["action_name"] = "unknown_\(String(format: "%02x", actionId))"
-                print("Warning: Unknown action ID \(actionId) in action \(i)")
+                print("Warning: Unknown action ID \(actionId)")
                 break
             }
-            
-            actions.append(action)
+            return action
         }
         
-        // Read trailing unknown EOF marker if there's enough data
+        // 1. Parse main actions
+        for _ in 0..<actionCount {
+            guard byteCursor + 8 <= rawData.count else { break }
+            let layer = Int(readUInt32LE())
+            let actionId = Int(readUInt32LE())
+            actions.append(parseActionPayload(layer: layer, actionId: actionId))
+        }
+        
+        // 2. Parse trailing EOF marker and hidden Sketch Layer actions
         if byteCursor + 4 <= rawData.count {
             let unknown_eof = readUInt32LE()
-            if unknown_eof != 0 {print("Trailing EOF marker:", unknown_eof)}
-            _ = unknown_eof
+            if unknown_eof != 0 { print("Trailing EOF marker: \(unknown_eof)") }
+            
+            // Hidden layers (e.g., Sketch Layer) are stored in trailing blocks
+            while byteCursor + 8 <= rawData.count {
+                let trailingLayer = Int(readUInt32LE())
+                let trailingActionCount = Int(readUInt32LE())
+                print("Found trailing block: Layer \(trailingLayer), \(trailingActionCount) actions")
+                
+                for _ in 0..<trailingActionCount {
+                    guard byteCursor + 4 <= rawData.count else { break }
+                    let actionId = Int(readUInt32LE())
+                    actions.append(parseActionPayload(layer: trailingLayer, actionId: actionId))
+                }
+            }
         }
-        
     }
     
     // MARK: - Helper Methods

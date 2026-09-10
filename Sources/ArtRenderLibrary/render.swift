@@ -6,6 +6,8 @@ import Cairo
 import JPEG
 #elseif os(macOS)
 import CoreGraphics
+import Accelerate
+import CoreText
 #endif
 
 #if canImport(ImageIO)
@@ -73,6 +75,121 @@ public struct GPUSplineSegment {
     }
 }
 #endif
+
+struct StrokeRecord {
+    var points: [Point]
+    var pen: PenInfo
+    var penMatrixScale: CGFloat
+    var penMatrixAffine: CGAffineTransform?
+    var isPolyline: Bool
+}
+
+public struct PasteMask {
+    public var inv0: SIMD4<Float>
+    public var inv1: SIMD4<Float>
+    public var rect: SIMD4<Float>
+    public var flags: SIMD4<Float>       // x: 0 = keep, 1 = erase
+    
+    public init(inv: CGAffineTransform, rectXYWH: [Float], erase: Bool) {
+        self.inv0 = SIMD4<Float>(Float(inv.a), Float(inv.c), Float(inv.tx), 0)
+        self.inv1 = SIMD4<Float>(Float(inv.b), Float(inv.d), Float(inv.ty), 0)
+        self.rect = SIMD4<Float>(rectXYWH[0], rectXYWH[1], rectXYWH[2], rectXYWH[3])
+        self.flags = erase ? SIMD4<Float>(1, 0, 0, 0) : SIMD4<Float>(0, 0, 0, 0)
+    }
+}
+
+public struct PasteLayerMeta {
+    public var row0: SIMD4<Float>, row1: SIMD4<Float>
+    public var edgeWidth: Float
+    public var maskCount: UInt32
+    public var pad0: UInt32, pad1: UInt32
+    
+    public init(invAffine: CGAffineTransform, edgeWidth: Float = 0.75, maskCount: UInt32) {
+        self.row0 = SIMD4<Float>(Float(invAffine.a), Float(invAffine.c), Float(invAffine.tx), 0)
+        self.row1 = SIMD4<Float>(Float(invAffine.b), Float(invAffine.d), Float(invAffine.ty), 0)
+        self.edgeWidth = edgeWidth
+        self.maskCount = maskCount
+        self.pad0 = 0; self.pad1 = 0
+    }
+}   // MemoryLayout<PasteLayerMeta>.stride must print 48; PasteMask stride 64
+
+public struct CutMeta {
+    // Destination GPU/device -> selection frame.
+    public var row0: SIMD4<Float>
+    public var row1: SIMD4<Float>
+    
+    // Rectangle in selection-frame coordinates:
+    // x, y, width, height.
+    public var rect: SIMD4<Float>
+    
+    public var edgeWidth: Float
+    public var padding0: UInt32
+    public var padding1: UInt32
+    public var padding2: UInt32
+    
+    public init(
+        inverseAffine: CGAffineTransform,
+        rect: [Float],
+        edgeWidth: Float = 0.75
+    ) {
+        self.row0 = SIMD4<Float>(
+            Float(inverseAffine.a),
+            Float(inverseAffine.c),
+            Float(inverseAffine.tx),
+            0
+        )
+        
+        self.row1 = SIMD4<Float>(
+            Float(inverseAffine.b),
+            Float(inverseAffine.d),
+            Float(inverseAffine.ty),
+            0
+        )
+        
+        self.rect = SIMD4<Float>(
+            rect[0],
+            rect[1],
+            rect[2],
+            rect[3]
+        )
+        
+        self.edgeWidth = edgeWidth
+        self.padding0 = 0
+        self.padding1 = 0
+        self.padding2 = 0
+    }
+}
+
+
+enum LayerOperation {
+    case stroke(StrokeRecord)
+    case cut(meta: CutMeta)
+    case paste(
+        segments: [GPUSplineSegment],
+        color: SIMD4<Float>,
+        isEraser: Bool,
+        isMarker: Bool,
+        meta: PasteLayerMeta,
+        masks: [PasteMask],
+        sourceToDestinationGPU: CGAffineTransform,
+        isMerge: Bool,          // from ResolvedPasteRender.isMerge
+        mergeID: UInt64)        // identifies ONE merge action's group batch
+}
+
+struct StrokeMask: Equatable {
+    var m1: CGAffineTransform        // action-time view: canvas -> selection frame
+    var rect: [Float]                // selection rect x,y,w,h
+    var accRef: CGAffineTransform    // stroke's accumulated transform when recorded
+    var erase: Bool                  // false = keep, true = erase
+}
+
+private struct ResolvedStroke {
+    let stroke: StrokeRecord
+    let accumulatedDeviceTransform: CGAffineTransform
+    let sourceLayerIndex: Int
+    let selectionRect: [Float]
+    var masks: [StrokeMask] = []     // NEW — shape cases need no edits (default [])
+}
 
 struct PenInfo {
     var size: Float
@@ -595,6 +712,8 @@ public final class Renderer {
     
     private let sRGBColorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
     
+//    public static var droppedPasteMaskCount = 0
+    
     #if canImport(Metal)
     private var layerTexture: MTLTexture?
 //    private var layerContext: CGContext? // unused?
@@ -957,7 +1076,7 @@ public final class Renderer {
     // MARK: - Main Render Function
     public func render(art: ArtParser) -> CGImage? {
         // Create main bitmap context
-        #if os(Linux)
+#if os(Linux)
         guard let context = createLinuxBitmapContext(
             width: Int(canvasSize.width * scale),
             height: Int(canvasSize.height * scale)
@@ -965,7 +1084,7 @@ public final class Renderer {
             print("Creating context failed.")
             return nil
         }
-        #else
+#else
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
         let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
         guard let context = CGContext(
@@ -979,7 +1098,15 @@ public final class Renderer {
         ) else {
             return nil
         }
-        #endif
+#endif
+        // Sanity check
+//        print("PasteLayerMeta stride:", MemoryLayout<PasteLayerMeta>.stride, "should be 48")
+//        print("PasteMask stride:", MemoryLayout<PasteMask>.stride, "should be 64")
+//        Self.droppedPasteMaskCount = 0
+        
+        // MAKE MAIN CONTEXT Y-DOWN
+        context.scaleBy(x: 1, y: -1)
+        context.translateBy(x: 0, y: -CGFloat(context.height))
         
         // Start with transparent context
         Self.clearContext(context, rect: CGRect(x: 0, y: 0, width: context.width, height: context.height))
@@ -987,49 +1114,11 @@ public final class Renderer {
         // Get the view matrix from art file
         let viewMatrix = art.viewMatrix
         let baseTransform = transformFromMatrix(viewMatrix, scale: scale)
-        
-        // --- NEW: compute content bounds and fit-to-canvas transform ---
-//        let contentBounds = calculateContentBounds(art: art) // returns art-space rect (may be 0..0 if none)
-//        let deviceCanvasSize = CGSize(width: context.width, height: context.height) // in pixels
-//
-//        if contentBounds.width > 0 && contentBounds.height > 0 {
-//            // leave a small margin
-//            let margin: CGFloat = 40.0
-//            let availW = CGFloat(deviceCanvasSize.width) - margin * 2.0
-//            let availH = CGFloat(deviceCanvasSize.height) - margin * 2.0
-//            let scaleFit = min(availW / contentBounds.width, availH / contentBounds.height)
-//
-//            // Translate art so contentBounds.origin -> (margin, margin), then scale
-//            // We want artCoord -> device pixels: translate(-minX, -minY) then scale(scaleFit)
-//            let translateToOrigin = CGAffineTransform(translationX: -contentBounds.origin.x, y: -contentBounds.origin.y)
-//            let scaleTransform = CGAffineTransform(scaleX: scaleFit, y: scaleFit)
-//            // Optionally center: compute extra offset to center the scaled content
-//            let scaledSize = CGSize(width: contentBounds.width * scaleFit, height: contentBounds.height * scaleFit)
-//            let centerOffsetX = (CGFloat(deviceCanvasSize.width) - scaledSize.width) * 0.5
-//            let centerOffsetY = (CGFloat(deviceCanvasSize.height) - scaledSize.height) * 0.5
-//            let centerTranslate = CGAffineTransform(translationX: centerOffsetX, y: centerOffsetY)
-//
-//            // Compose: center * scale * translate
-//            let fitTransform = centerTranslate.concatenating(scaleTransform).concatenating(translateToOrigin)
-//
-//            // Replace baseTransform with baseTransform * fitTransform so file viewMatrix is applied first,
-//            // then we map art-space to device-space.
-//            baseTransform = baseTransform.concatenating(fitTransform)
-//
-//            NSLog("DEBUG: Applied fitTransform scale=\(scaleFit) centerOffset=(\(centerOffsetX),\(centerOffsetY))")
-//        } else {
-//            NSLog("DEBUG: contentBounds empty — using viewMatrix only")
-//        }
-
-//        NSLog("DEBUG: layerContext size = \(layerContext.width)x\(layerContext.height) ; stroke count = \(layerStrokes.count)")
-
-        // Create a temporary context for layer rendering if not using Metal
-//        var layerContext: CGContext?
-//        if metalRenderer == nil {
-//            let ctx = createBitmapContext(size: canvasSize, scale: scale)
-//            ctx.clear(CGRect(x: 0, y: 0, width: ctx.width, height: ctx.height))
-//            layerContext = ctx
-//        }
+        // TEMPORARY, for diagnosis only:
+//        let baseTransform = CGAffineTransform.identity
+        print("actions per layer:",
+              Dictionary(grouping: art.actions, by: { $0["layer"] as? Int ?? -1 })
+            .mapValues(\.count))
         
         // Process layers in order
         for layerIndex in art.layerOrder {
@@ -1037,14 +1126,14 @@ public final class Renderer {
                 continue
             }
             let layer = art.layers[layerIndex]
-
+            
             let visible = getVisibility(from: layer)
             if !visible {
                 continue
             }
-
+            
             let layerOpacity = layer["opacity"] as? Float ?? 1.0
-
+            
             // Render the layer with proper isolation
             let layerImage = renderLayerIsolated(
                 layer: layer,
@@ -1053,17 +1142,17 @@ public final class Renderer {
                 baseTransform: baseTransform,
                 layerOpacity: layerOpacity
             )
-
+            
             // Composite the layer onto the main context
             if let layerImage = layerImage, !gpExportMode {
                 context.saveGState()
-
+                
                 // Apply layer opacity
                 context.setAlpha(CGFloat(layerOpacity))
-
+                
                 // Draw the layer
                 context.draw(layerImage, in: CGRect(x: 0, y: 0, width: context.width, height: context.height))
-
+                
                 context.restoreGState()
             }
         }
@@ -1080,18 +1169,22 @@ public final class Renderer {
                 g: CGFloat(bgColor[1]) / 255.0,
                 b: CGFloat(bgColor[2]) / 255.0
             )
-
+            
             // Apply paper texture and background color logic
             if art.paperTextureId != 0 {
                 let paperColor = getPaperColor(for: art.paperTextureId)
                 let paperStrength = art.paperStrength
-
+                
                 // Create a temporary context for the paper texture compositing
                 let paperContext = createBitmapContext(
                     size: CGSize(width: context.width, height: context.height),
                     scale: 1.0
                 )
-
+                
+                // MAKE PAPER CONTEXT Y-DOWN
+                paperContext.scaleBy(x: 1, y: -1)
+                paperContext.translateBy(x: 0, y: -CGFloat(paperContext.height))
+                
                 if paperStrength > 0.0 {
                     // Composite tiled paper texture on top of paper color with paper strength alpha
                     renderPaperTexture(
@@ -1106,7 +1199,7 @@ public final class Renderer {
                     paperContext.setFillColor(createSRGBColor(r: paperColor.r, g: paperColor.g, b: paperColor.b))
                     paperContext.fill(CGRect(x: 0, y: 0, width: paperContext.width, height: paperContext.height))
                 }
-
+                
                 // Apply background color multiplication (unless pure white)
                 if backgroundColor.r != 1.0 || backgroundColor.g != 1.0 || backgroundColor.b != 1.0 {
                     paperContext.saveGState()
@@ -1115,7 +1208,7 @@ public final class Renderer {
                     paperContext.fill(CGRect(x: 0, y: 0, width: paperContext.width, height: paperContext.height))
                     paperContext.restoreGState()
                 }
-
+                
                 // Draw the final paper with background to the main context
                 if let finalPaperImage = paperContext.makeImage() {
                     context.draw(finalPaperImage, in: CGRect(x: 0, y: 0, width: context.width, height: context.height))
@@ -1127,6 +1220,29 @@ public final class Renderer {
             }
         }
         context.restoreGState()
+        
+//#if os(macOS)
+////        Self.droppedPasteMaskCount = 25
+//        if Self.droppedPasteMaskCount > 0 {
+//            print("⚠ \(Self.droppedPasteMaskCount) paste mask(s) dropped — content may overflow its cut")
+//            let text = "⚠ \(Self.droppedPasteMaskCount) paste mask(s) dropped — content may overflow its cut"
+//            let font = CTFontCreateWithName("Helvetica Bold" as CFString, 28, nil)
+//            let attrs: [CFString: Any] = [
+//                kCTFontAttributeName: font,
+//                kCTForegroundColorAttributeName: CGColor(srgbRed: 0.8, green: 0, blue: 0, alpha: 1),
+//                kCTBaselineOffsetAttributeName: -8.0
+//            ]
+//            let attrStr = CFAttributedStringCreate(nil, text as CFString, attrs as CFDictionary)!
+//            let line = CTLineCreateWithAttributedString(attrStr)
+//
+//            context.saveGState()
+//            context.translateBy(x: 24, y: 24)
+//            context.scaleBy(x: 1, y: -1)     // CoreText is y-up; main context is flipped y-down
+//            CTLineDraw(line, context)
+//            context.restoreGState()
+//        }
+//#endif
+        
         
         return context.makeImage()
     }
@@ -1149,7 +1265,6 @@ public final class Renderer {
     }
     #endif
     
-    // New renderLayerIsolated() Function
     private func renderLayerIsolated(
         layer: [String: Any],
         layerIndex: Int,
@@ -1158,25 +1273,28 @@ public final class Renderer {
         layerOpacity: Float
     ) -> CGImage? {
         
-        guard let matrix = layer["matrix"] as? [[Float]] else {
-            return nil
-        }
+        guard let matrix = layer["matrix"] as? [[Float]] else { return nil }
         
-        let layerTransform = transformFromMatrix(matrix)
+        // 1. Pure Y-DOWN: Use toDirectCGTransform for everything
+        let layerTransform = toDirectCGTransform(matrix)
         let artToDevice = CGAffineTransformConcat(layerTransform, baseTransform)
         
-        // Create a temporary context for this layer
+//        let viewMatrix = art.viewMatrix
+//        let yDownBaseTransform = baseTransform // They are identical now
+        
         let layerContext = createBitmapContext(size: canvasSize, scale: scale)
         Self.clearContext(layerContext, rect: CGRect(x: 0, y: 0, width: layerContext.width, height: layerContext.height))
         
-        // Collect all strokes for this layer
-        var layerStrokes: [StrokeRecord] = []
+        // 2. Pure Y-DOWN: flipTransform MUST be nil
+        let flipTransform: CGAffineTransform? = nil
         
-        // Process actions for this layer
+        var layerOps: [LayerOperation] = []
+//        var pendingCutRect: [Float] = []
+        
         var currentPen = defaultPenInfo()
         var penMatrixScale: CGFloat = 1.0
         
-        for action in art.actions {
+        for (actionIdx, action) in art.actions.enumerated() {
             guard let actionLayer = action["layer"] as? Int,
                   actionLayer == layerIndex,
                   let actionName = action["action_name"] as? String else {
@@ -1184,403 +1302,68 @@ public final class Renderer {
             }
             
             switch actionName {
-            case "pen_properties":
-                // Tolerant numeric parser: handles Float, Double, Int
-                func num(_ v: Any?) -> Float? {
-                    switch v {
-                    case let f as Float: return f
-                    case let d as Double: return Float(d)
-                    case let i as Int: return Float(i)
-                    case let ui8 as UInt8: return Float(ui8)
-                    case let ui16 as UInt16: return Float(ui16)
-                    default: return nil
-                    }
-                }
-                
-                // Read common pen values (if present)
-                if let v = num(action["size"]) { currentPen.size = v }
-                if let v = num(action["size_min"]) { currentPen.sizeMin = v }
-                if let v = num(action["sizeMin"]) { currentPen.sizeMin = v }        // accept alternate key
-                if let v = num(action["opacity"]) { currentPen.opacity = v }
-                
-                // Raw "opacity_min" in the action may actually encode a subType for some pen types.
-                // Read it as subType first (but keep it available).
-                var rawSubType: Float? = nil
-                if let v = num(action["opacity_min"]) { rawSubType = v }
-                else if let v = num(action["subType"]) { rawSubType = v }
-                else if let v = num(action["sub_type"]) { rawSubType = v }
-                
-                // Read 'type' if supplied (may be Int or numeric)
-                var penTypeVal: Int? = nil
-                if let tAny = action["type"] {
-                    if let ti = tAny as? Int {
-                        penTypeVal = ti
-                    } else if let td = tAny as? Double {
-                        penTypeVal = Int(td)
-                    } else if let tf = tAny as? Float {
-                        penTypeVal = Int(tf)
-                    }
-                }
-                
-                // Store the brush type in the PenInfo
-                currentPen.type = penTypeVal
-                
- /*
-                                 | 'type': 1 - 'opacity_min': 1 | 'type': 0 - 'opacity_min': 0          | 'type': 1 - 'opacity_min': 1 |
-                                 | ---------------------------- | --------------------------------------| ---------------------------- |
-                                 | 'type': 2 - 'opacity_min': 1 | 'type': 0 - 'opacity_min': 0.80000... | 'type': 0 - 'opacity_min': 0 |
-  
-  Presets:
-  | Noise                        | 'type': 1 - 'opacity_min': 1          | 'type': 1 - 'opacity_min': 1          | 'type': 1 - 'opacity_min': 1  |
-  | ---------------------------- | ------------------------------------- | ------------------------------------- | ----------------------------- |
-  | Noise                        | 'type': 1 - 'opacity_min': 1          | 'type': 1 - 'opacity_min': 1          | 'type': 1 - 'opacity_min': 1  |
-  | ---------------------------- | ------------------------------------- | ------------------------------------- | ----------------------------- |
-  | Solid                        | 'type': 0 - 'opacity_min': 0          | 'type': 0 - 'opacity_min': 0          | 'type': 0 - 'opacity_min': 0  |
-  | ---------------------------- | ------------------------------------- | ------------------------------------- | ----------------------------- |
-  | Solid with opacity dynamics  | 'type': 0 - 'opacity_min': 0.80000... | 'type': 0 - 'opacity_min': 0.80000... | 'type': 0 - 'opacity_min': 1  |
-  | ---------------------------- | ------------------------------------- | ------------------------------------- | ----------------------------- |
-  | Marker                       | 'type': 2 - 'opacity_min': 1          | 'type': 2 - 'opacity_min': 0          | 'type': 2 - 'opacity_min': 0  |
-
-  Type 0: Solid
-  Type 1: Noise
-  Type 2: Marker    opacity_min 1: opacity dynamics   opacity_min 0: full opacity
-  
-*/
-                
-                // Determine derived opacityMin based on (type, subType) heuristics you provided.
-                // Start from the explicit value if it really was intended as opacity_min; otherwise derive.
-                var derivedOpacityMin: Float = currentPen.opacityMin // keep existing default
-                
-                if let type = penTypeVal {
-                    // Map behaviors for types/subTypes (heuristics)
-                    if type == 1 {
-                        // pencil -> treat as type 2 round shape, full pressure range
-                        derivedOpacityMin = 0.16 // 0.44
-                    } else if type == 0 {
-                        // solid
-                        if let st = rawSubType {
-                            // type 0 cases:
-                            currentPen.isMarker = false
-                            
-                            if abs(st - 0.0) < 0.0001 {
-                                // subtype == 0 -> fully opaque behavior (min == max)
-                                derivedOpacityMin = currentPen.opacity
-                            } else if st > 0.7 {
-                                // subtype ~0.8 -> low but non-zero min opacity
-                                derivedOpacityMin = 0.15   // chosen low constant (0.1-0.2 range)
-                            } else {
-                                // other subtype values -> keep whatever default is currently set
-                                derivedOpacityMin = currentPen.opacityMin
-                            }
+                case "pen_properties": actionPenProperties(action: action, currentPen: &currentPen)
+                case "pen_matrix": actionPenMatrix(action: action, currentPen: &currentPen, penMatrixScale: &penMatrixScale)
+                case "is_eraser": actionIsEraser(action: action, currentPen: &currentPen)
+                case "pen_color": actionPenColor(action: action, currentPen: &currentPen)
+                    
+                case "stroke":
+                    var tempStrokes: [StrokeRecord] = []
+                    actionStroke(action: action, currentPen: currentPen, penMatrixScale: penMatrixScale, layerStrokes: &tempStrokes)
+                    layerOps.append(contentsOf: tempStrokes.map { .stroke($0) })
+                    
+                case "polyline":
+                    var tempStrokes: [StrokeRecord] = []
+                    actionPolyline(action: action, currentPen: currentPen, penMatrixScale: penMatrixScale, layerStrokes: &tempStrokes)
+                    layerOps.append(contentsOf: tempStrokes.map { .stroke($0) })
+                    
+                case "rect":
+                    var tempStrokes: [StrokeRecord] = []
+                    actionRect(action: action, currentPen: currentPen, penMatrixScale: penMatrixScale, layerStrokes: &tempStrokes)
+                    layerOps.append(contentsOf: tempStrokes.map { .stroke($0) })
+                    
+                case "ellipse":
+                    var tempStrokes: [StrokeRecord] = []
+                    actionEllipse(action: action, currentPen: currentPen, penMatrixScale: penMatrixScale, layerStrokes: &tempStrokes)
+                    layerOps.append(contentsOf: tempStrokes.map { .stroke($0) })
+                    
+                case "cut":
+                    if let rect = parseFloatArray(action["selection_rect"]), rect.count == 4 {
+                        let m1: CGAffineTransform
+                        if let own = parseMatrixRobust(action["matrix_1"]) {
+                            m1 = transformFromMatrix(own.map { $0.map { Float($0) } }, scale: 1.0)
+                        } else if let next = nextPasteViewMatrix(in: art.actions, after: actionIdx) {
+                            m1 = next
                         } else {
-                            // no subtype — keep current default
-                            derivedOpacityMin = currentPen.opacityMin
+                            m1 = .identity  // fallback: treat rect as current device px
+                            print("CUT: no matrix_1 (own or following paste) — rect used as device px")
                         }
-                    } else if type == 2 {
-                        // marker
-                        // 45° pill shape ratio 1:4 diameter
-                        currentPen.isMarker = true
-                        
-                        if let st = rawSubType {
-                            if st == 1.0 {
-                                // full pressure range (0..opacity)
-                                derivedOpacityMin = 0.0
-                            } else {
-                                // max opacity (safe)
-                                derivedOpacityMin = 1.0
-                            }
-                        } else {
-                            // type 2, no subtype -> assume full pressure range
-                            derivedOpacityMin = 0.0
-                        }
-                    } else {
-                        // unknown types — leave as-is
-                        derivedOpacityMin = currentPen.opacityMin
-                    }
-                }
-//                else if let st = rawSubType {
-//                    // No type provided but a raw subtype exists — apply some safe defaults:
-//                    // Not sure this is ever the case, but ok
-//                    if st > 0.7 {
-//                        derivedOpacityMin = 0.15
-//                    } else if abs(st - 0.33) < 0.08 {
-//                        derivedOpacityMin = currentPen.opacityMin
-//                    } else {
-//                        derivedOpacityMin = currentPen.opacityMin
-//                    }
-//                }
-                
-                // Final clamp to [0,1]
-                derivedOpacityMin = min(max(derivedOpacityMin, 0.0), 1.0)
-                
-                // Assign derived result back into pen snapshot
-                currentPen.opacityMin = derivedOpacityMin
-                
-                print("stroke pen snapshot -> type=\(penTypeVal ?? -1), subType=\(rawSubType ?? -1), opacity=\(currentPen.opacity), opacityMin=\(currentPen.opacityMin)")
-                
-            case "pen_matrix":
-                // Helper to coerce Any -> Double
-                func toDouble(_ v: Any?) -> Double? {
-                    switch v {
-                    case let d as Double: return d
-                    case let f as Float: return Double(f)
-                    case let i as Int: return Double(i)
-                    case let s as String: return Double(s)
-                    default: return nil
-                    }
-                }
-                
-                // Read matrix as [[Any]] or [[Double]]
-                var a: Double = 1.0, b: Double = 0.0, c: Double = 0.0, d: Double = 1.0
-                var tx: Double = 0.0, ty: Double = 0.0
-                var parsed = false
-                
-                if let matAny = action["matrix"] as? [[Any]] {
-                    // Many files encode 4x4 row-major: mat[row][col]
-                    if matAny.count >= 4 && matAny[3].count >= 2 {
-                        // guess: layout like:
-                        // [ [a, b, ...],
-                        //   [c, d, ...],
-                        //   [...],
-                        //   [tx, ty, ..., 1] ]
-                        if let aa = toDouble(matAny[0][0]) { a = aa }
-                        if matAny[0].count > 1, let bb = toDouble(matAny[0][1]) { b = bb }
-                        if matAny.count > 1 && matAny[1].count > 0, let cc = toDouble(matAny[1][0]) { c = cc }
-                        if matAny.count > 1 && matAny[1].count > 1, let dd = toDouble(matAny[1][1]) { d = dd }
-                        if let txx = toDouble(matAny[3][0]) { tx = txx }
-                        if let tyy = toDouble(matAny[3][1]) { ty = tyy }
-                        parsed = true
-                    } else if matAny.count >= 2 && matAny[0].count >= 2 && matAny[1].count >= 2 {
-                        // fallback: take top-left 2x2 and row 2 as translation
-                        if let aa = toDouble(matAny[0][0]) { a = aa }
-                        if let bb = toDouble(matAny[0][1]) { b = bb }
-                        if let cc = toDouble(matAny[1][0]) { c = cc }
-                        if let dd = toDouble(matAny[1][1]) { d = dd }
-                        // translation not present — keep tx/ty = 0
-                        parsed = true
-                    }
-                } else if let matDouble = action["matrix"] as? [[Double]] {
-                    if matDouble.count >= 4 && matDouble[3].count >= 2 {
-                        a = matDouble[0][0]; b = matDouble[0][1]
-                        c = matDouble[1][0]; d = matDouble[1][1]
-                        tx = matDouble[3][0]; ty = matDouble[3][1]
-                        parsed = true
-                    } else if matDouble.count >= 2 && matDouble[0].count >= 2 {
-                        a = matDouble[0][0]; b = matDouble[0][1]
-                        c = matDouble[1][0]; d = matDouble[1][1]
-                        parsed = true
-                    }
-                }
-                
-                if parsed {
-                    // Compose candidate CGAffineTransform.
-                    // We use a layout where affine maps (x,y) -> (a*x + b*y + tx, c*x + d*y + ty)
-                    let affine = CGAffineTransform(a: CGFloat(a), b: CGFloat(b), c: CGFloat(c), d: CGFloat(d), tx: CGFloat(tx), ty: CGFloat(ty))
-                    
-                    // Compute numeric scale from affine (average column vector length)
-                    let sx = sqrt(a*a + c*c)
-                    let sy = sqrt(b*b + d*d)
-                    var computedScale = CGFloat((sx + sy) / 2.0)
-                    if !computedScale.isFinite || computedScale <= 0.0 { computedScale = 1.0 }
-                    
-                    // Store into current pen snapshot
-                    currentPen.penMatrixAffine = affine
-                    penMatrixScale = computedScale
-                    
-                    print("Parsed pen_matrix: a=\(a) b=\(b) c=\(c) d=\(d) tx=\(tx) ty=\(ty) scale=\(computedScale)")
-                } else {
-                    print("Warning: couldn't parse pen_matrix action: \(action)")
-                }
-                
-            case "is_eraser":
-                if let isEraser = action["is_eraser"] as? Bool {
-                    currentPen.isEraser = isEraser
-                }
-                
-            case "pen_color":
-                // keep your reverted logic here — accept different encodings robustly
-                if let t = action["color"] as? (Int, Int, Int) {
-                    currentPen.color = (r: Float(t.0)/255.0, g: Float(t.1)/255.0, b: Float(t.2)/255.0)
-                } else if let arr = action["color"] as? [Any], arr.count >= 3 {
-                    if let r = arr[0] as? Int, let g = arr[1] as? Int, let b = arr[2] as? Int {
-                        currentPen.color = (r: Float(r)/255.0, g: Float(g)/255.0, b: Float(b)/255.0)
-                    } else if let r = arr[0] as? UInt8, let g = arr[1] as? UInt8, let b = arr[2] as? UInt8 {
-                        currentPen.color = (r: Float(r)/255.0, g: Float(g)/255.0, b: Float(b)/255.0)
-                    } else if let rf = arr[0] as? Float, let gf = arr[1] as? Float, let bf = arr[2] as? Float {
-                        currentPen.color = (r: rf, g: gf, b: bf)
-                    } else if let rd = arr[0] as? Double, let gd = arr[1] as? Double, let bd = arr[2] as? Double {
-                        currentPen.color = (r: Float(rd), g: Float(gd), b: Float(bd))
-                    }
-                }
-                
-            case "stroke":
-                // Parse points and create stroke record
-                if let pts = action["points"] as? [[String: Any]], !pts.isEmpty {
-                    // Parse points
-                    func toFloat(_ v: Any?) -> Float {
-                        if let f = v as? Float { return f }
-                        if let d = v as? Double { return Float(d) }
-                        if let i = v as? Int { return Float(i) }
-                        if let s = v as? String, let d = Double(s) { return Float(d) }
-                        return 0.0
+                        layerOps.append(.cut(meta: CutMeta(
+                            inverseAffine: baseTransform.inverted().concatenating(m1),
+                            rect: rect, edgeWidth: 0.75)))
                     }
                     
-                    func toInt(_ v: Any?) -> Int {
-                        if let i = v as? Int { return i }
-                        if let f = v as? Float { return Int(f) }
-                        if let d = v as? Double { return Int(d) }
-                        if let s = v as? String, let d = Int(s) { return d }
-                        return 0
-                    }
+                case "paste_layer":
+                    layerOps.append(contentsOf: actionPasteLayerOps(
+                        action: action,
+                        art: art,
+                        targetLayerIndex: layerIndex,
+                        actionIndex: actionIdx,
+                        dstPenAffine: currentPen.penMatrixAffine ?? .identity,
+                        baseTransform: baseTransform,
+                        yDownBaseTransform: baseTransform,
+                        flipTransform: flipTransform))
                     
-                    let rawPoints: [Point] = pts.map { dict in
-                        let x = toFloat(dict["x"])
-                        let y = toFloat(dict["y"])
-                        let p = toFloat(dict["p"])
-//                        print("[P][raw point] x=\(x) y=\(y) p(raw)=\(p)")
-                        return Point(x: x, y: y, p: p)
-                    }
+                case "merge_layer":
+                    layerOps.append(contentsOf: actionMergeLayerOps(
+                        action: action,
+                        art: art,
+                        targetLayerIndex: layerIndex,
+                        actionIndex: actionIdx,
+                        baseTransform: baseTransform,
+                        flipTransform: nil))
                     
-                    // Create StrokeRecord
-                    let rec = StrokeRecord(
-                        points: rawPoints,
-                        pen: currentPen,
-                        penMatrixScale: penMatrixScale,
-                        penMatrixAffine: currentPen.penMatrixAffine,
-                        isPolyline: false
-                    )
-//                    if let first = rawPoints.first, let last = rawPoints.last {
-//                        print("[P][stroke record] points=\(rawPoints.count) p.first=\(first.p) p.last=\(last.p) pen.opacity=\(currentPen.opacity) pen.opacityMin=\(currentPen.opacityMin)")
-//                    }
-                    
-                    layerStrokes.append(rec)
-                }
-            
-            case "polyline" :
-                if let pts = action["points"] as? [[String: Any]], !pts.isEmpty {
-                    // Parse points
-                    func toFloat(_ v: Any?) -> Float {
-                        if let f = v as? Float { return f }
-                        if let d = v as? Double { return Float(d) }
-                        if let i = v as? Int { return Float(i) }
-                        if let s = v as? String, let d = Double(s) { return Float(d) }
-                        return 0.0
-                    }
-                    
-                    func toInt(_ v: Any?) -> Int {
-                        if let i = v as? Int { return i }
-                        if let f = v as? Float { return Int(f) }
-                        if let d = v as? Double { return Int(d) }
-                        if let s = v as? String, let d = Int(s) { return d }
-                        return 0
-                    }
-                    
-                    let rawPoints: [Point] = pts.map { dict in
-                        let x = toFloat(dict["x"])
-                        let y = toFloat(dict["y"])
-                        let p = toFloat(dict["p"])
-                        //                        print("[P][raw point] x=\(x) y=\(y) p(raw)=\(p)")
-                        return Point(x: x, y: y, p: p)
-                    }
-                    
-                    // Create StrokeRecord
-                    let rec = StrokeRecord(
-                        points: rawPoints,
-                        pen: currentPen,
-                        penMatrixScale: penMatrixScale,
-                        penMatrixAffine: currentPen.penMatrixAffine,
-                        isPolyline: true
-                    )
-//                    print("POLYLINE")
-                    
-                    layerStrokes.append(rec)
-                }
-                
-            case "rect":
-                if let x = action["x"] as? Float,
-                   let y = action["y"] as? Float,
-                   let w = action["w"] as? Float,
-                   let h = action["h"] as? Float {
-                    let angle = action["angle"] as? Float ?? 0.0
-                    let cosA = cos(angle)
-                    let sinA = sin(angle)
-                    
-                    let halfW = w * 0.5
-                    let halfH = h * 0.5
-                    let localCorners: [(Float, Float)] = [
-                        (-halfW, -halfH),
-                        ( halfW, -halfH),
-                        ( halfW,  halfH),
-                        (-halfW,  halfH),
-                        (-halfW, -halfH)
-                    ]
-                    
-                    let pts: [Point] = localCorners.map { (dx, dy) in
-                        let rx = dx * cosA - dy * sinA
-                        let ry = dx * sinA + dy * cosA
-                        return Point(x: x + rx, y: y + ry, p: 1.0)
-                    }
-                    
-                    let rec = StrokeRecord(
-                        points: pts,
-                        pen: currentPen,
-                        penMatrixScale: penMatrixScale,
-                        penMatrixAffine: currentPen.penMatrixAffine,
-                        isPolyline: true
-                    )
-                    layerStrokes.append(rec)
-                }
-                
-            case "ellipse":
-                if let cx = action["cx"] as? Float,
-                   let cy = action["cy"] as? Float,
-                   let rx = action["rx"] as? Float,
-                   let ry = action["ry"] as? Float {
-                    let angle = action["angle"] as? Float ?? 0.0
-                    let cosA = cos(angle)
-                    let sinA = sin(angle)
-                    
-                    let tx = -rx / 2.0
-                    let ty = -ry / 2.0
-                    
-                    // Generate points directly on the true ellipse.
-                    let segments = 128 // 96
-                    let twoPi: Float = 2.0 * .pi
-                    
-                    var pts: [Point] = []
-                    pts.reserveCapacity(segments + 1)
-                    for i in 0..<segments {
-                        let t = Float(i) / Float(segments) * twoPi
-                        let ex = rx * cos(t)
-                        let ey = ry * sin(t)
-                        
-                        let ox = ex + tx
-                        let oy = ey + ty
-                        
-                        let rotX = ox * cosA - oy * sinA
-                        let rotY = ox * sinA + oy * cosA
-                        
-                        pts.append(Point(x: cx + rotX, y: cy + rotY, p: 1.0))
-                    }
-                    
-                    // Explicitly close the loop for the polyline renderer
-                    if let firstPt = pts.first {
-                        pts.append(firstPt)
-                    }
-                    
-                    // Render as a dense polyline
-                    let rec = StrokeRecord(
-                        points: pts,
-                        pen: currentPen,
-                        penMatrixScale: penMatrixScale,
-                        penMatrixAffine: currentPen.penMatrixAffine,
-                        isPolyline: true
-                    )
-                    layerStrokes.append(rec)
-                }
-                
-            default:
-                break
+                default: break
             }
         }
         
@@ -1588,441 +1371,2406 @@ public final class Renderer {
         if gpExportMode {
             let layerName = layer["name"] as? String ?? "Layer \(layerIndex)"
             let layerVisible = (layer["visible"] as? Int ?? 1) != 0
-            let exportLayer = exportGPLayer(
-                layerStrokes: layerStrokes,
-                artToDevice: artToDevice,
-                canvasHeight: canvasSize.height * scale,
-                layerName: layerName,
-                layerOpacity: layerOpacity,
-                layerVisible: layerVisible,
-                resampleStep: gpExportResampleStep,
-                catmullRom: gpExportCatmullRom
-            )
-            gpExportLayers.append(exportLayer)
+            let exportCanvasHeight = canvasSize.height * scale
+            
+            // Everything drawn after a paste/merge is appended to that paste's GP
+            // layer, so erasers erase the pasted content (and everything drawn on
+            // that layer before them). The destination layer's own record holds
+            // only what was drawn before the first paste. Cuts erase everything
+            // below them at action time: the entry joins the pending stream (it
+            // lands at its position in whichever record is active) and is
+            // replicated into every lower record.
+            var records: [GPExportLayer] = []
+            var pendingItems: [GPExportItem] = []
+            var writingIndex: Int? = nil      // record the pending stream flushes into (nil = new base record)
+            
+            
+            // Erasers act on the flat composite: replicate an eraser entry into
+            // lower records whose content it touches — earlier paste groups AND
+            // earlier records. Bounds-checked so distant layers get nothing.
+            func replicateEraserDown(_ s: GPExportStroke, from: Int = 0, below idx: Int) {
+                let reach = strokeBounds([s], includeErasers: true)
+                guard !reach.isNull else { return }
+                for i in from..<idx where !recordBounds[i].isNull && recordBounds[i].intersects(reach) {
+                    records[i].strokes.append(s)
+                }
+            }
+            
+            var recordBounds: [CGRect] = []    // content bounds per record, JSON space
+            
+            func flushPending() {
+                let items = pendingItems
+                pendingItems = []
+                if let w = writingIndex {
+                    guard !items.isEmpty else { return }
+                    var appended = exportGPStrokes(
+                        items: items, artToDevice: artToDevice, canvasHeight: exportCanvasHeight,
+                        resampleStep: gpExportResampleStep, catmullRom: gpExportCatmullRom)
+                    // in-position cut entries: keep only where there is content to erase
+                    // (the paste layer's own strokes count — a cut over the island is real)
+                    let contentBox = unionBounds(recordBounds[w], strokeBounds(appended))
+                    appended = dropNoOpCutEntries(appended, contentBox: contentBox)
+                    records[w].strokes.append(contentsOf: appended)
+                    recordBounds[w] = unionBounds(recordBounds[w], strokeBounds(appended))
+                    
+                    // erasers drawn on the user-facing layer: reach down
+                    for s in appended where s.is_eraser {
+                        replicateEraserDown(s, below: w)
+                    }
+                } else {
+                    guard items.contains(where: { item -> Bool in
+                        if case .stroke = item { return true }
+                        return false
+                    }) else { return }
+                    var layer = exportGPLayer(
+                        items: items,
+                        artToDevice: artToDevice,
+                        canvasHeight: exportCanvasHeight,
+                        layerName: layerName,
+                        layerOpacity: layerOpacity,
+                        layerVisible: layerVisible,
+                        resampleStep: gpExportResampleStep,
+                        catmullRom: gpExportCatmullRom)
+                    layer.strokes = dropNoOpCutEntries(layer.strokes, contentBox: strokeBounds(layer.strokes))
+                    records.append(layer)
+                    recordBounds.append(strokeBounds(layer.strokes))
+                    writingIndex = records.count - 1
+                }
+            }
+            
+            var currentPen = defaultPenInfo()
+            var penMatrixScale: CGFloat = 1.0
+            var actionLayerMatrix = initialActionLayerMatrix(layerIndex: layerIndex, art: art)
+            
+            for (actionIdx, action) in art.actions.enumerated() {
+                guard let actionLayer = action["layer"] as? Int,
+                      actionLayer == layerIndex,
+                      let actionName = action["action_name"] as? String else { continue }
+                
+                switch actionName {
+                    case "pen_properties":
+                        actionPenProperties(action: action, currentPen: &currentPen)
+                    case "pen_matrix":
+                        actionPenMatrix(action: action, currentPen: &currentPen, penMatrixScale: &penMatrixScale)
+                    case "is_eraser":
+                        actionIsEraser(action: action, currentPen: &currentPen)
+                    case "pen_color":
+                        actionPenColor(action: action, currentPen: &currentPen)
+                    case "layer_matrix":
+                        if let mRaw = parseMatrixRobust(action["matrix"]) {
+                            actionLayerMatrix = transformFromMatrix(mRaw.map { $0.map { Float($0) } }, scale: 1.0)
+                        }
+                        
+                    case "stroke", "polyline", "rect", "ellipse":
+                        var tempStrokes: [StrokeRecord] = []
+                        switch actionName {
+                            case "stroke":
+                                actionStroke(action: action, currentPen: currentPen, penMatrixScale: penMatrixScale, layerStrokes: &tempStrokes)
+                            case "polyline":
+                                actionPolyline(action: action, currentPen: currentPen, penMatrixScale: penMatrixScale, layerStrokes: &tempStrokes)
+                            case "rect":
+                                actionRect(action: action, currentPen: currentPen, penMatrixScale: penMatrixScale, layerStrokes: &tempStrokes)
+                            default:
+                                actionEllipse(action: action, currentPen: currentPen, penMatrixScale: penMatrixScale, layerStrokes: &tempStrokes)
+                        }
+                        pendingItems.append(contentsOf: tempStrokes.map { GPExportItem.stroke($0) })
+                        
+                    case "cut":
+                        guard let devCorners = cutRectDeviceCorners(
+                            action: action, art: art, actionIndex: actionIdx, baseTransform: artToDevice) else { break }
+                        // in-position entry: erases the active record's content drawn before it
+                        pendingItems.append(.cut(corners: devCorners))
+                        // geometric replication: the cut erases everything below it at
+                        // action time — but only lower records whose CONTENT intersects
+                        // the rect need the entry.
+                        let cutEntry = GPExportStroke(
+                            color: [0, 0, 0, 1], is_eraser: false, hardness: 1.0,
+                            points: devCorners.map { GPExportPoint(x: Float($0.x), y: Float($0.y), radius: 1.0, opacity: 1.0) },
+                            cut_rect: true)
+                        var cbMinX = devCorners[0].x, cbMaxX = devCorners[0].x
+                        var cbMinY = devCorners[0].y, cbMaxY = devCorners[0].y
+                        for p in devCorners {
+                            cbMinX = min(cbMinX, p.x); cbMaxX = max(cbMaxX, p.x)
+                            cbMinY = min(cbMinY, p.y); cbMaxY = max(cbMaxY, p.y)
+                        }
+                        let cutBox = CGRect(x: cbMinX, y: cbMinY, width: cbMaxX - cbMinX, height: cbMaxY - cbMinY)
+                        for i in 0..<(writingIndex ?? records.count) {
+                            if !recordBounds[i].isNull && recordBounds[i].intersects(cutBox) {
+                                records[i].strokes.append(cutEntry)
+                            }
+                        }
+                        
+                    case "paste_layer":
+                        if let resolved = resolvePasteRender(
+                            action: action, art: art, targetLayerIndex: layerIndex, actionIndex: actionIdx,
+                            dstPenAffine: currentPen.penMatrixAffine ?? .identity,
+                            dstLayerMatrix: actionLayerMatrix,
+                            baseTransform: artToDevice) {
+                            let groupLayers = exportPasteLayers(
+                                resolved: resolved, actionIndex: actionIdx, isMerge: false,
+                                destLayerName: layerName, destLayerOpacity: layerOpacity, colorAlpha: 1.0,
+                                canvasHeight: exportCanvasHeight,
+                                resampleStep: gpExportResampleStep, catmullRom: gpExportCatmullRom)
+                            if !groupLayers.isEmpty {
+                                flushPending()
+                                let firstNew = records.count
+                                records.append(contentsOf: groupLayers)
+                                recordBounds.append(contentsOf: groupLayers.map { strokeBounds($0.strokes) })
+                                // Pasted erasers act on the flat composite too: earlier
+                                // groups of this paste (below their own layer in the
+                                // stack) and everything under the paste. Their own
+                                // group's content is already handled in-position.
+                                for gi in groupLayers.indices {
+                                    for s in groupLayers[gi].strokes where s.is_eraser {
+                                        replicateEraserDown(s, below: firstNew + gi)
+                                    }
+                                }
+                                writingIndex = records.count - 1
+                            }
+                        }
+                        
+                    case "merge_layer":
+                        let opacitySrc = action["opacity_src"] as? Float ?? 1.0
+                        if let resolved = resolveMergeRender(
+                            action: action, art: art, targetLayerIndex: layerIndex, baseTransform: artToDevice) {
+                            let groupLayers = exportPasteLayers(
+                                resolved: resolved, actionIndex: actionIdx, isMerge: true,
+                                destLayerName: layerName, destLayerOpacity: layerOpacity, colorAlpha: opacitySrc,
+                                canvasHeight: exportCanvasHeight,
+                                resampleStep: gpExportResampleStep, catmullRom: gpExportCatmullRom)
+                            if !groupLayers.isEmpty {
+                                flushPending()
+                                let firstNew = records.count
+                                records.append(contentsOf: groupLayers)
+                                recordBounds.append(contentsOf: groupLayers.map { strokeBounds($0.strokes) })
+                                // MERGE: erasers from the merged layer erase only that layer's
+                                // own content — the sibling groups of this merge (from: firstNew).
+                                // They must NOT reach the destination's records below.
+                                for gi in groupLayers.indices {
+                                    for s in groupLayers[gi].strokes where s.is_eraser {
+                                        replicateEraserDown(s, from: firstNew, below: firstNew + gi)
+                                    }
+                                }
+                                writingIndex = records.count - 1
+                            }
+                        }
+                        
+                    default: break
+                }
+            }
+            
+            flushPending()
+            gpExportLayers.append(contentsOf: records)
             return nil
         }
         
-        #if os(macOS)
+#if os(macOS)
         // Render all strokes for this layer with Metal if available
-//        let useSegmentRendering: Bool = true
+        //        let useSegmentRendering: Bool = true
         print("useSegmentRendering: ", useSegmentRendering )
-        if useSegmentRendering, let mr = self.metalRenderer, !layerStrokes.isEmpty, MetalRenderer.useGPURendering {
+        if useSegmentRendering,
+           let mr = self.metalRenderer,
+           !layerOps.isEmpty,
+           MetalRenderer.useGPURendering {
+            
             do {
-                var segmentGroups: [(segments: [GPUSplineSegment], color: SIMD4<Float>, isEraser: Bool, isMarker: Bool)] = []
-                
-                for stroke in layerStrokes {
-                    guard stroke.points.count >= 1 else { continue }
-                    let points = stroke.points.count == 1 ? [stroke.points[0], stroke.points[0]] : stroke.points
-                    
-                    // Calculate effective radius scale
-                    var effectiveRadiusScale: CGFloat = stroke.penMatrixScale
-                    if let affine = stroke.pen.penMatrixAffine {
-                        let scaleX = sqrt(affine.a * affine.a + affine.c * affine.c)
-                        let scaleY = sqrt(affine.b * affine.b + affine.d * affine.d)
-                        effectiveRadiusScale = (scaleX + scaleY) / 2.0
-                    }
-                    let artToDeviceScaleX = sqrt(artToDevice.a * artToDevice.a + artToDevice.c * artToDevice.c)
-                    let artToDeviceScaleY = sqrt(artToDevice.b * artToDevice.b + artToDevice.d * artToDevice.d)
-                    let artToDeviceScale = (artToDeviceScaleX + artToDeviceScaleY) / 2.0
-                    effectiveRadiusScale *= artToDeviceScale * 0.5
-                    
-                    let color = SIMD4<Float>(Float(stroke.pen.color.r), Float(stroke.pen.color.g), Float(stroke.pen.color.b), 1.0)
-                    let flipTransform: CGAffineTransform? = verticalFlipTransform(canvasHeight: CGFloat(layerContext.height))
-                    
-                    var segmentsForStroke: [GPUSplineSegment] = []
-                    
-                    // 1. Apply transforms to raw points first
-                    var transformedPoints: [(p: CGPoint, pressure: Float)] = []
-                    for p in points {
-                        var pt = CGPoint(x: CGFloat(p.x), y: CGFloat(p.y))
-                        if let affine = stroke.pen.penMatrixAffine { pt = pt.applying(affine) }
-                        pt = pt.applying(artToDevice)
-                        if let f = flipTransform { pt = pt.applying(f) }
-                        transformedPoints.append((pt, p.p))
-                    }
-                    
-                    // 2. Extract radii and opacities
-                    var radii: [CGFloat] = []
-                    var opacities: [CGFloat] = []
-                    for tp in transformedPoints {
-                        let (r, op) = pressureToRadiusOpacity(pressure: tp.pressure, pen: stroke.pen, radiusScale: effectiveRadiusScale, gamma: 1.0)
-                        radii.append(r)
-                        opacities.append(CGFloat(op))
-                    }
-                    
-                    // 3. Mirror endpoints for Catmull-Rom
-                    var pts  = transformedPoints.map { $0.p }
-                    var rads = radii
-                    var opas = opacities
-                    
-                    let firstPt = pts[0]
-                    let secondPt = pts[1]
-                    pts.insert(CGPoint(x: 2.0 * firstPt.x - secondPt.x, y: 2.0 * firstPt.y - secondPt.y), at: 0)
-                    rads.insert(rads[0], at: 0)
-                    opas.insert(opas[0], at: 0)
-                    
-                    let lastPt = pts[pts.count - 1]
-                    let secondToLastPt = pts[pts.count - 2]
-                    pts.append(CGPoint(x: 2.0 * lastPt.x - secondToLastPt.x, y: 2.0 * lastPt.y - secondToLastPt.y))
-                    rads.append(rads[rads.count - 1])
-                    opas.append(opas[opas.count - 1])
-                    
-                    // --- Dynamic Geometric Smoothing ---
-                    // If points are closer together than the local radius, they represent a rapid spike.
-                    // We average them with their neighbors to prevent rigid caps, mimicking stamp renderers.
-//                    for _ in 0..<3 {
-//                        var newRads = rads
-//                        var newOpas = opas
-//
-//                        for i in 1..<(pts.count - 1) {
-//                            let distPrev = hypot(pts[i].x - pts[i-1].x, pts[i].y - pts[i-1].y)
-//                            let distNext = hypot(pts[i].x - pts[i+1].x, pts[i].y - pts[i+1].y)
-//                            let localRadius = max(rads[i], 1.0)
-//
-//                            // If distance is smaller than 1.5x radius, apply smoothing
-//                            if distPrev < (localRadius * 1.5) || distNext < (localRadius * 1.5) {
-//                                let avgR = (rads[i-1] + rads[i+1]) * 0.5
-//                                let avgO = (opas[i-1] + opas[i+1]) * 0.5
-//                                // Blend 50% with the average of neighbors
-//                                newRads[i] = (rads[i] + avgR) * 0.5
-//                                newOpas[i] = (opas[i] + avgO) * 0.5
-//                            }
-//                        }
-//                        rads = newRads
-//                        opas = newOpas
-//                    }
-                    
-                    
-                    // 4. Flatten and build segments
-                    let seed = stroke.pen.type == 1 ? arc4random() + 1 : 0
-                    
-                    // Pre-allocate memory to prevent array reallocation during recursion
-                    segmentsForStroke.reserveCapacity((pts.count - 3) * 4)
-                    
-                    for i in 1..<(pts.count - 2) {
-                        let pSpan = CRPointSpan(p0: pts[i-1], p1: pts[i], p2: pts[i+1], p3: pts[i+2])
-                        let rSpan = CRScalarSpan(s0: rads[i-1], s1: rads[i], s2: rads[i+1], s3: rads[i+2])
-                        let oSpan = CRScalarSpan(s0: opas[i-1], s1: opas[i], s2: opas[i+1], s3: opas[i+2])
-                        flattenAndBuild(span: pSpan, rSpan: rSpan, oSpan: oSpan, seed: seed, depth: 0, into: &segmentsForStroke, isPolyline: stroke.isPolyline, isMarker: stroke.pen.isMarker)
-                    }
-                    
-                    segmentGroups.append((segments: segmentsForStroke, color: color, isEraser: stroke.pen.isEraser, isMarker: stroke.pen.isMarker))
-                }
-                
                 let w = Int(self.canvasSize.width * self.scale)
                 let h = Int(self.canvasSize.height * self.scale)
                 
-                // Execute the unified GPU segment path
-                if let cgImage = try mr.renderSegmentGroupsInOrderSync(segmentGroups: segmentGroups, width: w, height: h) {
-                    return cgImage
+                if let image = try mr.renderSegmentGroupsInOrderSync(
+                    layerOps: layerOps,
+                    width: w,
+                    height: h,
+                    artToDevice: artToDevice,
+                    flipTransform: flipTransform
+                ) {
+                    // 3. Pure Y-DOWN: Do NOT flip the image. Metal outputs Y-DOWN, CGContext expects Y-DOWN.
+                    return image
                 }
-                
                 return nil
                 
             } catch {
-                print("Segment rendering failed: \(error)")
+                print("Segment rendering failed: \(error) \n Rendering on CPU.")
                 return renderLayerWithCPU(
-                    strokes: layerStrokes,
+                    art: art,
+                    layerIndex: layerIndex,
                     artToDevice: artToDevice,
-                    context: layerContext,
-                    art: art
+                    context: layerContext
                 )
             }
-        } else if let mr = self.metalRenderer, !layerStrokes.isEmpty, /*let layerTexture = self.layerTexture,*/ MetalRenderer.useGPURendering {
-            do {
-                // Create an array to preserve stroke order
-                var strokeGroups: [(stamps: [Stamp], color: SIMD4<Float>, isEraser: Bool, isMarker: Bool)] = []
-                
-//                NSLog("DEBUG: layerContext size = \(layerContext.width)x\(layerContext.height) ; stroke count = \(layerStrokes.count)")
-
-                // Process each stroke in order
-                for stroke in layerStrokes {
-                    // Resample the stroke
-//                    let useSplineGeometryForLayer = true
-                    // Calculate the step in art space to maintain a consistent device-pixel density
-                    let targetStepInDevicePx: CGFloat = stroke.pen.type == 1 ? 2.0 : 1.5
-                    let artToDeviceScaleX = sqrt(artToDevice.a * artToDevice.a + artToDevice.c * artToDevice.c)
-                    let artToDeviceScaleY = sqrt(artToDevice.b * artToDevice.b + artToDevice.d * artToDevice.d)
-                    var avgArtToDeviceScale = (artToDeviceScaleX + artToDeviceScaleY) / 2.0
-                    if avgArtToDeviceScale <= 0.0 { avgArtToDeviceScale = 1.0 } // Avoid division by zero or negative scale
-                    
-                    var totalArtToDeviceScale = avgArtToDeviceScale
-                    if let affine = stroke.pen.penMatrixAffine {
-                        let scaleY = sqrt(affine.b * affine.b + affine.d * affine.d)
-                        let affineScale = scaleY
-                        totalArtToDeviceScale *= affineScale / scale
-                    }
-                    // Safety clamp to prevent degenerate steps
-                    //             totalArtToDeviceScale = max(totalArtToDeviceScale, 0.01)
-
-                    let stampStepPx = targetStepInDevicePx / totalArtToDeviceScale
-                    
-//                    if let first = stroke.points.first, let last = stroke.points.last {
-//                        print("[P][resample input] count=\(stroke.points.count) p.min=\(stroke.points.map{$0.p}.min() ?? -1) p.max=\(stroke.points.map{$0.p}.max() ?? -1)")
-//                    }
-                    
-                    var resampledArt: [ResampledPoint] = []
-                    
-//                    if useSplineGeometryForLayer {
-                    let splinePoints: [Point] = buildResampledStrokeWithSpline(stroke.points, stepPx: stampStepPx, samplesPerSegment: 6, gamma: 1.0, isPolyline: stroke.isPolyline)
-                        resampledArt = splinePoints.map { p in
-                            ResampledPoint(x: CGFloat(p.x), y: CGFloat(p.y), p: p.p)
-                        }
-//                        print("[P][spline out] count=\(splinePoints.count) p.min=\(splinePoints.map{$0.p}.min() ?? -1) p.max=\(splinePoints.map{$0.p}.max() ?? -1)")
-//                    } else {
-//                        resampledArt = linearResampleAlongSegments(stroke.points, stepPx: stampStepPx)
-//
-//                        print("[P][linear out] count=\(resampledArt.count) p.min=\(resampledArt.map{$0.p}.min() ?? -1) p.max=\(resampledArt.map{$0.p}.max() ?? -1)")
-//
-//                    }
-                    
-                    
-                    if !resampledArt.isEmpty {
-                        var resampledMutable = resampledArt
-//                        print("[P][taper in] p=\(resampledMutable.map{$0.p})")
-                        applyEndTaperToResampled(&resampledMutable, tailSamples: 4, ease: 1.8)
-//                        print("[P][taper out] p=\(resampledMutable.map{$0.p})")
-                        
-                        // Apply transforms
-//                        let mirrorViewVerticallyForLayer = true
-//                        let flipTransform: CGAffineTransform? = mirrorViewVerticallyForLayer ? verticalFlipTransform(canvasHeight: CGFloat(layerContext.height)) : nil
-//                         #if os(macOS)
-                        let flipTransform: CGAffineTransform? = verticalFlipTransform(canvasHeight: CGFloat(layerContext.height))
-//                         #endif
-                        
-                        var deviceResampled: [ResampledPoint] = []
-                        deviceResampled.reserveCapacity(resampledMutable.count)
-                        
-                        for i in 0..<resampledMutable.count {
-                            let rp = resampledMutable[i]
-                            let pressure = rp.p
-                            var pt = CGPoint(x: rp.x, y: rp.y)
-                            
-                            // Apply transforms
-                            if let affine = stroke.pen.penMatrixAffine {
-                                pt = pt.applying(affine)
-                            }
-                            pt = pt.applying(artToDevice)
-                            if let f = flipTransform {
-                                pt = pt.applying(f)
-                            }
-                            
-                            deviceResampled.append(ResampledPoint(location: pt, pressure: pressure))
-                        }
-                        
-                        // Calculate effective radius scale
-                        var effectiveRadiusScale: CGFloat = stroke.penMatrixScale
-                        
-                        if let affine = stroke.pen.penMatrixAffine {
-                            let scaleX = sqrt(affine.a * affine.a + affine.c * affine.c)
-                            let scaleY = sqrt(affine.b * affine.b + affine.d * affine.d)
-                            let affineScale = (scaleX + scaleY) / 2.0
-                            effectiveRadiusScale = affineScale
-                        }
-                        
-                        let artToDeviceScaleX = sqrt(artToDevice.a * artToDevice.a + artToDevice.c * artToDevice.c)
-                        let artToDeviceScaleY = sqrt(artToDevice.b * artToDevice.b + artToDevice.d * artToDevice.d)
-                        let artToDeviceScale = (artToDeviceScaleX + artToDeviceScaleY) / 2.0
-                        
-                        // Adjust for normalized pressure values
-                        effectiveRadiusScale *= artToDeviceScale * 0.5
-                        
-                        // Get the color for this stroke
-                        let color = SIMD4<Float>(Float(stroke.pen.color.r), Float(stroke.pen.color.g), Float(stroke.pen.color.b), 1.0)
-                        
-                        // Convert to stamps
-                        var stampsForStroke: [Stamp] = []
-                        for point in deviceResampled {
-                            let (radius, opacity) = pressureToRadiusOpacity(
-                                pressure: point.pressure,
-                                pen: stroke.pen,
-                                radiusScale: effectiveRadiusScale,
-                                gamma: 1.0
-                            )
-                            
-                            // Debug: Print opacity for solid strokes
-//                            if stroke.pen.opacity >= 0.999 {
-//                                print("DEBUG: Creating stamp for solid stroke - opacity: \(opacity)")
-//                            }
-                            
-                            let stamp = Stamp(
-                                center: SIMD2<Float>(Float(point.location.x), Float(point.location.y)),
-                                radius: Float(radius),
-                                opacity: opacity,
-                                rotation: 0.0,
-                                noiseSeed: stroke.pen.type == 1 ? arc4random() + 1 : 0
-                            )
-
-                            stampsForStroke.append(stamp)
-                        }
-                        
-                        // Add to stroke groups in order, marking if it's an eraser
-                        strokeGroups.append((stamps: stampsForStroke, color: color, isEraser: stroke.pen.isEraser, isMarker: stroke.pen.isMarker))
-                    }
-                }
-                
-                // Get canvas dimensions
-                let w = Int(self.canvasSize.width * self.scale)
-                let h = Int(self.canvasSize.height * self.scale)
-                
-                // Create a temporary context for compositing the results
-                let tempContext = createBitmapContext(size: canvasSize, scale: scale)
-                tempContext.clear(CGRect(x: 0, y: 0, width: tempContext.width, height: tempContext.height))
-                
-                // Render all strokes in order
-                if let cgImage = try mr.renderStrokesInOrderSync(strokeGroups: strokeGroups, width: w, height: h) {
-                    return cgImage
-                }
-                
-                let allP = layerStrokes.flatMap { $0.points.map { $0.p } }
-                print("[P][Layer.summary] strokes=\(layerStrokes.count) min=\(allP.min() ?? -1) max=\(allP.max() ?? -1)")
-
-                
-                // Return the composited result
-                return tempContext.makeImage()
-                
-            } catch {
-                print("Metal layer rendering failed: \(error)")
-                // Fall back to CPU rendering for this layer
-                return renderLayerWithCPU(
-                    strokes: layerStrokes,
-                    artToDevice: artToDevice,
-                    context: layerContext,
-                    art: art
-                )
-            }
-        } else {
-            // No Metal renderer, no strokes, no layer texture, or GPU rendering disabled - use CPU rendering
-            return renderLayerWithCPU(
-                strokes: layerStrokes,
+        } else if let mr = self.metalRenderer, !layerOps.isEmpty, MetalRenderer.useGPURendering {
+            // ── GPU stamp path (re-enabled) ──
+            // Resampled-stamp rendering (kept for its tapers). Cuts are CoreGraphics rect
+            // erases on the compositing context; pastes/merges render as isolated GPU stamp
+            // layers with the selection transforms baked into the point data, and their
+            // masks are applied as CPU inside/outside erases.
+            if let image = renderLayerWithGPUStamps(
+                art: art,
+                layerIndex: layerIndex,
                 artToDevice: artToDevice,
                 context: layerContext,
-                art: art
-            )
+                metalRenderer: mr
+            ) {
+                return image
+            }
+            // Stamp path failed (layerContext may hold partial output) — CPU fallback on a fresh context
+            let freshContext = createBitmapContext(size: canvasSize, scale: scale)
+            Self.clearContext(freshContext, rect: CGRect(x: 0, y: 0, width: freshContext.width, height: freshContext.height))
+            return renderLayerWithCPU(art: art, layerIndex: layerIndex, artToDevice: artToDevice, context: freshContext)
         }
-        #else
+#endif
+        // ── CPU path (re-enabled) ──
+        // Linux / no Metal renderer / GPU rendering disabled: action-order rendering with
+        // CoreGraphics cut rectangles and isolated paste layers. Noise stays off.
         return renderLayerWithCPU(
-            strokes: layerStrokes,
+            art: art,
+            layerIndex: layerIndex,
             artToDevice: artToDevice,
-            context: layerContext,
-            art: art
+            context: layerContext
         )
-        #endif
     }
-    
+   
     // CPU Fallback Function
     private func renderLayerWithCPU(
-        strokes: [StrokeRecord],
+        art: ArtParser,
+        layerIndex: Int,
         artToDevice: CGAffineTransform,
-        context: CGContext,
-        art: ArtParser
+        context: CGContext
     ) -> CGImage? {
         
-//        NSLog("DEBUG: layerContext art = \(art) ; stroke count = \(strokes.count)")
-        // Render all strokes with CPU
-        for stroke in strokes {
-            // Resample the stroke
-//            let useSplineGeometryForLayer = true
-            // Calculate the step in art space to maintain a consistent device-pixel density
-            let targetStepInDevicePx: CGFloat = stroke.pen.type == 1 ? 2.0 : 1.5
-            let artToDeviceScaleX = sqrt(artToDevice.a * artToDevice.a + artToDevice.c * artToDevice.c)
-            let artToDeviceScaleY = sqrt(artToDevice.b * artToDevice.b + artToDevice.d * artToDevice.d)
-            var avgArtToDeviceScale = (artToDeviceScaleX + artToDeviceScaleY) / 2.0
-            if avgArtToDeviceScale <= 0.0 { avgArtToDeviceScale = 1.0 } // Avoid division by zero or negative scale
+        var currentPen = defaultPenInfo()
+        var penMatrixScale: CGFloat = 1.0
+        var actionLayerMatrix = initialActionLayerMatrix(layerIndex: layerIndex, art: art)
+        
+        for (actionIdx, action) in art.actions.enumerated() {
+            guard let actionLayer = action["layer"] as? Int,
+                  actionLayer == layerIndex,
+                  let actionName = action["action_name"] as? String else { continue }
             
-            var totalArtToDeviceScale = avgArtToDeviceScale
-            if let affine = stroke.pen.penMatrixAffine {
-                let scaleY = sqrt(affine.b * affine.b + affine.d * affine.d)
-                let affineScale = scaleY
-                totalArtToDeviceScale *= affineScale / scale
-            }
-            // Safety clamp to prevent degenerate steps
-//             totalArtToDeviceScale = max(totalArtToDeviceScale, 0.01)
-
-            let stampStepPx = targetStepInDevicePx / totalArtToDeviceScale
-            
-            var resampledArt: [ResampledPoint] = []
-            
-            let splinePoints: [Point] = buildResampledStrokeWithSpline(stroke.points, stepPx: stampStepPx, samplesPerSegment: 6, gamma: 1.0, isPolyline: stroke.isPolyline)
-                resampledArt = splinePoints.map { p in
-                    ResampledPoint(x: CGFloat(p.x), y: CGFloat(p.y), p: p.p)
-                }
-            
-            if !resampledArt.isEmpty {
-                var resampledMutable = resampledArt
-                applyEndTaperToResampled(&resampledMutable, tailSamples: 4, ease: 1.8)
-                
-                // Apply transforms
-                #if os(macOS)
-                let flipTransform: CGAffineTransform? = verticalFlipTransform(canvasHeight: CGFloat(context.height))
-                #else
-                let flipTransform: CGAffineTransform? = nil
-                #endif
-
-                var deviceResampled: [ResampledPoint] = []
-                deviceResampled.reserveCapacity(resampledMutable.count)
-                
-                for i in 0..<resampledMutable.count {
-                    let rp = resampledMutable[i]
-                    let pressure = rp.p
-                    var pt = CGPoint(x: rp.x, y: rp.y)
+            switch actionName {
+                case "pen_properties":
+                    actionPenProperties(action: action, currentPen: &currentPen)
+                case "pen_matrix":
+                    actionPenMatrix(action: action, currentPen: &currentPen, penMatrixScale: &penMatrixScale)
+                case "is_eraser":
+                    actionIsEraser(action: action, currentPen: &currentPen)
+                case "pen_color":
+                    actionPenColor(action: action, currentPen: &currentPen)
                     
-                    // Apply transforms
-                    if let affine = stroke.pen.penMatrixAffine {
-                        pt = pt.applying(affine)
+                case "stroke", "polyline", "rect", "ellipse":
+                    var tempStrokes: [StrokeRecord] = []
+                    switch actionName {
+                        case "stroke":
+                            actionStroke(action: action, currentPen: currentPen, penMatrixScale: penMatrixScale, layerStrokes: &tempStrokes)
+                        case "polyline":
+                            actionPolyline(action: action, currentPen: currentPen, penMatrixScale: penMatrixScale, layerStrokes: &tempStrokes)
+                        case "rect":
+                            actionRect(action: action, currentPen: currentPen, penMatrixScale: penMatrixScale, layerStrokes: &tempStrokes)
+                        default:
+                            actionEllipse(action: action, currentPen: currentPen, penMatrixScale: penMatrixScale, layerStrokes: &tempStrokes)
                     }
-                    pt = pt.applying(artToDevice)
-                    if let f = flipTransform {
-                        pt = pt.applying(f)
+                    for stroke in tempStrokes {
+                        drawStrokeOnCPU(stroke: stroke, lb: artToDevice, accNow: .identity, destMap: .identity, context: context)
                     }
                     
-                    deviceResampled.append(ResampledPoint(location: pt, pressure: pressure))
-                }
-                
-                // Calculate effective radius scale
-                var effectiveRadiusScale: CGFloat = stroke.penMatrixScale
-                
-                if let affine = stroke.pen.penMatrixAffine {
-                    let scaleX = sqrt(affine.a * affine.a + affine.c * affine.c)
-                    let scaleY = sqrt(affine.b * affine.b + affine.d * affine.d)
-                    let affineScale = (scaleX + scaleY) / 2.0
-                    effectiveRadiusScale = affineScale
-                }
-                
-                let artToDeviceScaleX = sqrt(artToDevice.a * artToDevice.a + artToDevice.c * artToDevice.c)
-                let artToDeviceScaleY = sqrt(artToDevice.b * artToDevice.b + artToDevice.d * artToDevice.d)
-                let artToDeviceScale = (artToDeviceScaleX + artToDeviceScaleY) / 2.0
-                
-                // Adjust for normalized pressure values
-                effectiveRadiusScale *= artToDeviceScale * 0.5
-                                
-                // Render the stroke
-                renderStroke_drawDeviceResampled(
-                    resampledPoints: deviceResampled,
-                    pen: stroke.pen,
-                    in: context,
-                    radiusScale: effectiveRadiusScale
-                )
+                case "cut":
+                    applyCutRectCPU(context: context, action: action, art: art, actionIndex: actionIdx, baseTransform: artToDevice)
+                    
+                case "paste_layer":
+                    guard let resolved = resolvePasteRender(
+                        action: action, art: art, targetLayerIndex: layerIndex, actionIndex: actionIdx,
+                        dstPenAffine: currentPen.penMatrixAffine ?? .identity,
+                        dstLayerMatrix: actionLayerMatrix,
+                        baseTransform: artToDevice) else { continue }
+                    renderPasteGroupsCPU(resolved: resolved, context: context)
+                    
+                case "merge_layer":
+                    guard let resolved = resolveMergeRender(
+                        action: action, art: art, targetLayerIndex: layerIndex,
+                        baseTransform: artToDevice) else { continue }
+                    renderPasteGroupsCPU(resolved: resolved, context: context)
+                    
+                case "layer_matrix":
+                    if let mRaw = parseMatrixRobust(action["matrix"]) {
+                        actionLayerMatrix = transformFromMatrix(mRaw.map { $0.map { Float($0) } }, scale: 1.0)
+                    }
+                    
+                default: break
             }
         }
-                
-        // Render embedded images
+        
+        // Render embedded images (unchanged — this code already draws in device coords)
         context.saveGState()
-        
-        // 1. Move the origin from the bottom-left to the center of the canvas
-        context.translateBy(x: CGFloat(context.width) / 2.0,
-                            y: CGFloat(context.height) / 2.0)
-        
-        // 2. Apply your art-to-device transform (it will now act relative to the center)
+        context.translateBy(x: CGFloat(context.width) / 2.0, y: CGFloat(context.height) / 2.0)
         context.concatenate(artToDevice)
-        
-        // 3. Draw the images
         renderEmbeddedImages(art: art, in: context)
-        
         context.restoreGState()
         
         return context.makeImage()
     }
+    
+    private func drawStrokeOnCPU(
+        stroke: StrokeRecord,
+        lb: CGAffineTransform,
+        accNow: CGAffineTransform,
+        destMap: CGAffineTransform,
+        context: CGContext
+    ) {
+        guard !stroke.points.isEmpty else { return }
+        let (stampStepPx, effectiveRadiusScale) = strokeScaleParams(stroke: stroke, lb: lb, accNow: accNow, destMap: destMap)
+        
+        let splinePoints = buildResampledStrokeWithSpline(
+            stroke.points, stepPx: stampStepPx, samplesPerSegment: 6, gamma: 1.0, isPolyline: stroke.isPolyline)
+        var resampledArt: [ResampledPoint] = splinePoints.map {
+            ResampledPoint(x: CGFloat($0.x), y: CGFloat($0.y), p: $0.p)
+        }
+        guard !resampledArt.isEmpty else { return }
+        
+        applyEndTaperToResampled(&resampledArt, tailSamples: 4, ease: 1.8)
+        
+        var deviceResampled: [ResampledPoint] = []
+        deviceResampled.reserveCapacity(resampledArt.count)
+        for rp in resampledArt {
+            // Device y-down coords go into the context DIRECTLY (see compositeImageCPU note).
+            let pt = devicePointForStroke(CGPoint(x: rp.x, y: rp.y), stroke: stroke,
+                                          lb: lb, accNow: accNow, destMap: destMap)
+            deviceResampled.append(ResampledPoint(location: pt, pressure: rp.pressure))
+        }
+        
+        renderStroke_drawDeviceResampled(
+            resampledPoints: deviceResampled, pen: stroke.pen, in: context, radiusScale: effectiveRadiusScale)
+    }
+    
+    /// Full point transform: pen affine -> lb (Lsrc ∘ B) -> accNow -> destMap (D).
+    /// Identical chain to the segment path's buildOpFromStroke + GPU D — no flips.
+    private func devicePointForStroke(
+        _ p: CGPoint,
+        stroke: StrokeRecord,
+        lb: CGAffineTransform,
+        accNow: CGAffineTransform,
+        destMap: CGAffineTransform
+    ) -> CGPoint {
+        var pt = p
+        if let affine = stroke.pen.penMatrixAffine { pt = pt.applying(affine) }
+        pt = pt.applying(lb)
+        pt = pt.applying(accNow)
+        pt = pt.applying(destMap)
+        return pt
+    }
+    
+    private func renderPasteGroupsCPU(resolved: ResolvedPasteRender, context: CGContext) {
+        // MERGE: composite the source layer as an isolated fragment — its erasers
+        // erase only the merged layer's own content (reference: flatten the source,
+        // then composite the result over the destination). PASTES stay flat.
+        if resolved.isMerge {
+            let mergeAlpha = CGFloat(min(max(resolved.groups.first?.color.w ?? 1, 0), 1))
+            let fragment = createBitmapContext(size: canvasSize, scale: scale)
+            Self.clearContext(fragment, rect: CGRect(x: 0, y: 0, width: fragment.width, height: fragment.height))
+            for g in resolved.groups {
+                renderPasteGroupCPU(g: g, resolved: resolved, target: fragment, groupAlpha: 1.0)
+            }
+            if let image = fragment.makeImage() {
+                compositeImageCPU(image: image, alpha: mergeAlpha, into: context)
+            }
+            return
+        }
+        for g in resolved.groups {
+            renderPasteGroupCPU(g: g, resolved: resolved, target: context,
+                                groupAlpha: CGFloat(min(max(g.color.w, 0), 1)))
+        }
+    }
+    
+    /// One paste/merge group into `target` (the layer context, or a merge fragment).
+    private func renderPasteGroupCPU(g: PasteRenderGroup, resolved: ResolvedPasteRender,
+                                     target: CGContext, groupAlpha: CGFloat) {
+        if g.maskEntries.isEmpty && !g.isEraser && groupAlpha >= 1.0 {
+            for stroke in g.strokes {
+                drawStrokeOnCPU(stroke: stroke, lb: g.lb, accNow: g.accNow,
+                                destMap: resolved.destMap, context: target)
+            }
+            return
+        }
+        let temp = createBitmapContext(size: canvasSize, scale: scale)
+        Self.clearContext(temp, rect: CGRect(x: 0, y: 0, width: temp.width, height: temp.height))
+        for stroke in g.strokes {
+            var s = stroke
+            if g.isEraser {
+                // alpha coverage; composited with .destinationOut below
+                s.pen.isEraser = false
+                s.pen.isMarker = false
+            }
+            drawStrokeOnCPU(stroke: s, lb: g.lb, accNow: g.accNow, destMap: resolved.destMap, context: temp)
+        }
+        for m in g.maskEntries {
+            applyPasteMaskCPU(context: temp, maskInv: m.inv, rect: m.rect, erase: m.erase, destMap: resolved.destMap)
+        }
+        guard let image = temp.makeImage() else { return }
+        compositeImageCPU(image: image, erase: g.isEraser, alpha: groupAlpha, into: target)
+    }
+    
+    /// Composites a layer-space CGImage into a (y-up) layer context with a RAW draw
+    /// (pixel-exact copy; the y-down main context's raw draw fixes final orientation).
+    private func compositeImageCPU(image: CGImage, erase: Bool = false, alpha: CGFloat = 1.0, into context: CGContext) {
+        context.saveGState()
+        if erase { context.setBlendMode(.destinationOut) }
+        if alpha < 1.0 { context.setAlpha(alpha) }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: context.width, height: context.height))
+        context.restoreGState()
+    }
+    
+    /// Cut rect corners in device y-down space (frame math + y conversion).
+    func cutRectDeviceCorners(action: [String: Any], art: ArtParser,
+                              actionIndex: Int, baseTransform: CGAffineTransform) -> [CGPoint]? {
+        guard let rect = parseFloatArray(action["selection_rect"]), rect.count == 4 else { return nil }
+        let m1: CGAffineTransform
+        if let own = parseMatrixRobust(action["matrix_1"]) {
+            m1 = transformFromMatrix(own.map { $0.map { Float($0) } }, scale: 1.0)
+        } else if let next = nextPasteViewMatrix(in: art.actions, after: actionIndex) {
+            m1 = next
+        } else {
+            m1 = .identity
+            print("CUT: no matrix_1 (own or following paste) — rect used as device px")
+        }
+        let deviceToFrame = baseTransform.inverted().concatenating(m1)
+        let det = deviceToFrame.a * deviceToFrame.d - deviceToFrame.b * deviceToFrame.c
+        guard abs(det) > 1e-12 else { return nil }
+        let frameToDevice = deviceToFrame.inverted()
+        let rectYFlip = verticalFlipTransform(canvasHeight: canvasSize.height * scale)
+        let x = CGFloat(rect[0]), y = CGFloat(rect[1]), w = CGFloat(rect[2]), h = CGFloat(rect[3])
+        return [
+            CGPoint(x: x, y: y), CGPoint(x: x + w, y: y),
+            CGPoint(x: x + w, y: y + h), CGPoint(x: x, y: y + h)
+        ].map { $0.applying(frameToDevice).applying(rectYFlip) }
+    }
+    
+    /// Paste-mask rect corners in device y-down space (frame math + y conversion + destMap).
+    func maskRectDeviceCorners(maskInv: CGAffineTransform, rect: [Float],
+                               destMap: CGAffineTransform) -> [CGPoint]? {
+        guard rect.count == 4 else { return nil }
+        let det = maskInv.a * maskInv.d - maskInv.b * maskInv.c
+        guard abs(det) > 1e-12 else { return nil }
+        let frameToSource = maskInv.inverted()
+        let rectYFlip = verticalFlipTransform(canvasHeight: canvasSize.height * scale)
+        let x = CGFloat(rect[0]), y = CGFloat(rect[1]), w = CGFloat(rect[2]), h = CGFloat(rect[3])
+        return [
+            CGPoint(x: x, y: y), CGPoint(x: x + w, y: y),
+            CGPoint(x: x + w, y: y + h), CGPoint(x: x, y: y + h)
+        ].map { $0.applying(frameToSource).applying(destMap).applying(rectYFlip) }
+    }
+    
+    private func applyCutRectCPU(context: CGContext, action: [String: Any], art: ArtParser,
+                                 actionIndex: Int, baseTransform: CGAffineTransform) {
+        guard let corners = cutRectDeviceCorners(action: action, art: art,
+                                                 actionIndex: actionIndex, baseTransform: baseTransform) else { return }
+        context.saveGState()
+        context.setBlendMode(.clear)
+        context.beginPath()
+        context.addLines(between: corners)
+        context.closePath()
+        context.fillPath()
+        context.restoreGState()
+    }
+    
+    private func applyPasteMaskCPU(context: CGContext, maskInv: CGAffineTransform, rect: [Float],
+                                   erase: Bool, destMap: CGAffineTransform) {
+        guard let corners = maskRectDeviceCorners(maskInv: maskInv, rect: rect, destMap: destMap) else { return }
+        context.saveGState()
+        context.setBlendMode(.clear)
+        context.beginPath()
+        if erase {
+            context.addLines(between: corners)
+            context.closePath()
+            context.fillPath()
+        } else {
+            context.addRect(CGRect(x: 0, y: 0, width: context.width, height: context.height))
+            context.addLines(between: corners)
+            context.closePath()
+            context.fillPath(using: .evenOdd)
+//            context.drawPath(using: .eoFill) // alternative
+        }
+        context.restoreGState()
+    }
+    
+    /// Per-stroke export body. pointTransform is applied AFTER the pen affine
+    /// (art -> device y-down). radiusScale/totalScale come fully computed from the
+    /// caller (regular layers: averaged; pastes: widest-axis selection rule).
+    func exportGPStroke(stroke: StrokeRecord,
+                        pointTransform: CGAffineTransform,
+                        flipTransform: CGAffineTransform,
+                        radiusScale: CGFloat,
+                        totalScale: CGFloat,
+                        resampleStep: CGFloat,
+                        pencilStep: CGFloat,
+                        catmullRom: Bool) -> GPExportStroke? {
+        guard !stroke.points.isEmpty else { return nil }
+        var exportPoints: [GPExportPoint] = []
+        
+        if catmullRom {
+            exportPoints.reserveCapacity(stroke.points.count)
+            for point in stroke.points {
+                let pressure = Float(max(0.0, point.p))
+                var pt = CGPoint(x: CGFloat(point.x), y: CGFloat(point.y))
+                if let affine = stroke.pen.penMatrixAffine { pt = pt.applying(affine) }
+                pt = pt.applying(pointTransform)
+                pt = pt.applying(flipTransform)
+                let (radius, opacity) = pressureToRadiusOpacity(
+                    pressure: pressure, pen: stroke.pen, radiusScale: radiusScale, gamma: 1.0)
+                exportPoints.append(GPExportPoint(x: Float(pt.x), y: Float(pt.y), radius: Float(radius), opacity: opacity))
+            }
+        } else {
+            let targetStepInDevicePx: CGFloat = stroke.pen.type == 1 ? pencilStep : resampleStep
+            let stampStepPx = targetStepInDevicePx / totalScale
+            let splinePoints = buildResampledStrokeWithSpline(
+                stroke.points, stepPx: stampStepPx, samplesPerSegment: 6, gamma: 1.0, isPolyline: stroke.isPolyline)
+            let resampledArt: [ResampledPoint] = splinePoints.map {
+                ResampledPoint(x: CGFloat($0.x), y: CGFloat($0.y), p: $0.p)
+            }
+            if resampledArt.isEmpty { return nil }
+            // (end taper stays disabled for export, as before)
+            exportPoints.reserveCapacity(resampledArt.count)
+            for rp in resampledArt {
+                var pt = CGPoint(x: rp.x, y: rp.y)
+                if let affine = stroke.pen.penMatrixAffine { pt = pt.applying(affine) }
+                pt = pt.applying(pointTransform)
+                pt = pt.applying(flipTransform)
+                let (radius, opacity) = pressureToRadiusOpacity(
+                    pressure: rp.pressure, pen: stroke.pen, radiusScale: radiusScale, gamma: 1.0)
+                exportPoints.append(GPExportPoint(x: Float(pt.x), y: Float(pt.y), radius: Float(radius), opacity: opacity))
+            }
+        }
+        guard !exportPoints.isEmpty else { return nil }
+        
+        let hardness: Float
+        if stroke.pen.type == 1 {
+            hardness = 0.946
+        } else if stroke.pen.opacityMin > 0.5 {
+            hardness = 1.0
+        } else {
+            hardness = 1.0
+        }
+        let color: [Float] = [stroke.pen.color.r, stroke.pen.color.g, stroke.pen.color.b, 1.0]
+        return GPExportStroke(color: color, is_eraser: stroke.pen.isEraser, hardness: hardness, points: exportPoints)
+    }
+    
+    func cutRectStroke(exportCorners: [CGPoint]) -> GPExportStroke {
+        GPExportStroke(color: [0, 0, 0, 1], is_eraser: false, hardness: 1.0,
+                       points: exportCorners.map { GPExportPoint(x: Float($0.x), y: Float($0.y), radius: 1.0, opacity: 1.0) },
+                       cut_rect: true)
+    }
+    
+    /// One GP layer PER GROUP. A group's mask shapes (keep frames + erase quads)
+    /// erase everything below them within their layer, so groups must not share
+    /// one layer: masks scope to their own group in the source semantics (the
+    /// renderers dispatch one masked paste per group). Stacking preserves group
+    /// order; the LAST group's layer is the record subsequent content joins.
+    private func exportPasteLayers(resolved: ResolvedPasteRender,
+                           actionIndex: Int,
+                           isMerge: Bool,
+                           destLayerName: String,
+                           destLayerOpacity: Float,
+                           colorAlpha: Float,
+                           canvasHeight: CGFloat,
+                           resampleStep: CGFloat,
+                           catmullRom: Bool) -> [GPExportLayer] {
+        let pencilStep = resampleStep * 0.75
+        let exportFlip = verticalFlipTransform(canvasHeight: canvasHeight)
+        let baseName = "\(destLayerName) [\(isMerge ? "merge" : "paste") \(actionIndex)]"
+        var layers: [GPExportLayer] = []
+        
+        for (gi, g) in resolved.groups.enumerated() {
+            // pen affine -> lb -> accNow -> destMap, then the export flip
+            let pointTransform = g.lb.concatenating(g.accNow).concatenating(resolved.destMap)
+            
+            let lbScaleX = sqrt(g.lb.a * g.lb.a + g.lb.c * g.lb.c)
+            let lbScaleY = sqrt(g.lb.b * g.lb.b + g.lb.d * g.lb.d)
+            var avgLbScale = (lbScaleX + lbScaleY) / 2.0
+            if avgLbScale <= 0.0 { avgLbScale = 1.0 }
+            let selectionScale = maxAxisScale(g.accNow) * maxAxisScale(resolved.destMap)
+            
+            var strokes: [GPExportStroke] = []
+            var minX = CGFloat.greatestFiniteMagnitude, minY = CGFloat.greatestFiniteMagnitude
+            var maxX = -CGFloat.greatestFiniteMagnitude, maxY = -CGFloat.greatestFiniteMagnitude
+            var maxRadius: CGFloat = 0
+            
+            for stroke in g.strokes {
+                guard !stroke.points.isEmpty else { continue }
+                var effectiveRadiusScale: CGFloat = stroke.penMatrixScale
+                if let affine = stroke.pen.penMatrixAffine {
+                    let sx = sqrt(affine.a * affine.a + affine.c * affine.c)
+                    let sy = sqrt(affine.b * affine.b + affine.d * affine.d)
+                    effectiveRadiusScale = (sx + sy) / 2.0
+                }
+                effectiveRadiusScale *= avgLbScale * selectionScale * 0.5
+                
+                var totalScale = avgLbScale * selectionScale
+                if let affine = stroke.pen.penMatrixAffine {
+                    let affineScale = sqrt(affine.b * affine.b + affine.d * affine.d)
+                    totalScale *= affineScale / scale
+                }
+                
+                if let s = exportGPStroke(stroke: stroke, pointTransform: pointTransform,
+                                          flipTransform: exportFlip, radiusScale: effectiveRadiusScale,
+                                          totalScale: totalScale, resampleStep: resampleStep,
+                                          pencilStep: pencilStep, catmullRom: catmullRom) {
+                    strokes.append(s)
+                    for p in s.points {
+                        minX = min(minX, CGFloat(p.x)); maxX = max(maxX, CGFloat(p.x))
+                        minY = min(minY, CGFloat(p.y)); maxY = max(maxY, CGFloat(p.y))
+                        maxRadius = max(maxRadius, CGFloat(p.radius))
+                    }
+                }
+            }
+            
+            // This group's OWN content bounds — the keep frame only has to
+            // cover this group's strokes (not the running union).
+            guard minX <= maxX, minY <= maxY else { continue }
+            let pad = maxRadius + 16.0
+            let layerBounds = CGRect(x: minX - pad, y: minY - pad,
+                                     width: (maxX - minX) + 2.0 * pad,
+                                     height: (maxY - minY) + 2.0 * pad)
+            
+            for m in g.maskEntries {
+                guard let devCorners = maskRectDeviceCorners(maskInv: m.inv, rect: m.rect,
+                                                             destMap: resolved.destMap) else { continue }
+                let exportCorners = devCorners      // already in the JSON's y convention
+                if m.erase {
+                    // erase INSIDE the mask rect: the quad itself
+                    strokes.append(cutRectStroke(exportCorners: exportCorners))
+                } else {
+                    // keep: erase OUTSIDE via the frame — this group's layer only
+                    for shape in outsideKeepFrameShapes(keepQuad: exportCorners, bounds: layerBounds) {
+                        strokes.append(cutRectStroke(exportCorners: shape))
+                    }
+                }
+            }
+            
+            guard !strokes.isEmpty else { continue }
+            layers.append(GPExportLayer(
+                name: gi == 0 ? baseName : "\(baseName) #\(gi + 1)",
+                opacity: destLayerOpacity * colorAlpha,
+                visible: true,
+                strokes: strokes))
+        }
+        return layers
+    }
+
+    
+    
+    /// "Erase outside the keep quad" as up to 4 shapes: the outside of a convex quad
+    /// is the union of the four outside-edge half-planes; clip the bounds polygon
+    /// against each. Axis-aligned quads yield plain rectangles.
+    func outsideKeepFrameShapes(keepQuad: [CGPoint], bounds: CGRect) -> [[CGPoint]] {
+        guard keepQuad.count == 4 else { return [] }
+        let cx = (keepQuad[0].x + keepQuad[1].x + keepQuad[2].x + keepQuad[3].x) / 4.0
+        let cy = (keepQuad[0].y + keepQuad[1].y + keepQuad[2].y + keepQuad[3].y) / 4.0
+        var area: CGFloat = 0
+        for i in 0..<4 {
+            let a = keepQuad[i], b = keepQuad[(i + 1) % 4]
+            area += a.x * b.y - b.x * a.y
+        }
+        let boundsCorners = [
+            CGPoint(x: bounds.minX, y: bounds.minY), CGPoint(x: bounds.maxX, y: bounds.minY),
+            CGPoint(x: bounds.maxX, y: bounds.maxY), CGPoint(x: bounds.minX, y: bounds.maxY)
+        ]
+        // Degenerate selection: keep nothing — erase the whole bounds.
+        guard abs(area) > 1e-6 else { return [boundsCorners] }
+        
+        var shapes: [[CGPoint]] = []
+        for i in 0..<4 {
+            let p1 = keepQuad[i], p2 = keepQuad[(i + 1) % 4]
+            let ex = p2.x - p1.x, ey = p2.y - p1.y
+            func side(_ q: CGPoint) -> CGFloat { ex * (q.y - p1.y) - ey * (q.x - p1.x) }
+            let centroidSide = side(CGPoint(x: cx, y: cy))
+            guard abs(centroidSide) > 1e-9 else { continue }
+            func isOutside(_ q: CGPoint) -> Bool { side(q) * centroidSide < 0 }   // boundary stays kept
+            
+            var clipped: [CGPoint] = []
+            for j in 0..<boundsCorners.count {
+                let cur = boundsCorners[j], nxt = boundsCorners[(j + 1) % boundsCorners.count]
+                let curOut = isOutside(cur), nxtOut = isOutside(nxt)
+                if nxtOut {
+                    if !curOut { clipped.append(edgeLineIntersection(cur, nxt, p1: p1, ex: ex, ey: ey)) }
+                    clipped.append(nxt)
+                } else if curOut {
+                    clipped.append(edgeLineIntersection(cur, nxt, p1: p1, ex: ex, ey: ey))
+                }
+            }
+            if clipped.count >= 3 { shapes.append(clipped) }
+        }
+        return shapes
+    }
+    
+    private func edgeLineIntersection(_ a: CGPoint, _ b: CGPoint, p1: CGPoint, ex: CGFloat, ey: CGFloat) -> CGPoint {
+        let sa = ex * (a.y - p1.y) - ey * (a.x - p1.x)
+        let sb = ex * (b.y - p1.y) - ey * (b.x - p1.x)
+        let denom = sa - sb
+        guard abs(denom) > 1e-12 else { return a }
+        let t = sa / denom
+        return CGPoint(x: a.x + t * (b.x - a.x), y: a.y + t * (b.y - a.y))
+    }
+    
+    /// Initial action-time layer matrix: a layer with any layer_matrix action is
+    /// action-driven from identity; a layer with none keeps its saved matrix.
+    private func initialActionLayerMatrix(layerIndex: Int, art: ArtParser) -> CGAffineTransform {
+        let hasLayerMatrixAction = art.actions.contains { a in
+            (a["layer"] as? Int) == layerIndex && (a["action_name"] as? String) == "layer_matrix"
+        }
+        return hasLayerMatrixAction ? .identity : layerMatrix(ofLayer: layerIndex, in: art)
+    }
+    
+    /// Widest-axis scale of a transform — the "widest rectangle side" rule for
+    /// non-uniform selection transforms: radius/pressure scale as if the transform
+    /// were uniform by this factor (equals zoom_2/zoom_1 for uniform pastes).
+    private func maxAxisScale(_ t: CGAffineTransform) -> CGFloat {
+        let sx = sqrt(t.a * t.a + t.c * t.c)
+        let sy = sqrt(t.b * t.b + t.d * t.d)
+        return max(sx, sy)
+    }
+    
+    /// Shared scale computation for the stamp/CPU point paths (existing idioms for
+    /// pen affine + layer/view; selection transforms contribute their widest axis).
+    private func strokeScaleParams(
+        stroke: StrokeRecord,
+        lb: CGAffineTransform,
+        accNow: CGAffineTransform,
+        destMap: CGAffineTransform
+    ) -> (stepPx: CGFloat, radiusScale: CGFloat) {
+        let targetStepInDevicePx: CGFloat = stroke.pen.type == 1 ? 2.0 : 1.5
+        let lbScaleX = sqrt(lb.a * lb.a + lb.c * lb.c)
+        let lbScaleY = sqrt(lb.b * lb.b + lb.d * lb.d)
+        var avgLbScale = (lbScaleX + lbScaleY) / 2.0
+        if avgLbScale <= 0.0 { avgLbScale = 1.0 }
+        
+        // SELECTION SCALE: widest axis (max, not averaged).
+        // (zoom_2/zoom_1 equivalent for uniform m2 — swap in here if parsed instead)
+        let selectionScale = maxAxisScale(accNow) * maxAxisScale(destMap)
+        
+        var totalScale = avgLbScale * selectionScale
+        if let affine = stroke.pen.penMatrixAffine {
+            let affineScale = sqrt(affine.b * affine.b + affine.d * affine.d)
+            totalScale *= affineScale / scale
+        }
+        let stampStepPx = targetStepInDevicePx / totalScale
+        
+        var effectiveRadiusScale: CGFloat = stroke.penMatrixScale
+        if let affine = stroke.pen.penMatrixAffine {
+            let scaleX = sqrt(affine.a * affine.a + affine.c * affine.c)
+            let scaleY = sqrt(affine.b * affine.b + affine.d * affine.d)
+            effectiveRadiusScale = (scaleX + scaleY) / 2.0
+        }
+        effectiveRadiusScale *= avgLbScale * selectionScale * 0.5
+        
+        return (stampStepPx, effectiveRadiusScale)
+    }
+
+    
+    private func buildStrokesForLayer(
+        layerIndex: Int,
+        art: ArtParser,
+        baseTransform: CGAffineTransform,
+        visited: Set<Int> = []
+    ) -> [ResolvedStroke] {
+        
+        var resolvedStrokes: [ResolvedStroke] = []
+        var currentPen = defaultPenInfo()
+        var penMatrixScale: CGFloat = 1.0
+        
+        guard layerIndex >= 0, layerIndex < art.layers.count else { return [] }
+        if visited.contains(layerIndex) {
+//            print("REPLAY L\(layerIndex): cyclic reference \(visited) — skipped")
+            return []
+        }
+        
+        for (actionIdx, action) in art.actions.enumerated() {
+                        
+            guard let actionLayer = action["layer"] as? Int,
+                  actionLayer == layerIndex,
+                  let actionName = action["action_name"] as? String else { continue }
+            
+            switch actionName {
+                    
+                case "pen_properties":
+                    actionPenProperties(action: action, currentPen: &currentPen)
+                    
+                case "pen_matrix":
+                    actionPenMatrix(action: action, currentPen: &currentPen,
+                                    penMatrixScale: &penMatrixScale)
+                    
+                case "is_eraser":
+                    actionIsEraser(action: action, currentPen: &currentPen)
+                    
+                case "pen_color":
+                    actionPenColor(action: action, currentPen: &currentPen)
+                    
+                case "stroke":
+                    var strokes: [StrokeRecord] = []
+                    actionStroke(action: action, currentPen: currentPen,
+                                 penMatrixScale: penMatrixScale, layerStrokes: &strokes)
+                    for stroke in strokes {
+                        resolvedStrokes.append(ResolvedStroke(
+                            stroke: stroke,
+                            accumulatedDeviceTransform: .identity,
+                            sourceLayerIndex: layerIndex,
+                            selectionRect: []))
+                    }
+                    
+                case "polyline":
+                    var strokes: [StrokeRecord] = []
+                    actionPolyline(action: action, currentPen: currentPen,
+                                   penMatrixScale: penMatrixScale, layerStrokes: &strokes)
+                    for stroke in strokes {
+                        resolvedStrokes.append(ResolvedStroke(
+                            stroke: stroke,
+                            accumulatedDeviceTransform: .identity,
+                            sourceLayerIndex: layerIndex,
+                            selectionRect: []))
+                    }
+                    
+                case "rect":
+                    var strokes: [StrokeRecord] = []
+                    actionRect(action: action, currentPen: currentPen,
+                               penMatrixScale: penMatrixScale, layerStrokes: &strokes)
+                    for stroke in strokes {
+                        resolvedStrokes.append(ResolvedStroke(
+                            stroke: stroke,
+                            accumulatedDeviceTransform: .identity,
+                            sourceLayerIndex: layerIndex,
+                            selectionRect: []))
+                    }
+                    
+                case "ellipse":
+                    var strokes: [StrokeRecord] = []
+                    actionEllipse(action: action, currentPen: currentPen,
+                                  penMatrixScale: penMatrixScale, layerStrokes: &strokes)
+                    for stroke in strokes {
+                        resolvedStrokes.append(ResolvedStroke(
+                            stroke: stroke,
+                            accumulatedDeviceTransform: .identity,
+                            sourceLayerIndex: layerIndex,
+                            selectionRect: []))
+                    }
+                    
+                case "cut":
+                    guard let rect = parseFloatArray(action["selection_rect"]),
+                          rect.count == 4 else { continue }
+                    // Cuts carry no matrix of their own; borrow the action-time view
+                    // from the next paste_layer in global order. A trailing cut (no
+                    // following paste) falls back to identity — the rect is device px,
+                    // the same convention as the destination-layer cut path. (Skipping
+                    // these left trailing source-layer cuts with no effect on any
+                    // paste of that layer.)
+                    let m1cut: CGAffineTransform
+                    if let own = parseMatrixRobust(action["matrix_1"]) {
+                        m1cut = transformFromMatrix(own.map { $0.map { Float($0) } }, scale: 1.0)
+                    } else if let next = nextPasteViewMatrix(in: art.actions, after: actionIdx) {
+                        m1cut = next
+                    } else {
+                        m1cut = .identity
+                    }
+                    // Erases everything collected so far in this layer's replay.
+                    for i in resolvedStrokes.indices {
+                        resolvedStrokes[i].masks.append(StrokeMask(
+                            m1: m1cut, rect: rect,
+                            accRef: resolvedStrokes[i].accumulatedDeviceTransform,
+                            erase: true))
+                    }
+                    
+                case "paste_layer":
+                    guard let fromLayer = action["from_layer"] as? Int,
+                          fromLayer >= 0, fromLayer < art.layers.count,
+                          let selectionRect = parseFloatArray(action["selection_rect"]),
+                          selectionRect.count == 4,
+                          let m1raw = parseMatrixRobust(action["matrix_1"]),
+                          let m2raw = parseMatrixRobust(action["matrix_2"]) else { continue }
+                    
+                    let matrix1 = transformFromMatrix(m1raw.map { $0.map { Float($0) } }, scale: 1.0)
+                    let matrix2 = transformFromMatrix(m2raw.map { $0.map { Float($0) } }, scale: 1.0)
+                    let Bi = baseTransform.inverted()
+                    
+                    let pen: CGAffineTransform
+                    let sel2Dev: CGAffineTransform
+                    if isIdentityTransform(matrix1) {
+                        pen = currentPen.penMatrixAffine ?? .identity
+                        sel2Dev = matrix1.inverted().concatenating(pen) // rotationOnlyInverse(matrix1).concatenating(pen)
+                            .concatenating(layerMatrix(ofLayer: layerIndex, in: art))
+                    } else if pasteFollowsCut(art: art, layerIndex: layerIndex,
+                                              pasteActionIndex: actionIdx, pasteRect: selectionRect) {
+                        pen = .identity
+                        sel2Dev = matrix1.inverted()
+                    } else {
+                        pen = currentPen.penMatrixAffine ?? .identity
+                        sel2Dev = pen.concatenating(layerMatrix(ofLayer: layerIndex, in: art))
+                    }
+                    let pasteDeviceMap = Bi.concatenating(matrix1).concatenating(matrix2)
+                        .concatenating(sel2Dev).concatenating(baseTransform)
+
+                    
+                    // Clipboard semantics: the ENTIRE source layer is the paste source.
+                    let sourceStrokes = buildStrokesForLayer(
+                        layerIndex: fromLayer,
+                        art: art,
+                        baseTransform: baseTransform,
+                        visited: visited.union([layerIndex]))
+                    
+//                    print("REPLAY merge@\(actionIdx) L\(layerIndex)<-L\(fromLayer): \(sourceStrokes.count) strokes (full replay)")
+                    
+                    for resolved in sourceStrokes {
+                        var masks = resolved.masks
+                        // Keep-mask for THIS paste's selection, recorded pre-move.
+                        masks.append(StrokeMask(
+                            m1: matrix1, rect: selectionRect,
+                            accRef: resolved.accumulatedDeviceTransform,
+                            erase: false))
+                        resolvedStrokes.append(ResolvedStroke(
+                            stroke: resolved.stroke,
+                            accumulatedDeviceTransform:
+                                resolved.accumulatedDeviceTransform.concatenating(pasteDeviceMap),
+                            sourceLayerIndex: resolved.sourceLayerIndex,
+                            selectionRect: selectionRect,
+                            masks: masks))
+                    }
+                    
+                case "merge_layer":
+                    guard let fromLayer = action["from_layer"] as? Int,
+                          fromLayer >= 0, fromLayer < art.layers.count else { continue }
+                    // NOTE: `matrix`+`zoom` is an action-time view snapshot (like
+                    // matrix_1/zoom_1 in pastes) — deliberately NOT parsed or applied.
+                    // Snapshot semantics: source layer as it exists AT the merge.
+                    let sourceStrokes = buildStrokesForLayer(
+                        layerIndex: fromLayer,
+                        art: art,
+                        baseTransform: baseTransform,
+                        visited: visited.union([layerIndex]))
+                    
+//                    print("REPLAY merge@\(actionIdx) L\(layerIndex)<-L\(fromLayer): \(sourceStrokes.count) strokes (cutoff=\(actionIdx))")
+                    
+                    // Merge preserves canvas position: B ∘ Ldst ∘ B⁻¹
+                    let mergeDeviceMap = baseTransform.inverted()
+                        .concatenating(layerMatrix(ofLayer: layerIndex, in: art))
+                        .concatenating(baseTransform)
+                    
+                    for resolved in sourceStrokes {
+                        resolvedStrokes.append(ResolvedStroke(
+                            stroke: resolved.stroke,
+                            accumulatedDeviceTransform:
+                                resolved.accumulatedDeviceTransform.concatenating(mergeDeviceMap),
+                            sourceLayerIndex: resolved.sourceLayerIndex,
+                            selectionRect: [],
+                            masks: resolved.masks))
+                    }
+                    
+                default: break
+            }
+        }
+        
+//        let bySrc = Dictionary(grouping: resolvedStrokes, by: { $0.sourceLayerIndex })
+//            .map { "L\($0.key)=\($0.value.count)" }
+//            .sorted().joined(separator: ", ")
+//        print("REPLAY L\(layerIndex) done: \(resolvedStrokes.count) strokes {\(bySrc)}")
+        return resolvedStrokes
+    }
+
+    
+    private func parseMatrixRobust(_ v: Any?) -> [[Double]]? {
+        if let m = v as? [[Double]] {
+            return m
+        }
+        
+        if let m = v as? [[Float]] {
+            return m.map { row in
+                row.map { Double($0) }
+            }
+        }
+        
+        if let mAny = v as? [[Any]] {
+            var result: [[Double]] = []
+            result.reserveCapacity(mAny.count)
+            
+            for row in mAny {
+                var converted: [Double] = []
+                converted.reserveCapacity(row.count)
+                
+                for item in row {
+                    switch item {
+                        case let d as Double:
+                            converted.append(d)
+                        case let f as Float:
+                            converted.append(Double(f))
+                        case let i as Int:
+                            converted.append(Double(i))
+                        case let i as Int32:
+                            converted.append(Double(i))
+                        case let i as Int64:
+                            converted.append(Double(i))
+                        case let s as String:
+                            guard let d = Double(s) else {
+                                return nil
+                            }
+                            converted.append(d)
+                        default:
+                            return nil
+                    }
+                }
+                
+                result.append(converted)
+            }
+            
+            return result
+        }
+        
+        // Some parser/debug paths expose the whole 4x4 matrix as a string.
+        if let string = v as? String,
+           let data = string.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data),
+           let matrix = object as? [[Any]] {
+            return parseMatrixRobust(matrix)
+        }
+        
+        return nil
+    }
+    
+    private func parseFloatArray(_ v: Any?) -> [Float]? {
+        if let arr = v as? [Float] { return arr }
+        if let arr = v as? [Double] { return arr.map { Float($0) } }
+        if let arrAny = v as? [Any] {
+            var res: [Float] = []
+            for item in arrAny {
+                if let f = item as? Float { res.append(f) }
+                else if let d = item as? Double { res.append(Float(d)) }
+                else if let i = item as? Int { res.append(Float(i)) }
+                else if let s = item as? String, let d = Double(s) { res.append(Float(d)) }
+                else { return nil }
+            }
+            return res
+        }
+        return nil
+    }
+    
+    // A wrapper to use with your existing transformFromMatrix logic
+//    private func transformFromAnyMatrix(_ v: Any?) -> CGAffineTransform {
+//        guard let m = parseMatrixRobust(v),
+//              m.count >= 4,
+//              m[0].count >= 2,
+//              m[1].count >= 2,
+//              m[3].count >= 2 else {
+//            return .identity
+//        }
+//
+//        let a  = CGFloat(m[0][0])
+//        let b  = -CGFloat(m[1][0])
+//        let c  = -CGFloat(m[0][1])
+//        let d  = CGFloat(m[1][1])
+//        let tx = CGFloat(m[3][0])
+//        let ty = CGFloat(m[3][1])
+//
+//        return CGAffineTransform(
+//            a: a,
+//            b: b,
+//            c: c,
+//            d: d,
+//            tx: tx,
+//            ty: ty
+//        )
+//    }
+    
+//    private func applyEraseRects(image: CGImage, rects: [(center: CGPoint, halfExtents: CGPoint)]) -> CGImage? {
+//        let width = image.width
+//        let height = image.height
+//
+//        guard let context = CGContext(
+//            data: nil,
+//            width: width,
+//            height: height,
+//            bitsPerComponent: 8,
+//            bytesPerRow: 0,
+//            space: CGColorSpaceCreateDeviceRGB(),
+//            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+//        ) else { return nil }
+//
+//        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
+//        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+//
+//        context.setBlendMode(.destinationOut)
+//        context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+//
+//        for rect in rects {
+//            let flippedCenterY = CGFloat(height) - rect.center.y
+//            let drawRect = CGRect(
+//                x: rect.center.x - rect.halfExtents.x,
+//                y: flippedCenterY - rect.halfExtents.y,
+//                width: rect.halfExtents.x * 2,
+//                height: rect.halfExtents.y * 2
+//            )
+//            context.fill(drawRect)
+//        }
+//
+//        return context.makeImage()
+//    }
+    
+    private func applyErasePolygons(image: CGImage, polygons: [[CGPoint]]) -> CGImage? {
+        let w = image.width
+        let h = image.height
+        guard let context = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        
+        let rect = CGRect(x: 0, y: 0, width: w, height: h)
+        
+        // MAKE CONTEXT Y-DOWN
+//        context.scaleBy(x: 1, y: -1)
+//        context.translateBy(x: 0, y: -CGFloat(h))
+        
+        // 1. Draw the image. It now aligns perfectly right-side up in memory.
+        context.draw(image, in: rect)
+        
+        context.saveGState()
+        context.setBlendMode(.destinationOut)
+        context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+        
+        for polygon in polygons {
+            if polygon.count > 2 {
+                context.beginPath()
+                // 2. Polygons are Y-down. Context is Y-down. Perfect alignment.
+                context.addLines(between: polygon)
+                context.closePath()
+                context.fillPath()
+            }
+        }
+        context.restoreGState()
+        
+        return context.makeImage()
+    }
+    
+    /// AABB of a cut_rect entry's corner points (JSON space).
+    private func cutEntryBox(_ s: GPExportStroke) -> CGRect {
+        guard s.points.count >= 3 else { return .null }
+        var minX = CGFloat.greatestFiniteMagnitude, minY = CGFloat.greatestFiniteMagnitude
+        var maxX = -CGFloat.greatestFiniteMagnitude, maxY = -CGFloat.greatestFiniteMagnitude
+        for p in s.points {
+            minX = min(minX, CGFloat(p.x)); maxX = max(maxX, CGFloat(p.x))
+            minY = min(minY, CGFloat(p.y)); maxY = max(maxY, CGFloat(p.y))
+        }
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+    
+    /// Drops cut_rect entries with nothing to erase on the record they're being
+    /// written to (existing record content + this batch's strokes). contentBox is
+    /// a superset of what any entry in the batch can reach, so this never drops
+    /// an entry that would erase something — it only removes no-ops. Lower-record
+    /// replication is gated separately (same criterion) and is unaffected.
+    private func dropNoOpCutEntries(_ strokes: [GPExportStroke], contentBox: CGRect) -> [GPExportStroke] {
+        guard strokes.contains(where: { $0.cut_rect == true }) else { return strokes }
+        guard !contentBox.isNull else { return strokes.filter { $0.cut_rect != true } }
+        return strokes.filter { s in
+            guard s.cut_rect == true else { return true }
+            let box = cutEntryBox(s)
+            return !box.isNull && contentBox.intersects(box)
+        }
+    }
+    
+    /// JSON-space bounds of exported strokes (points ± radius). cut_rect entries
+    /// are erase operators and erasers carry no content — both are excluded from
+    /// CONTENT bounds; pass includeErasers: true to measure an eraser's reach.
+    private func strokeBounds(_ strokes: [GPExportStroke], includeErasers: Bool = false) -> CGRect {
+        var minX = CGFloat.greatestFiniteMagnitude, minY = CGFloat.greatestFiniteMagnitude
+        var maxX = -CGFloat.greatestFiniteMagnitude, maxY = -CGFloat.greatestFiniteMagnitude
+        for s in strokes {
+            if s.cut_rect == true { continue }
+            if s.is_eraser && !includeErasers { continue }
+            for p in s.points {
+                let r = CGFloat(p.radius)
+                minX = min(minX, CGFloat(p.x) - r)
+                maxX = max(maxX, CGFloat(p.x) + r)
+                minY = min(minY, CGFloat(p.y) - r)
+                maxY = max(maxY, CGFloat(p.y) + r)
+            }
+        }
+        guard minX <= maxX, minY <= maxY else { return .null }
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+    
+    private func unionBounds(_ a: CGRect, _ b: CGRect) -> CGRect {
+        if a.isNull { return b }
+        if b.isNull { return a }
+        return a.union(b)
+    }
+    
+#if os(macOS)
+    // MARK: - GPU stamp path (re-enabled)
+    
+    // Resampled-stamp GPU rendering via renderStrokesInOrderSync. Action order is
+    // preserved by flushing GPU runs at every cut/paste boundary:
+    //   - strokes     -> stamp batches in the current run (draw or erase kind)
+    //   - erase runs  -> rendered as alpha coverage, composited with .destinationOut
+    //                    so they erase everything composited below (incl. pasted content)
+    //   - cut         -> flush + CoreGraphics rect erase on the layer context
+    //   - paste/merge -> flush + isolated GPU layer per group + CPU mask erases
+    // Returns nil on GPU failure; the caller falls back to the CPU path.
+    private func renderLayerWithGPUStamps(
+        art: ArtParser,
+        layerIndex: Int,
+        artToDevice: CGAffineTransform,
+        context: CGContext,
+        metalRenderer: MetalRenderer
+    ) -> CGImage? {
+        
+        let w = Int(canvasSize.width * scale)
+        let h = Int(canvasSize.height * scale)
+        
+        enum RunKind { case draw, erase }
+        var run: (kind: RunKind, batches: [(stamps: [Stamp], color: SIMD4<Float>, isMarker: Bool)])? = nil
+        
+        func flushRun() -> Bool {
+            guard let r = run, !r.batches.isEmpty else { run = nil; return true }
+            run = nil
+            let groups = r.batches.map {
+                (stamps: $0.stamps, color: $0.color, isEraser: false,
+                 isMarker: r.kind == .erase ? false : $0.isMarker)
+            }
+            let image: CGImage
+            do {
+                guard let img = try metalRenderer.renderStrokesInOrderSync(strokeGroups: groups, width: w, height: h) else {
+                    print("GPU stamp flush returned nil (\(r.kind) run, \(r.batches.count) batch(es))")
+                    return false
+                }
+                image = img
+            } catch {
+                print("GPU stamp flush failed: \(error)")
+                return false
+            }
+            compositeImageCPU(image: image, erase: r.kind == .erase, into: context)
+            return true
+        }
+        
+        func appendRun(_ kind: RunKind,
+                       _ batch: (stamps: [Stamp], color: SIMD4<Float>, isMarker: Bool)) -> Bool {
+            if run?.kind != kind {
+                if !flushRun() { return false }
+                run = (kind: kind, batches: [])
+            }
+            run!.batches.append(batch)
+            return true
+        }
+        
+        var currentPen = defaultPenInfo()
+        var penMatrixScale: CGFloat = 1.0
+        var failed = false
+        var actionLayerMatrix = initialActionLayerMatrix(layerIndex: layerIndex, art: art)
+        
+        for (actionIdx, action) in art.actions.enumerated() {
+            guard let actionLayer = action["layer"] as? Int,
+                  actionLayer == layerIndex,
+                  let actionName = action["action_name"] as? String else { continue }
+            
+            switch actionName {
+                case "pen_properties":
+                    actionPenProperties(action: action, currentPen: &currentPen)
+                case "pen_matrix":
+                    actionPenMatrix(action: action, currentPen: &currentPen, penMatrixScale: &penMatrixScale)
+                case "is_eraser":
+                    actionIsEraser(action: action, currentPen: &currentPen)
+                case "pen_color":
+                    actionPenColor(action: action, currentPen: &currentPen)
+                    
+                case "stroke", "polyline", "rect", "ellipse":
+                    var tempStrokes: [StrokeRecord] = []
+                    switch actionName {
+                        case "stroke":
+                            actionStroke(action: action, currentPen: currentPen, penMatrixScale: penMatrixScale, layerStrokes: &tempStrokes)
+                        case "polyline":
+                            actionPolyline(action: action, currentPen: currentPen, penMatrixScale: penMatrixScale, layerStrokes: &tempStrokes)
+                        case "rect":
+                            actionRect(action: action, currentPen: currentPen, penMatrixScale: penMatrixScale, layerStrokes: &tempStrokes)
+                        default:
+                            actionEllipse(action: action, currentPen: currentPen, penMatrixScale: penMatrixScale, layerStrokes: &tempStrokes)
+                    }
+                    for stroke in tempStrokes {
+                        guard let batch = buildStampBatch(stroke: stroke, lb: artToDevice, accNow: .identity, destMap: .identity) else { continue }
+                        if !appendRun(stroke.pen.isEraser ? .erase : .draw,
+                                      (stamps: batch.stamps, color: batch.color, isMarker: batch.isMarker)) {
+                            failed = true
+                            break
+                        }
+                    }
+                    
+                case "cut":
+                    if !flushRun() { failed = true; break }
+                    applyCutRectCPU(context: context, action: action, art: art, actionIndex: actionIdx,
+                                    baseTransform: artToDevice)
+                    
+                    // flushRun() composite:
+//                    compositeImageCPU(image: image, erase: r.kind == .erase, into: context)
+                    
+
+                    
+                case "paste_layer":
+                    if !flushRun() { failed = true; break }
+                    if let resolved = resolvePasteRender(
+                        action: action, art: art, targetLayerIndex: layerIndex, actionIndex: actionIdx,
+                        dstPenAffine: currentPen.penMatrixAffine ?? .identity,
+                        dstLayerMatrix: actionLayerMatrix,
+                        baseTransform: artToDevice) {
+                        if !renderPasteGroupsWithGPUStamps(resolved: resolved, context: context,
+                                                           metalRenderer: metalRenderer) {
+                            failed = true
+                            break
+                        }
+                    }
+                    
+                case "merge_layer":
+                    if !flushRun() { failed = true; break }
+                    if let resolved = resolveMergeRender(
+                        action: action, art: art, targetLayerIndex: layerIndex,
+                        baseTransform: artToDevice) {
+                        if !renderPasteGroupsWithGPUStamps(resolved: resolved, context: context,
+                                                           metalRenderer: metalRenderer) {
+                            failed = true
+                            break
+                        }
+                    }
+                    
+                case "layer_matrix":
+                    if let mRaw = parseMatrixRobust(action["matrix"]) {
+                        actionLayerMatrix = transformFromMatrix(mRaw.map { $0.map { Float($0) } }, scale: 1.0)
+                    }
+                    
+                default: break
+            }
+            if failed { break }
+        }
+        
+        if !failed, !flushRun() { failed = true }
+        if failed { return nil }
+        
+        // Render embedded images (same placement as the CPU path)
+        context.saveGState()
+        context.translateBy(x: CGFloat(context.width) / 2.0, y: CGFloat(context.height) / 2.0)
+        context.concatenate(artToDevice)
+        renderEmbeddedImages(art: art, in: context)
+        context.restoreGState()
+        
+        return context.makeImage()
+    }
+    
+    /// Builds the stamp batch for one stroke (the pipeline of the previously disabled
+    /// stamp renderer, generalized with the selection transforms).
+    private func buildStampBatch(
+        stroke: StrokeRecord,
+        lb: CGAffineTransform,
+        accNow: CGAffineTransform,
+        destMap: CGAffineTransform
+    ) -> (stamps: [Stamp], color: SIMD4<Float>, isEraser: Bool, isMarker: Bool)? {
+        
+        guard !stroke.points.isEmpty else { return nil }
+        let (stampStepPx, effectiveRadiusScale) = strokeScaleParams(stroke: stroke, lb: lb, accNow: accNow, destMap: destMap)
+        
+        let splinePoints = buildResampledStrokeWithSpline(
+            stroke.points, stepPx: stampStepPx, samplesPerSegment: 6, gamma: 1.0, isPolyline: stroke.isPolyline)
+        var resampled: [ResampledPoint] = splinePoints.map {
+            ResampledPoint(x: CGFloat($0.x), y: CGFloat($0.y), p: $0.p)
+        }
+        guard !resampled.isEmpty else { return nil }
+        applyEndTaperToResampled(&resampled, tailSamples: 4, ease: 1.8)
+        
+        let color = SIMD4<Float>(Float(stroke.pen.color.r), Float(stroke.pen.color.g), Float(stroke.pen.color.b), 1.0)
+        
+        var stamps: [Stamp] = []
+        stamps.reserveCapacity(resampled.count)
+        for rp in resampled {
+            let pt = devicePointForStroke(CGPoint(x: rp.x, y: rp.y), stroke: stroke,
+                                          lb: lb, accNow: accNow, destMap: destMap)
+            let (radius, opacity) = pressureToRadiusOpacity(
+                pressure: rp.pressure, pen: stroke.pen, radiusScale: effectiveRadiusScale, gamma: 1.0)
+            stamps.append(Stamp(
+                center: SIMD2<Float>(Float(pt.x), Float(pt.y)),
+                radius: Float(radius),
+                opacity: opacity,
+                rotation: 0.0,
+                noiseSeed: stroke.pen.type == 1 ? arc4random() + 1 : 0))
+        }
+        return (stamps: stamps, color: color, isEraser: stroke.pen.isEraser, isMarker: stroke.pen.isMarker)
+    }
+    
+    private func renderPasteGroupsWithGPUStamps(
+        resolved: ResolvedPasteRender,
+        context: CGContext,
+        metalRenderer: MetalRenderer
+    ) -> Bool {
+        let w = Int(canvasSize.width * scale)
+        let h = Int(canvasSize.height * scale)
+        
+        // MERGE: render through an isolated fragment (see renderPasteGroupsCPU).
+        // PASTES stay flat: eraser groups composite .destinationOut against the layer.
+        var fragment: CGContext? = nil
+        if resolved.isMerge {
+            fragment = createBitmapContext(size: canvasSize, scale: scale)
+            Self.clearContext(fragment!, rect: CGRect(x: 0, y: 0, width: fragment!.width, height: fragment!.height))
+        }
+        let target = fragment ?? context
+        
+        for g in resolved.groups {
+            var batches: [(stamps: [Stamp], color: SIMD4<Float>, isMarker: Bool)] = []
+            for stroke in g.strokes {
+                guard let batch = buildStampBatch(stroke: stroke, lb: g.lb, accNow: g.accNow, destMap: resolved.destMap) else { continue }
+                batches.append((stamps: batch.stamps, color: g.color, isMarker: batch.isMarker))
+            }
+            guard !batches.isEmpty else { continue }
+            
+            let groups = batches.map {
+                (stamps: $0.stamps, color: $0.color, isEraser: false,
+                 isMarker: g.isEraser ? false : $0.isMarker)
+            }
+            let image: CGImage
+            do {
+                guard let img = try metalRenderer.renderStrokesInOrderSync(strokeGroups: groups, width: w, height: h) else {
+                    print("GPU stamp paste flush returned nil")
+                    return false
+                }
+                image = img
+            } catch {
+                print("GPU stamp paste failed: \(error)")
+                return false
+            }
+            
+            var outImage = image
+            if !g.maskEntries.isEmpty {
+                let maskContext = createBitmapContext(size: canvasSize, scale: scale)
+                Self.clearContext(maskContext, rect: CGRect(x: 0, y: 0, width: maskContext.width, height: maskContext.height))
+                compositeImageCPU(image: image, into: maskContext)
+                for m in g.maskEntries {
+                    applyPasteMaskCPU(context: maskContext, maskInv: m.inv, rect: m.rect, erase: m.erase,
+                                      destMap: resolved.destMap)
+                }
+                if let masked = maskContext.makeImage() { outImage = masked }
+            }
+            
+            // full opacity inside a merge fragment — the fragment carries the merge
+            // alpha when it lands on the layer; pastes keep the per-group alpha
+            let groupAlpha = resolved.isMerge ? CGFloat(1) : CGFloat(min(max(g.color.w, 0), 1))
+            compositeImageCPU(image: outImage, erase: g.isEraser, alpha: groupAlpha, into: target)
+        }
+        
+        if let frag = fragment, let image = frag.makeImage() {
+            let mergeAlpha = CGFloat(min(max(resolved.groups.first?.color.w ?? 1, 0), 1))
+            compositeImageCPU(image: image, alpha: mergeAlpha, into: context)
+        }
+        return true
+    }
+#endif // os(macOS)
+
+    
+    // MARK: - Actions in actionName
+    private func actionPenProperties(action: [String: Any], currentPen: inout PenInfo) {
+        // Tolerant numeric parser: handles Float, Double, Int
+        func num(_ v: Any?) -> Float? {
+            switch v {
+                case let f as Float: return f
+                case let d as Double: return Float(d)
+                case let i as Int: return Float(i)
+                case let ui8 as UInt8: return Float(ui8)
+                case let ui16 as UInt16: return Float(ui16)
+                default: return nil
+            }
+        }
+        
+        // Read common pen values (if present)
+        if let v = num(action["size"]) { currentPen.size = v }
+        if let v = num(action["size_min"]) { currentPen.sizeMin = v }
+        if let v = num(action["sizeMin"]) { currentPen.sizeMin = v }        // accept alternate key
+        if let v = num(action["opacity"]) { currentPen.opacity = v }
+        
+        // Raw "opacity_min" in the action may actually encode a subType for some pen types.
+        // Read it as subType first (but keep it available).
+        var rawSubType: Float? = nil
+        if let v = num(action["opacity_min"]) { rawSubType = v }
+        else if let v = num(action["subType"]) { rawSubType = v }
+        else if let v = num(action["sub_type"]) { rawSubType = v }
+        
+        // Read 'type' if supplied (may be Int or numeric)
+        var penTypeVal: Int? = nil
+        if let tAny = action["type"] {
+            if let ti = tAny as? Int {
+                penTypeVal = ti
+            } else if let td = tAny as? Double {
+                penTypeVal = Int(td)
+            } else if let tf = tAny as? Float {
+                penTypeVal = Int(tf)
+            }
+        }
+        
+        // Store the brush type in the PenInfo
+        currentPen.type = penTypeVal
+        
+        /*
+         | 'type': 1 - 'opacity_min': 1 | 'type': 0 - 'opacity_min': 0          | 'type': 1 - 'opacity_min': 1 |
+         | ---------------------------- | --------------------------------------| ---------------------------- |
+         | 'type': 2 - 'opacity_min': 1 | 'type': 0 - 'opacity_min': 0.80000... | 'type': 0 - 'opacity_min': 0 |
+         
+         Presets:
+         | Noise                        | 'type': 1 - 'opacity_min': 1          | 'type': 1 - 'opacity_min': 1          | 'type': 1 - 'opacity_min': 1  |
+         | ---------------------------- | ------------------------------------- | ------------------------------------- | ----------------------------- |
+         | Noise                        | 'type': 1 - 'opacity_min': 1          | 'type': 1 - 'opacity_min': 1          | 'type': 1 - 'opacity_min': 1  |
+         | ---------------------------- | ------------------------------------- | ------------------------------------- | ----------------------------- |
+         | Solid                        | 'type': 0 - 'opacity_min': 0          | 'type': 0 - 'opacity_min': 0          | 'type': 0 - 'opacity_min': 0  |
+         | ---------------------------- | ------------------------------------- | ------------------------------------- | ----------------------------- |
+         | Solid with opacity dynamics  | 'type': 0 - 'opacity_min': 0.80000... | 'type': 0 - 'opacity_min': 0.80000... | 'type': 0 - 'opacity_min': 1  |
+         | ---------------------------- | ------------------------------------- | ------------------------------------- | ----------------------------- |
+         | Marker                       | 'type': 2 - 'opacity_min': 1          | 'type': 2 - 'opacity_min': 0          | 'type': 2 - 'opacity_min': 0  |
+         
+         Type 0: Solid
+         Type 1: Noise
+         Type 2: Marker    opacity_min 1: opacity dynamics   opacity_min 0: full opacity
+         
+         */
+        
+        // Determine derived opacityMin based on (type, subType) heuristics you provided.
+        // Start from the explicit value if it really was intended as opacity_min; otherwise derive.
+        var derivedOpacityMin: Float = currentPen.opacityMin // keep existing default
+        
+        if let type = penTypeVal {
+            // Map behaviors for types/subTypes (heuristics)
+            if type == 1 {
+                // pencil -> treat as type 2 round shape, full pressure range
+                derivedOpacityMin = 0.16 // 0.44
+            } else if type == 0 {
+                // solid
+                if let st = rawSubType {
+                    // type 0 cases:
+                    currentPen.isMarker = false
+                    
+                    if abs(st - 0.0) < 0.0001 {
+                        // subtype == 0 -> fully opaque behavior (min == max)
+                        derivedOpacityMin = currentPen.opacity
+                    } else if st > 0.7 {
+                        // subtype ~0.8 -> low but non-zero min opacity
+                        derivedOpacityMin = 0.15   // chosen low constant (0.1-0.2 range)
+                    } else {
+                        // other subtype values -> keep whatever default is currently set
+                        derivedOpacityMin = currentPen.opacityMin
+                    }
+                } else {
+                    // no subtype — keep current default
+                    derivedOpacityMin = currentPen.opacityMin
+                }
+            } else if type == 2 {
+                // marker
+                // 45° pill shape ratio 1:4 diameter
+                currentPen.isMarker = true
+                
+                if let st = rawSubType {
+                    if st == 1.0 {
+                        // full pressure range (0..opacity)
+                        derivedOpacityMin = 0.0
+                    } else {
+                        // max opacity (safe)
+                        derivedOpacityMin = 1.0
+                    }
+                } else {
+                    // type 2, no subtype -> assume full pressure range
+                    derivedOpacityMin = 0.0
+                }
+            } else {
+                // unknown types — leave as-is
+                derivedOpacityMin = currentPen.opacityMin
+            }
+        }
+        //                else if let st = rawSubType {
+        //                    // No type provided but a raw subtype exists — apply some safe defaults:
+        //                    // Not sure this is ever the case, but ok
+        //                    if st > 0.7 {
+        //                        derivedOpacityMin = 0.15
+        //                    } else if abs(st - 0.33) < 0.08 {
+        //                        derivedOpacityMin = currentPen.opacityMin
+        //                    } else {
+        //                        derivedOpacityMin = currentPen.opacityMin
+        //                    }
+        //                }
+        
+        // Final clamp to [0,1]
+        derivedOpacityMin = min(max(derivedOpacityMin, 0.0), 1.0)
+        
+        // Assign derived result back into pen snapshot
+        currentPen.opacityMin = derivedOpacityMin
+        
+        print("stroke pen snapshot -> type=\(penTypeVal ?? -1), subType=\(rawSubType ?? -1), opacity=\(currentPen.opacity), opacityMin=\(currentPen.opacityMin)")
+        
+    }
+    
+    private func actionPenMatrix(action: [String: Any], currentPen: inout PenInfo, penMatrixScale: inout CGFloat) {
+        // Helper to coerce Any -> Double
+        func toDouble(_ v: Any?) -> Double? {
+            switch v {
+                case let d as Double: return d
+                case let f as Float: return Double(f)
+                case let i as Int: return Double(i)
+                case let s as String: return Double(s)
+                default: return nil
+            }
+        }
+        
+        // Read matrix as [[Any]] or [[Double]]
+        var a: Double = 1.0, b: Double = 0.0, c: Double = 0.0, d: Double = 1.0
+        var tx: Double = 0.0, ty: Double = 0.0
+        var parsed = false
+        
+        if let matAny = action["matrix"] as? [[Any]] {
+            // Many files encode 4x4 row-major: mat[row][col]
+            if matAny.count >= 4 && matAny[3].count >= 2 {
+                // guess: layout like:
+                // [ [a, b, ...],
+                //   [c, d, ...],
+                //   [...],
+                //   [tx, ty, ..., 1] ]
+                if let aa = toDouble(matAny[0][0]) { a = aa }
+                if matAny[0].count > 1, let bb = toDouble(matAny[0][1]) { b = bb }
+                if matAny.count > 1 && matAny[1].count > 0, let cc = toDouble(matAny[1][0]) { c = cc }
+                if matAny.count > 1 && matAny[1].count > 1, let dd = toDouble(matAny[1][1]) { d = dd }
+                if let txx = toDouble(matAny[3][0]) { tx = txx }
+                if let tyy = toDouble(matAny[3][1]) { ty = tyy }
+                parsed = true
+            } else if matAny.count >= 2 && matAny[0].count >= 2 && matAny[1].count >= 2 {
+                // fallback: take top-left 2x2 and row 2 as translation
+                if let aa = toDouble(matAny[0][0]) { a = aa }
+                if let bb = toDouble(matAny[0][1]) { b = bb }
+                if let cc = toDouble(matAny[1][0]) { c = cc }
+                if let dd = toDouble(matAny[1][1]) { d = dd }
+                // translation not present — keep tx/ty = 0
+                parsed = true
+            }
+        } else if let matDouble = action["matrix"] as? [[Double]] {
+            if matDouble.count >= 4 && matDouble[3].count >= 2 {
+                a = matDouble[0][0]; b = matDouble[0][1]
+                c = matDouble[1][0]; d = matDouble[1][1]
+                tx = matDouble[3][0]; ty = matDouble[3][1]
+                parsed = true
+            } else if matDouble.count >= 2 && matDouble[0].count >= 2 {
+                a = matDouble[0][0]; b = matDouble[0][1]
+                c = matDouble[1][0]; d = matDouble[1][1]
+                parsed = true
+            }
+        }
+        
+        if parsed {
+            // Compose candidate CGAffineTransform.
+            // We use a layout where affine maps (x,y) -> (a*x + b*y + tx, c*x + d*y + ty)
+            let affine = CGAffineTransform(a: CGFloat(a), b: CGFloat(b), c: CGFloat(c), d: CGFloat(d), tx: CGFloat(tx), ty: CGFloat(ty))
+            
+            // Compute numeric scale from affine (average column vector length)
+            let sx = sqrt(a*a + c*c)
+            let sy = sqrt(b*b + d*d)
+            var computedScale = CGFloat((sx + sy) / 2.0)
+            if !computedScale.isFinite || computedScale <= 0.0 { computedScale = 1.0 }
+            
+            // Store into current pen snapshot
+            currentPen.penMatrixAffine = affine
+            penMatrixScale = computedScale
+            
+            print("Parsed pen_matrix: a=\(a) b=\(b) c=\(c) d=\(d) tx=\(tx) ty=\(ty) scale=\(computedScale)")
+        } else {
+            print("Warning: couldn't parse pen_matrix action: \(action)")
+        }
+        
+    }
+    
+    private func actionIsEraser(action: [String: Any], currentPen: inout PenInfo) {
+        if let isEraser = action["is_eraser"] as? Bool {
+            currentPen.isEraser = isEraser
+        }
+    }
+    
+    private func actionPenColor(action: [String: Any], currentPen: inout PenInfo) {
+        // keep your reverted logic here — accept different encodings robustly
+        if let t = action["color"] as? (Int, Int, Int) {
+            currentPen.color = (r: Float(t.0)/255.0, g: Float(t.1)/255.0, b: Float(t.2)/255.0)
+        } else if let arr = action["color"] as? [Any], arr.count >= 3 {
+            if let r = arr[0] as? Int, let g = arr[1] as? Int, let b = arr[2] as? Int {
+                currentPen.color = (r: Float(r)/255.0, g: Float(g)/255.0, b: Float(b)/255.0)
+            } else if let r = arr[0] as? UInt8, let g = arr[1] as? UInt8, let b = arr[2] as? UInt8 {
+                currentPen.color = (r: Float(r)/255.0, g: Float(g)/255.0, b: Float(b)/255.0)
+            } else if let rf = arr[0] as? Float, let gf = arr[1] as? Float, let bf = arr[2] as? Float {
+                currentPen.color = (r: rf, g: gf, b: bf)
+            } else if let rd = arr[0] as? Double, let gd = arr[1] as? Double, let bd = arr[2] as? Double {
+                currentPen.color = (r: Float(rd), g: Float(gd), b: Float(bd))
+            }
+        }
+    }
+    
+    private func actionStroke(action: [String: Any], currentPen: PenInfo, penMatrixScale: CGFloat, layerStrokes: inout [StrokeRecord]) {
+        // Parse points and create stroke record
+        if let pts = action["points"] as? [[String: Any]], !pts.isEmpty {
+            // Parse points
+            func toFloat(_ v: Any?) -> Float {
+                if let f = v as? Float { return f }
+                if let d = v as? Double { return Float(d) }
+                if let i = v as? Int { return Float(i) }
+                if let s = v as? String, let d = Double(s) { return Float(d) }
+                return 0.0
+            }
+            
+            func toInt(_ v: Any?) -> Int {
+                if let i = v as? Int { return i }
+                if let f = v as? Float { return Int(f) }
+                if let d = v as? Double { return Int(d) }
+                if let s = v as? String, let d = Int(s) { return d }
+                return 0
+            }
+            
+            let rawPoints: [Point] = pts.map { dict in
+                let x = toFloat(dict["x"])
+                let y = toFloat(dict["y"])
+                let p = toFloat(dict["p"])
+                //                        print("[P][raw point] x=\(x) y=\(y) p(raw)=\(p)")
+                return Point(x: x, y: y, p: p)
+            }
+            
+            // Create StrokeRecord
+            let rec = StrokeRecord(
+                points: rawPoints,
+                pen: currentPen,
+                penMatrixScale: penMatrixScale,
+                penMatrixAffine: currentPen.penMatrixAffine,
+                isPolyline: false
+            )
+            //                    if let first = rawPoints.first, let last = rawPoints.last {
+            //                        print("[P][stroke record] points=\(rawPoints.count) p.first=\(first.p) p.last=\(last.p) pen.opacity=\(currentPen.opacity) pen.opacityMin=\(currentPen.opacityMin)")
+            //                    }
+            
+            layerStrokes.append(rec)
+        }
+    }
+    
+    private func actionPolyline(action: [String: Any], currentPen: PenInfo, penMatrixScale: CGFloat, layerStrokes: inout [StrokeRecord]) {
+        if let pts = action["points"] as? [[String: Any]], !pts.isEmpty {
+            // Parse points
+            func toFloat(_ v: Any?) -> Float {
+                if let f = v as? Float { return f }
+                if let d = v as? Double { return Float(d) }
+                if let i = v as? Int { return Float(i) }
+                if let s = v as? String, let d = Double(s) { return Float(d) }
+                return 0.0
+            }
+            
+            func toInt(_ v: Any?) -> Int {
+                if let i = v as? Int { return i }
+                if let f = v as? Float { return Int(f) }
+                if let d = v as? Double { return Int(d) }
+                if let s = v as? String, let d = Int(s) { return d }
+                return 0
+            }
+            
+            let rawPoints: [Point] = pts.map { dict in
+                let x = toFloat(dict["x"])
+                let y = toFloat(dict["y"])
+                let p = toFloat(dict["p"])
+                //                        print("[P][raw point] x=\(x) y=\(y) p(raw)=\(p)")
+                return Point(x: x, y: y, p: p)
+            }
+            
+            // Create StrokeRecord
+            let rec = StrokeRecord(
+                points: rawPoints,
+                pen: currentPen,
+                penMatrixScale: penMatrixScale,
+                penMatrixAffine: currentPen.penMatrixAffine,
+                isPolyline: true
+            )
+            //                    print("POLYLINE")
+            
+            layerStrokes.append(rec)
+        }
+    }
+    
+    private func actionRect(action: [String: Any], currentPen: PenInfo, penMatrixScale: CGFloat, layerStrokes: inout [StrokeRecord]) {
+        if let x = action["x"] as? Float,
+           let y = action["y"] as? Float,
+           let w = action["w"] as? Float,
+           let h = action["h"] as? Float {
+            let angle = action["angle"] as? Float ?? 0.0
+            let cosA = cos(angle)
+            let sinA = sin(angle)
+            
+            let halfW = w * 0.5
+            let halfH = h * 0.5
+            let localCorners: [(Float, Float)] = [
+                (-halfW, -halfH),
+                ( halfW, -halfH),
+                ( halfW,  halfH),
+                (-halfW,  halfH),
+                (-halfW, -halfH)
+            ]
+            
+            let pts: [Point] = localCorners.map { (dx, dy) in
+                let rx = dx * cosA - dy * sinA
+                let ry = dx * sinA + dy * cosA
+                return Point(x: x + rx, y: y + ry, p: 1.0)
+            }
+            
+            let rec = StrokeRecord(
+                points: pts,
+                pen: currentPen,
+                penMatrixScale: penMatrixScale,
+                penMatrixAffine: currentPen.penMatrixAffine,
+                isPolyline: true
+            )
+            layerStrokes.append(rec)
+        }
+    }
+    
+    private func actionEllipse(action: [String: Any], currentPen: PenInfo, penMatrixScale: CGFloat, layerStrokes: inout [StrokeRecord]) {
+        if let cx = action["cx"] as? Float,
+           let cy = action["cy"] as? Float,
+           let rx = action["rx"] as? Float,
+           let ry = action["ry"] as? Float {
+            let angle = action["angle"] as? Float ?? 0.0
+            let cosA = cos(angle)
+            let sinA = sin(angle)
+            
+            let tx = -rx / 2.0
+            let ty = -ry / 2.0
+            
+            // Generate points directly on the true ellipse.
+            let segments = 128 // 96
+            let twoPi: Float = 2.0 * .pi
+            
+            var pts: [Point] = []
+            pts.reserveCapacity(segments + 1)
+            for i in 0..<segments {
+                let t = Float(i) / Float(segments) * twoPi
+                let ex = rx * cos(t)
+                let ey = ry * sin(t)
+                
+                let ox = ex + tx
+                let oy = ey + ty
+                
+                let rotX = ox * cosA - oy * sinA
+                let rotY = ox * sinA + oy * cosA
+                
+                pts.append(Point(x: cx + rotX, y: cy + rotY, p: 1.0))
+            }
+            
+            // Explicitly close the loop for the polyline renderer
+            if let firstPt = pts.first {
+                pts.append(firstPt)
+            }
+            
+            // Render as a dense polyline
+            let rec = StrokeRecord(
+                points: pts,
+                pen: currentPen,
+                penMatrixScale: penMatrixScale,
+                penMatrixAffine: currentPen.penMatrixAffine,
+                isPolyline: true
+            )
+            layerStrokes.append(rec)
+        }
+    }
+    
+    
+//    private func cutPolygon(
+//        rect: [Float],
+//        frameToDevice: CGAffineTransform
+//    ) -> [CGPoint] {
+//
+//        guard rect.count == 4 else {
+//            return []
+//        }
+//
+//        let x = CGFloat(rect[0])
+//        let y = CGFloat(rect[1])
+//        let w = CGFloat(rect[2])
+//        let h = CGFloat(rect[3])
+//
+//        let p1 = CGPoint(x: x,       y: y)
+//        let p2 = CGPoint(x: x + w,   y: y)
+//        let p3 = CGPoint(x: x + w,   y: y + h)
+//        let p4 = CGPoint(x: x,       y: y + h)
+//
+//        return [p1, p2, p3, p4].map {
+//            $0.applying(frameToDevice)
+//        }
+//    }
+    
+    private func actionPasteLayerOps(
+        action: [String: Any],
+        art: ArtParser,
+        targetLayerIndex: Int,
+        actionIndex: Int,
+        dstPenAffine: CGAffineTransform,
+        baseTransform: CGAffineTransform,
+        yDownBaseTransform: CGAffineTransform,
+        flipTransform: CGAffineTransform?
+    ) -> [LayerOperation] {
+        
+        // ── 1. Parse ──
+        guard let fromLayer = action["from_layer"] as? Int,
+              fromLayer >= 0, fromLayer < art.layers.count,
+              let selectionRect = parseFloatArray(action["selection_rect"]),
+              selectionRect.count == 4,
+              let m1raw = parseMatrixRobust(action["matrix_1"]),
+              let m2raw = parseMatrixRobust(action["matrix_2"]) else {
+            return []
+        }
+        
+        // matrix_1 = action-time view: canvas -> selection frame.
+        // matrix_2 = free transform, authored in that same selection frame.
+        let matrix1 = transformFromMatrix(m1raw.map { $0.map { Float($0) } }, scale: 1.0)
+        let matrix2 = transformFromMatrix(m2raw.map { $0.map { Float($0) } }, scale: 1.0)
+        
+        let B    = baseTransform
+        let Ldst = layerMatrix(ofLayer: targetLayerIndex, in: art)
+        
+        // ── 2. Device-space maps ──
+        // device px -> selection frame  (validated:  m1 ∘ B⁻¹)
+        let deviceToSelection = B.inverted().concatenating(matrix1)
+        
+        let pen: CGAffineTransform
+        let selectionToDevice: CGAffineTransform
+        
+        if isIdentityTransform(matrix1) {
+            pen = dstPenAffine                                    // validated m1 == I path — unchanged
+            selectionToDevice = matrix1.inverted() // rotationOnlyInverse(matrix1)
+                .concatenating(pen).concatenating(Ldst).concatenating(B)
+        } else if pasteFollowsCut(art: art, layerIndex: targetLayerIndex,
+                                  pasteActionIndex: actionIndex, pasteRect: selectionRect) {
+            pen = .identity
+            // Free transform: full conjugation through the action-time view.
+            // rotOnlyInverse was only valid at zoom_1 == 1 (where it equals m1⁻¹).
+            selectionToDevice = matrix1.inverted().concatenating(B)
+        } else {
+            pen = dstPenAffine                                    // new-layer paste: sel px ARE layer px,
+            // NOTE: actionPasteLayerOps keeps Ldst in this branch — the GPU paste shader
+            // compensates it. Point-level application must NOT include it (File1 case).
+            selectionToDevice = pen.concatenating(Ldst).concatenating(B)  // pen applied in full
+            
+        }
+
+
+        
+        // Free transform acts in screen space -> conjugate into device space:
+        //   D = (B ∘ Ldst ∘ m1⁻¹) ∘ m2 ∘ (m1 ∘ B⁻¹)
+        let sourceToDestinationGPU = deviceToSelection
+            .concatenating(matrix2)
+            .concatenating(selectionToDevice)
+        let destinationToSourceGPU = sourceToDestinationGPU.inverted()
+        
+        // ── 3. Diagnostics / guard ──
+        let detD = sourceToDestinationGPU.a * sourceToDestinationGPU.d
+        - sourceToDestinationGPU.b * sourceToDestinationGPU.c
+//        print("CUT/PASTE v7 dstLayer=\(targetLayerIndex) Ldst=\(Ldst)")
+//        print("CUT/PASTE v7 D=\(sourceToDestinationGPU) det=\(detD)")
+        guard abs(detD) > 1e-9 else { return [] }
+        
+
+        // Diagnostic: where does the source layer's content actually sit in the file?
+//        let srcIndices = art.actions.enumerated().compactMap {
+//            ($0.element["layer"] as? Int) == fromLayer ? $0.offset : nil
+//        }
+//        print("CUT/PASTE v7 paste@idx=\(actionIndex) srcLayer=\(fromLayer) srcActionIdx=\(srcIndices)")
+        
+        let resolvedStrokes = buildStrokesForLayer(
+            layerIndex: fromLayer,
+            art: art,
+            baseTransform: B,
+            visited: [])
+        
+        
+//        print("CUT/PASTE v7 source strokes=\(resolvedStrokes.count)")
+        
+        
+//        let corners = [CGPoint(x: 0, y: 0), CGPoint(x: 1, y: 0),
+//                       CGPoint(x: 1, y: 1), CGPoint(x: 0, y: 1)].map {
+//            CGPoint(x: CGFloat(selectionRect[0]) + $0.x * CGFloat(selectionRect[2]),
+//                    y: CGFloat(selectionRect[1]) + $0.y * CGFloat(selectionRect[3]))
+//            .applying(matrix2)
+//            .applying(selectionToDevice)
+//        }
+//        let minX = corners.map(\.x).min()!, maxX = corners.map(\.x).max()!
+//        let minY = corners.map(\.y).min()!, maxY = corners.map(\.y).max()!
+//        print("CUT/PASTE v10 predicted paste bbox: (\(minX), \(minY), \(maxX - minX), \(maxY - minY))")
+
+        
+        return assemblePasteOps(
+            resolvedStrokes: resolvedStrokes,
+            art: art,
+            baseTransform: B,
+            destinationToSourceGPU: destinationToSourceGPU,
+            sourceToDestinationGPU: sourceToDestinationGPU,
+            outerRect: selectionRect,
+            outerM1: matrix1,
+            colorAlpha: 1.0,
+            flipTransform: flipTransform,
+            isMerge: false,
+            mergeID: 0)
+    }
+    
+    private func assemblePasteOps(
+        resolvedStrokes: [ResolvedStroke],
+        art: ArtParser,
+        baseTransform: CGAffineTransform,
+        destinationToSourceGPU: CGAffineTransform,
+        sourceToDestinationGPU: CGAffineTransform,
+        outerRect: [Float]?,
+        outerM1: CGAffineTransform?,
+        colorAlpha: Float,
+        flipTransform: CGAffineTransform?,
+        isMerge: Bool,
+        mergeID: UInt64
+    ) -> [LayerOperation] {
+        
+        struct Group {
+            var color: SIMD4<Float>
+            var isEraser: Bool
+            var isMarker: Bool
+            var strokeToDevice: CGAffineTransform
+            var accNow: CGAffineTransform
+            var masks: [StrokeMask]
+            var strokes: [StrokeRecord]
+        }
+        
+        var groups: [Group] = []
+        for resolved in resolvedStrokes {
+            let strokeToDevice = layerMatrix(ofLayer: resolved.sourceLayerIndex, in: art)
+                .concatenating(baseTransform)
+                .concatenating(resolved.accumulatedDeviceTransform)
+            let color = SIMD4<Float>(Float(resolved.stroke.pen.color.r),
+                                     Float(resolved.stroke.pen.color.g),
+                                     Float(resolved.stroke.pen.color.b), colorAlpha)
+            if let idx = groups.firstIndex(where: {
+                $0.color == color &&
+                $0.isEraser == resolved.stroke.pen.isEraser &&
+                $0.isMarker == resolved.stroke.pen.isMarker &&
+                $0.strokeToDevice == strokeToDevice &&
+                $0.masks == resolved.masks }) {
+                groups[idx].strokes.append(resolved.stroke)
+            } else {
+                groups.append(Group(color: color,
+                                    isEraser: resolved.stroke.pen.isEraser,
+                                    isMarker: resolved.stroke.pen.isMarker,
+                                    strokeToDevice: strokeToDevice,
+                                    accNow: resolved.accumulatedDeviceTransform,
+                                    masks: resolved.masks,
+                                    strokes: [resolved.stroke]))
+            }
+        }
+        
+        var ops: [LayerOperation] = []
+        for g in groups {
+            var segments: [GPUSplineSegment] = []
+            for stroke in g.strokes {
+                guard let op = buildOpFromStroke(stroke,
+                                                 artToDevice: g.strokeToDevice,
+                                                 flipTransform: flipTransform) else { continue }
+                segments.append(contentsOf: op.segments)
+            }
+            guard !segments.isEmpty else { continue }
+            
+            let Bi = baseTransform.inverted()
+            var metaMasks: [PasteMask] = []
+            
+            // Slot 0: outer keep — src device -> this paste's selection frame (B⁻¹ ∘ m1).
+            if let outerRect = outerRect, let outerM1 = outerM1 {
+                metaMasks.append(PasteMask(inv: Bi.concatenating(outerM1),
+                                           rectXYWH: outerRect, erase: false))
+            }
+            // Masks recorded during the replay (nested selections + cut erases).
+            // Map: src device -> that mask's selection frame
+            //      = accNow⁻¹ -> accRef -> B⁻¹ -> m1   (receiver-first chain below)
+            for m in g.masks {
+                let map = g.accNow.inverted()
+                    .concatenating(m.accRef)
+                    .concatenating(Bi)
+                    .concatenating(m.m1)
+                metaMasks.append(PasteMask(inv: map, rectXYWH: m.rect, erase: m.erase))
+            }
+            
+            let meta = PasteLayerMeta(invAffine: destinationToSourceGPU,
+                                      edgeWidth: 0.75, maskCount: UInt32(metaMasks.count))
+//            print("CUT/PASTE op: segments=\(segments.count) masks=\(metaMasks.count) " +
+//                  "(erase=\(metaMasks.filter { $0.flags.x > 0.5 }.count))")
+            ops.append(.paste(
+                segments: segments,
+                color: g.color,
+                isEraser: g.isEraser,
+                isMarker: g.isMarker,
+                meta: meta,
+                masks: metaMasks,
+                sourceToDestinationGPU: sourceToDestinationGPU,
+                isMerge: isMerge,
+                mergeID: mergeID))
+        }
+        return ops
+    }
+    
+    private func layerMatrix(ofLayer i: Int, in art: ArtParser) -> CGAffineTransform {
+        guard i >= 0, i < art.layers.count,
+              let raw = parseMatrixRobust(art.layers[i]["matrix"]) else { return .identity }
+        return transformFromMatrix(raw.map { $0.map { Float($0) } }, scale: 1.0)
+    }
+    
+    private func actionMergeLayerOps(
+        action: [String: Any],
+        art: ArtParser,
+        targetLayerIndex: Int,
+        actionIndex: Int,
+        baseTransform: CGAffineTransform,
+        flipTransform: CGAffineTransform?
+    ) -> [LayerOperation] {
+        
+        guard let fromLayer = action["from_layer"] as? Int,
+              fromLayer >= 0, fromLayer < art.layers.count,
+              let mRaw = parseMatrixRobust(action["matrix"]) else { return [] }
+        
+        let M = transformFromMatrix(mRaw.map { $0.map { Float($0) } }, scale: 1.0)
+        // `matrix`+`zoom` is an action-time VIEW snapshot (same shape as matrix_1/zoom_1
+        // in pastes), NOT a content transform. Merging preserves canvas position.
+        print("MERGE v2 view-snapshot M (not applied)=\(M)")
+        
+        let B = baseTransform
+        let opacitySrc = action["opacity_src"] as? Float ?? 1.0
+        
+        let sourceToDestinationGPU = baseTransform.inverted()
+            .concatenating(layerMatrix(ofLayer: targetLayerIndex, in: art))
+            .concatenating(baseTransform)          // B ∘ Ldst ∘ B⁻¹
+        let destinationToSourceGPU = sourceToDestinationGPU.inverted()
+        
+        print("MERGE v1 dst=\(targetLayerIndex) src=\(fromLayer) M=\(M) opacity_src=\(opacitySrc)")
+        
+        guard abs(sourceToDestinationGPU.a * sourceToDestinationGPU.d
+                  - sourceToDestinationGPU.b * sourceToDestinationGPU.c) > 1e-9 else { return [] }
+        
+        let resolvedStrokes = buildStrokesForLayer(
+            layerIndex: fromLayer,
+            art: art,
+            baseTransform: B,
+            visited: [])
+        print("MERGE v1 source strokes=\(resolvedStrokes.count)")
+        
+        return assemblePasteOps(
+            resolvedStrokes: resolvedStrokes,
+            art: art,
+            baseTransform: B,
+            destinationToSourceGPU: destinationToSourceGPU,
+            sourceToDestinationGPU: sourceToDestinationGPU,
+            outerRect: nil,
+            outerM1: nil,
+            colorAlpha: opacitySrc,
+            flipTransform: flipTransform,
+            isMerge: true,
+            mergeID: UInt64(bitPattern: Int64(actionIndex)))
+    }
+        
+    /// Free-transform pastes restore a cut made on the SAME layer: the file records a
+    /// `cut` with the same selection_rect shortly before the paste_layer. New-layer
+    /// pastes have no cut — the app creates the layer and drops the clipboard in.
+    private func pasteFollowsCut(art: ArtParser,
+                                 layerIndex: Int,
+                                 pasteActionIndex: Int,
+                                 pasteRect: [Float]) -> Bool {
+        var i = pasteActionIndex - 1
+        while i >= 0 {
+            let a = art.actions[i]
+            if let l = a["layer"] as? Int, l == layerIndex,
+               let name = a["action_name"] as? String {
+                if name == "paste_layer" { return false }   // start of previous cycle
+                if name == "cut",
+                   let r = parseFloatArray(a["selection_rect"]), r.count == 4,
+                   abs(r[0]-pasteRect[0]) < 0.01, abs(r[1]-pasteRect[1]) < 0.01,
+                   abs(r[2]-pasteRect[2]) < 0.01, abs(r[3]-pasteRect[3]) < 0.01 {
+                    return true
+                }
+            }
+            i -= 1
+        }
+        return false
+    }
+        
+    
+//    private func extractRectParams(rect: [Float], artToDevice: CGAffineTransform, flip: CGAffineTransform) -> (center: SIMD4<Float>, axisX: SIMD4<Float>, axisY: SIMD4<Float>) {
+//        let w = CGFloat(rect[2]) * 0.5
+//        let h = CGFloat(rect[3]) * 0.5
+//        let cx = CGFloat(rect[0] + rect[2] * 0.5)
+//        let cy = CGFloat(rect[1] + rect[3] * 0.5)
+//
+//        // Transform center point to device space
+//        let center = CGPoint(x: cx, y: cy).applying(artToDevice).applying(flip)
+//
+//        // Transform axes as vectors (scale/rotation only, no translation)
+//        let axisXVec = CGPoint(x: w * artToDevice.a, y: w * artToDevice.b)
+//        let axisYVec = CGPoint(x: h * artToDevice.c, y: h * artToDevice.d)
+//
+//        // Apply flip scale to vectors
+//        let axisX = CGPoint(x: axisXVec.x * flip.a, y: axisXVec.y * flip.d)
+//        let axisY = CGPoint(x: axisYVec.x * flip.a, y: axisYVec.y * flip.d)
+//
+//        return (SIMD4<Float>(Float(center.x), Float(center.y), 0, 0),
+//                SIMD4<Float>(Float(axisX.x), Float(axisX.y), 0, 0),
+//                SIMD4<Float>(Float(axisY.x), Float(axisY.y), 0, 0))
+//    }
+    
+    private func nextPasteViewMatrix(in actions: [[String: Any]], after idx: Int) -> CGAffineTransform? {
+        for j in (idx + 1)..<actions.count
+        where actions[j]["action_name"] as? String == "paste_layer" {
+            if let raw = parseMatrixRobust(actions[j]["matrix_1"]) {
+                return transformFromMatrix(raw.map { $0.map { Float($0) } }, scale: 1.0)
+            }
+        }
+        return nil
+    }
+    
+    // MARK: - Paste/merge resolution for the stamp & CPU point paths
+    
+    private struct BakedMask: Equatable {
+        var inv: CGAffineTransform     // source device -> selection frame
+        var rect: [Float]
+        var erase: Bool
+    }
+    
+    private struct PasteRenderGroup {
+        var color: SIMD4<Float>
+        var isEraser: Bool
+        var isMarker: Bool
+        var strokes: [StrokeRecord]
+        var lb: CGAffineTransform      // Lsrc ∘ B: art -> source device (layer + view)
+        var accNow: CGAffineTransform  // accumulated selection transforms (device conjugation)
+        var maskEntries: [BakedMask]
+    }
+    
+    private struct ResolvedPasteRender {
+        var groups: [PasteRenderGroup]
+        var destMap: CGAffineTransform // D: source device -> destination device
+        var isMerge: Bool = false   // merges composite as an isolated fragment;
+                                    // their erasers scope to the merged layer's own content
+    }
+    
+    /// Mirrors actionPasteLayerOps (GPU segment path) but yields point data.
+    private func resolvePasteRender(
+        action: [String: Any],
+        art: ArtParser,
+        targetLayerIndex: Int,
+        actionIndex: Int,
+        dstPenAffine: CGAffineTransform,
+        dstLayerMatrix: CGAffineTransform,
+        baseTransform: CGAffineTransform
+    ) -> ResolvedPasteRender? {
+        guard let fromLayer = action["from_layer"] as? Int,
+              fromLayer >= 0, fromLayer < art.layers.count,
+              let selectionRect = parseFloatArray(action["selection_rect"]),
+              selectionRect.count == 4,
+              let m1raw = parseMatrixRobust(action["matrix_1"]),
+              let m2raw = parseMatrixRobust(action["matrix_2"]) else { return nil }
+        
+        let matrix1 = transformFromMatrix(m1raw.map { $0.map { Float($0) } }, scale: 1.0)
+        let matrix2 = transformFromMatrix(m2raw.map { $0.map { Float($0) } }, scale: 1.0)
+        
+        let B = baseTransform
+        let Ldst = dstLayerMatrix                // was: layerMatrix(ofLayer: targetLayerIndex, in: art)
+        
+        // device px -> selection frame (m1 ∘ B⁻¹)
+        let deviceToSelection = B.inverted().concatenating(matrix1)
+        let pen: CGAffineTransform
+        let selectionToDevice: CGAffineTransform
+        
+        if isIdentityTransform(matrix1) {
+            pen = dstPenAffine
+            selectionToDevice = matrix1.inverted().concatenating(pen).concatenating(Ldst).concatenating(B)
+        } else if pasteFollowsCut(art: art, layerIndex: targetLayerIndex,
+                                  pasteActionIndex: actionIndex, pasteRect: selectionRect) {
+            pen = .identity
+            selectionToDevice = matrix1.inverted().concatenating(B)
+        } else {
+            pen = dstPenAffine
+            // Matches actionPasteLayerOps — the layer matrix MUST be included.
+            // Dropping it strips the layer translation (rotationOnlyInverse-class bug).
+            selectionToDevice = pen.concatenating(Ldst).concatenating(B)
+        }
+        
+        // D = (B⁻¹ ∘ m1) ∘ m2 ∘ selectionToDevice — source device -> dest device
+        let destMap = deviceToSelection.concatenating(matrix2).concatenating(selectionToDevice)
+        guard abs(destMap.a * destMap.d - destMap.b * destMap.c) > 1e-9 else { return nil }
+        
+        let resolvedStrokes = buildStrokesForLayer(layerIndex: fromLayer, art: art, baseTransform: B, visited: [])
+        let groups = buildPasteRenderGroups(
+            resolvedStrokes: resolvedStrokes, art: art, baseTransform: B,
+            outerRect: selectionRect, outerM1: matrix1, colorAlpha: 1.0)
+        return ResolvedPasteRender(groups: groups, destMap: destMap)
+    }
+    
+    /// Mirrors actionMergeLayerOps (GPU segment path) but yields point data.
+    /// `matrix` is an action-time view snapshot and is deliberately not applied.
+    private func resolveMergeRender(
+        action: [String: Any],
+        art: ArtParser,
+        targetLayerIndex: Int,
+        baseTransform: CGAffineTransform
+    ) -> ResolvedPasteRender? {
+        guard let fromLayer = action["from_layer"] as? Int,
+              fromLayer >= 0, fromLayer < art.layers.count,
+              let _ = parseMatrixRobust(action["matrix"]) else { return nil }
+        let B = baseTransform
+        // Merge preserves canvas position: B ∘ Ldst ∘ B⁻¹
+        let destMap = B.inverted()
+            .concatenating(layerMatrix(ofLayer: targetLayerIndex, in: art))
+            .concatenating(B)
+        guard abs(destMap.a * destMap.d - destMap.b * destMap.c) > 1e-9 else { return nil }
+        let opacitySrc = action["opacity_src"] as? Float ?? 1.0
+        
+        let resolvedStrokes = buildStrokesForLayer(layerIndex: fromLayer, art: art, baseTransform: B, visited: [])
+        let groups = buildPasteRenderGroups(
+            resolvedStrokes: resolvedStrokes, art: art, baseTransform: B,
+            outerRect: nil, outerM1: nil, colorAlpha: opacitySrc)
+        return ResolvedPasteRender(groups: groups, destMap: destMap, isMerge: true)
+    }
+    
+    /// Mirrors assemblePasteOps' grouping and mask baking, but keeps point data.
+    private func buildPasteRenderGroups(
+        resolvedStrokes: [ResolvedStroke],
+        art: ArtParser,
+        baseTransform: CGAffineTransform,
+        outerRect: [Float]?,
+        outerM1: CGAffineTransform?,
+        colorAlpha: Float
+    ) -> [PasteRenderGroup] {
+        let Bi = baseTransform.inverted()
+        var groups: [PasteRenderGroup] = []
+        
+        for resolved in resolvedStrokes {
+            let lb = layerMatrix(ofLayer: resolved.sourceLayerIndex, in: art)
+                .concatenating(baseTransform)
+            let accNow = resolved.accumulatedDeviceTransform
+            let color = SIMD4<Float>(Float(resolved.stroke.pen.color.r),
+                                     Float(resolved.stroke.pen.color.g),
+                                     Float(resolved.stroke.pen.color.b), colorAlpha)
+            
+            var maskEntries: [BakedMask] = []
+            // Slot 0: outer keep — src device -> this paste's selection frame (B⁻¹ ∘ m1).
+            if let outerRect = outerRect, let outerM1 = outerM1 {
+                maskEntries.append(BakedMask(inv: Bi.concatenating(outerM1), rect: outerRect, erase: false))
+            }
+            // Replay masks: accNow⁻¹ -> accRef -> B⁻¹ -> m1 (same chain as the GPU path).
+            for m in resolved.masks {
+                maskEntries.append(BakedMask(
+                    inv: accNow.inverted().concatenating(m.accRef).concatenating(Bi).concatenating(m.m1),
+                    rect: m.rect, erase: m.erase))
+            }
+            
+            if let idx = groups.firstIndex(where: {
+                $0.color == color &&
+                $0.isEraser == resolved.stroke.pen.isEraser &&
+                $0.isMarker == resolved.stroke.pen.isMarker &&
+                $0.lb == lb && $0.accNow == accNow && $0.maskEntries == maskEntries }) {
+                groups[idx].strokes.append(resolved.stroke)
+            } else {
+                groups.append(PasteRenderGroup(
+                    color: color,
+                    isEraser: resolved.stroke.pen.isEraser,
+                    isMarker: resolved.stroke.pen.isMarker,
+                    strokes: [resolved.stroke],
+                    lb: lb, accNow: accNow,
+                    maskEntries: maskEntries))
+            }
+        }
+        return groups
+    }
+
+    
     
     // MARK: - Shape Rendering
     private func renderRect(x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat, angle: CGFloat, pen: PenInfo, in context: CGContext) {
@@ -2124,17 +3872,39 @@ public final class Renderer {
     
     // Convert a 4x4 matrix to a CGAffineTransform
     private func transformFromMatrix(_ m: [[Float]], scale: CGFloat = 1.0) -> CGAffineTransform {
-        // Mischief 4x4: translation is in row 3, columns 0/1
-        guard m.count >= 4 && m[0].count >= 4 else { return .identity }
-        let a  = CGFloat(m[0][0]) * scale
-        let b  = CGFloat(m[1][0]) * scale
-        let c  = CGFloat(m[0][1]) * scale
-        let d  = CGFloat(m[1][1]) * scale
-        let tx = CGFloat(m[3][0]) * scale
-        let ty = CGFloat(m[3][1]) * scale
-        return CGAffineTransform(a: a, b: b, c: c, d: d, tx: tx, ty: ty)
+        guard m.count >= 4, m[0].count >= 4 else { return .identity }
+        return CGAffineTransform(
+            a:  CGFloat(m[0][0]) * scale,
+            b: -CGFloat(m[1][0]) * scale,
+            c: -CGFloat(m[0][1]) * scale,
+            d:  CGFloat(m[1][1]) * scale,
+            tx: CGFloat(m[3][0]) * scale,
+            ty: CGFloat(m[3][1]) * scale
+        )
+    }
+
+    
+    // Legacy alias so old call sites keep compiling
+    private func toDirectCGTransform(_ m: [[Float]], scale: CGFloat = 1.0) -> CGAffineTransform {
+        transformFromMatrix(m, scale: scale)
     }
     
+    private func isIdentityTransform(_ t: CGAffineTransform) -> Bool {
+        abs(t.a - 1) < 1e-6 && abs(t.d - 1) < 1e-6 &&
+        abs(t.b) < 1e-6 && abs(t.c) < 1e-6 &&
+        abs(t.tx) < 1e-6 && abs(t.ty) < 1e-6
+    }
+    
+    /// m1⁻¹ with the zoom removed: keeps rotation + translation unwind, drops 1/scale.
+    /// At zoom_1 = 1 this is exactly m1⁻¹ (all previously validated files are unaffected).
+//    private func rotationOnlyInverse(_ m: CGAffineTransform) -> CGAffineTransform {
+//        let s = sqrt(abs(m.a * m.d - m.b * m.c))   // m1's zoom (= zoom_1)
+//        guard s > 1e-9 else { return .identity }
+//        let inv = m.inverted()
+//        return CGAffineTransform(a: inv.a * s, b: inv.b * s,
+//                                 c: inv.c * s, d: inv.d * s,
+//                                 tx: inv.tx * s, ty: inv.ty * s)
+//    }
     
     // Create a default pen info
     private func defaultPenInfo() -> PenInfo {
@@ -2394,45 +4164,7 @@ public final class Renderer {
         return out
     }
     
-    // 3) Map pressure -> effective radius & opacity (use in your render pipeline).
-    // gamma: small curve to favor mid/high pressure (e.g. 0.9..1.2)
-    // Optimized pressure to radius and opacity conversion
-    func pressureToRadiusOpacity(pressure: Float, pen: PenInfo, radiusScale: CGFloat, gamma: Float = 1.0) -> (CGFloat, Float) {
-        // Pressure is already a normalized float value (0.0 to 1.0)
-        let p = max(0.0, min(1.0, pressure))
-        let pg = powf(p, gamma)
-        
-        // Optimized radius calculation
-        let sizeMin = pen.sizeMin
-        let sizeMax = pen.size
-        let sizeRange = sizeMax - sizeMin
-        
-
-        var radius = CGFloat(sizeMin + sizeRange * pg) * radiusScale
-        
-        
-        // Ensure minimum visible radius with optimized threshold
-        let minVisibleRadius: CGFloat = max(0.5, CGFloat(sizeMin) * 0.5)
-        radius = max(radius, minVisibleRadius)
-        
-        // Optimized opacity calculation
-        let opMin = pen.opacityMin
-        let opMax = pen.opacity
-        let opRange = opMax - opMin
-        var opacity = opMin + opRange * p /* * pg */
-        
-        // Apply minimum visible opacity threshold
-        let minVisibleOpacity: Float = 0.02
-        opacity = max(opacity, minVisibleOpacity)
-        
-        // Clamp final values
-        opacity = max(0.0, min(1.0, opacity))
-        
-        // Add debug print
-//        print("[P][radius_opacity] pressure=\(pressure), radius=\(radius), opacity=\(opacity), pen.type=\(pen.type ?? -1)")
-        
-        return (radius, opacity)
-    }
+    
 
     
     // 4) Convenience wrapper: run the full pipeline
@@ -2458,423 +4190,6 @@ public final class Renderer {
 //        return smooth
 //    }
     
-    // MARK: - Segment stuff
-    @inline(__always)
-    func catmullRom(_ p0: CGPoint, _ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint, _ t: CGFloat) -> CGPoint {
-        func dist(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
-            let dx = a.x - b.x
-            let dy = a.y - b.y
-            // Replaces pow(dx*dx + dy*dy, 0.25). sqrt is drastically faster than pow.
-            return sqrt(sqrt(dx * dx + dy * dy))
-        }
-        
-        let d01 = max(dist(p0, p1), 1e-6)
-        let d12 = max(dist(p1, p2), 1e-6)
-        let d23 = max(dist(p2, p3), 1e-6)
-        
-        let t1 = d01
-        let t2 = t1 + d12
-        
-        let u = t1 + t * d12
-        
-        // Precompute inverse distances to turn divisions into multiplications
-        let inv_d01 = 1.0 / d01
-        let inv_d23 = 1.0 / d23
-        let inv_t2 = 1.0 / t2
-        let inv_t3_t1 = 1.0 / (d12 + d23)
-        
-        let t_d12 = t * d12
-        let one_minus_t = 1.0 - t
-        let d12_1mt = d12 * one_minus_t
-        
-        // Algebraically simplified Barry-Goldman algorithm
-        let A1x = (-t_d12 * p0.x + u * p1.x) * inv_d01
-        let A1y = (-t_d12 * p0.y + u * p1.y) * inv_d01
-        
-        // A2 is just a simple LERP
-        let A2x = p1.x + (p2.x - p1.x) * t
-        let A2y = p1.y + (p2.y - p1.y) * t
-        
-        let A3x = ((d12_1mt + d23) * p2.x - d12_1mt * p3.x) * inv_d23
-        let A3y = ((d12_1mt + d23) * p2.y - d12_1mt * p3.y) * inv_d23
-        
-        let B1x = (d12_1mt * A1x + u * A2x) * inv_t2
-        let B1y = (d12_1mt * A1y + u * A2y) * inv_t2
-        
-        let B2x = ((d12_1mt + d23) * A2x + t_d12 * A3x) * inv_t3_t1
-        let B2y = ((d12_1mt + d23) * A2y + t_d12 * A3y) * inv_t3_t1
-        
-        // C is just a simple LERP
-        let Cx = B1x + (B2x - B1x) * t
-        let Cy = B1y + (B2y - B1y) * t
-        
-        return CGPoint(x: Cx, y: Cy)
-    }
-    
-//    @inline(__always)
-//    func catmullRom(_ p0: CGPoint, _ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint, _ t: CGFloat, alpha: CGFloat = 0.5) -> CGPoint {
-//        // Centripetal Catmull-Rom (alpha = 0.5) prevents loops and overshoots on sharp corners
-//        func dist(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
-//            let dx = a.x - b.x
-//            let dy = a.y - b.y
-//            return pow(dx * dx + dy * dy, alpha / 2.0)
-//        }
-//
-//        let d01 = max(dist(p0, p1), 1e-6)
-//        let d12 = max(dist(p1, p2), 1e-6)
-//        let d23 = max(dist(p2, p3), 1e-6)
-//
-//        let t0: CGFloat = 0
-//        let t1: CGFloat = t0 + d01
-//        let t2: CGFloat = t1 + d12
-//        let t3: CGFloat = t2 + d23
-//
-//        let u = t1 + t * (t2 - t1)
-//
-//        // Weights for A1
-//        let w0 = (t1 - u) / (t1 - t0)
-//        let w1 = (u - t0) / (t1 - t0)
-//        let A1x = p0.x * w0 + p1.x * w1
-//        let A1y = p0.y * w0 + p1.y * w1
-//
-//        // Weights for A2
-//        let w2 = (t2 - u) / (t2 - t1)
-//        let w3 = (u - t1) / (t2 - t1)
-//        let A2x = p1.x * w2 + p2.x * w3
-//        let A2y = p1.y * w2 + p2.y * w3
-//
-//        // Weights for A3
-//        let w4 = (t3 - u) / (t3 - t2)
-//        let w5 = (u - t2) / (t3 - t2)
-//        let A3x = p2.x * w4 + p3.x * w5
-//        let A3y = p2.y * w4 + p3.y * w5
-//
-//        // Weights for B1
-//        let b1w0 = (t2 - u) / (t2 - t0)
-//        let b1w1 = (u - t0) / (t2 - t0)
-//        let B1x = A1x * b1w0 + A2x * b1w1
-//        let B1y = A1y * b1w0 + A2y * b1w1
-//
-//        // Weights for B2
-//        let b2w0 = (t3 - u) / (t3 - t1)
-//        let b2w1 = (u - t1) / (t3 - t1)
-//        let B2x = A2x * b2w0 + A3x * b2w1
-//        let B2y = A2y * b2w0 + A3y * b2w1
-//
-//        // Weights for C
-//        let cw0 = (t2 - u) / (t2 - t1)
-//        let cw1 = (u - t1) / (t2 - t1)
-//        let Cx = B1x * cw0 + B2x * cw1
-//        let Cy = B1y * cw0 + B2y * cw1
-//
-//        return CGPoint(x: Cx, y: Cy)
-//    }
-#if canImport(Metal)
-    struct CRPointSpan {
-        let p0: CGPoint; let p1: CGPoint; let p2: CGPoint; let p3: CGPoint
-    }
-    
-    struct CRScalarSpan {
-        let s0: CGFloat; let s1: CGFloat; let s2: CGFloat; let s3: CGFloat
-    }
-    
-    // Exact mathematical subdivision of a Catmull-Rom span (CGPoint)
-    func subdivideCRPoint(_ span: CRPointSpan) -> (CRPointSpan, CRPointSpan) {
-        let p0 = span.p0, p1 = span.p1, p2 = span.p2, p3 = span.p3
-        
-        // Convert CR to Bezier
-        let b0 = p1
-        let b1 = CGPoint(x: p1.x + (p2.x - p0.x) / 6.0, y: p1.y + (p2.y - p0.y) / 6.0)
-        let b2 = CGPoint(x: p2.x - (p3.x - p1.x) / 6.0, y: p2.y - (p3.y - p1.y) / 6.0)
-        let b3 = p2
-        
-        // De Casteljau split at t=0.5
-        let m01 = CGPoint(x: (b0.x + b1.x) / 2.0, y: (b0.y + b1.y) / 2.0)
-        let m12 = CGPoint(x: (b1.x + b2.x) / 2.0, y: (b1.y + b2.y) / 2.0)
-        let m23 = CGPoint(x: (b2.x + b3.x) / 2.0, y: (b2.y + b3.y) / 2.0)
-        let m012 = CGPoint(x: (m01.x + m12.x) / 2.0, y: (m01.y + m12.y) / 2.0)
-        let m123 = CGPoint(x: (m12.x + m23.x) / 2.0, y: (m12.y + m23.y) / 2.0)
-        let m = CGPoint(x: (m012.x + m123.x) / 2.0, y: (m012.y + m123.y) / 2.0)
-        
-        // Convert Left Bezier back to CR
-        let l_p0 = CGPoint(x: m.x - 6.0 * (m01.x - b0.x), y: m.y - 6.0 * (m01.y - b0.y))
-        let l_p1 = b0
-        let l_p2 = m
-        let l_p3 = CGPoint(x: b0.x + 6.0 * (m.x - m012.x), y: b0.y + 6.0 * (m.y - m012.y))
-        let left = CRPointSpan(p0: l_p0, p1: l_p1, p2: l_p2, p3: l_p3)
-        
-        // Convert Right Bezier back to CR
-        let r_p0 = CGPoint(x: b3.x - 6.0 * (m123.x - m.x), y: b3.y - 6.0 * (m123.y - m.y))
-        let r_p1 = m
-        let r_p2 = b3
-        let r_p3 = CGPoint(x: m.x + 6.0 * (b3.x - m23.x), y: m.y + 6.0 * (b3.y - m23.y))
-        let right = CRPointSpan(p0: r_p0, p1: r_p1, p2: r_p2, p3: r_p3)
-        
-        return (left, right)
-    }
-    
-    // Exact mathematical subdivision of a Catmull-Rom span (CGFloat)
-    func subdivideCRScalar(_ span: CRScalarSpan) -> (CRScalarSpan, CRScalarSpan) {
-        let s0 = span.s0, s1 = span.s1, s2 = span.s2, s3 = span.s3
-        
-        let b0 = s1
-        let b1 = s1 + (s2 - s0) / 6.0
-        let b2 = s2 - (s3 - s1) / 6.0
-        let b3 = s2
-        
-        let m01 = (b0 + b1) / 2.0
-        let m12 = (b1 + b2) / 2.0
-        let m23 = (b2 + b3) / 2.0
-        let m012 = (m01 + m12) / 2.0
-        let m123 = (m12 + m23) / 2.0
-        let m = (m012 + m123) / 2.0
-        
-        let l_s0 = m - 6.0 * (m01 - b0)
-        let l_s1 = b0
-        let l_s2 = m
-        let l_s3 = b0 + 6.0 * (m - m012)
-        let left = CRScalarSpan(s0: l_s0, s1: l_s1, s2: l_s2, s3: l_s3)
-        
-        let r_s0 = b3 - 6.0 * (m123 - m)
-        let r_s1 = m
-        let r_s2 = b3
-        let r_s3 = m + 6.0 * (b3 - m23)
-        let right = CRScalarSpan(s0: r_s0, s1: r_s1, s2: r_s2, s3: r_s3)
-        
-        return (left, right)
-    }
-    
-    struct FlatPoint {
-        let p0: CGPoint // CR Prev
-        let p1: CGPoint // CR Start
-        let p2: CGPoint // CR End
-        let p3: CGPoint // CR Next
-        let r0: CGFloat
-        let r1: CGFloat
-        let r2: CGFloat
-        let r3: CGFloat
-        let o0: CGFloat
-        let o1: CGFloat
-        let o2: CGFloat
-        let o3: CGFloat
-    }
-    
-    @inline(__always)
-    func isSafeAngle(_ v1: CGPoint, _ v2: CGPoint) -> Bool {
-        let dot = v1.x * v2.x + v1.y * v2.y
-        if dot <= 0 { return false }
-        let len1Sq = v1.x * v1.x + v1.y * v1.y
-        let len2Sq = v2.x * v2.x + v2.y * v2.y
-        // cos(60) = 0.5. We want cos(angle) > 0.5
-        // dot / (len1 * len2) > 0.5  =>  4 * dot^2 > len1Sq * len2Sq
-        return 4.0 * dot * dot > len1Sq * len2Sq
-    }
-    
-    @inline(__always)
-    func isStraightAngle(_ v1: CGPoint, _ v2: CGPoint) -> Bool {
-        let dot = v1.x * v2.x + v1.y * v2.y
-        if dot <= 0 { return false }
-        let len1Sq = v1.x * v1.x + v1.y * v1.y
-        let len2Sq = v2.x * v2.x + v2.y * v2.y
-        // cos(3 degrees) ~= 0.9986
-        return dot * dot > len1Sq * len2Sq * 0.998
-    }
-    
-    func flattenAndBuild(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRScalarSpan, seed: UInt32, depth: Int = 0, into segments: inout [GPUSplineSegment], isPolyline: Bool, isMarker: Bool) {
-        
-        if isPolyline {
-            flattenPolyline(span: span, rSpan: rSpan, oSpan: oSpan, seed: seed, into: &segments)
-            return
-        }
-        
-        let p0 = span.p0, p1 = span.p1, p2 = span.p2, p3 = span.p3
-        let r1 = rSpan.s1, r2 = rSpan.s2
-        let o1 = oSpan.s1, o2 = oSpan.s2
-        
-        let dx = p2.x - p1.x
-        let dy = p2.y - p1.y
-        let h_chord = hypot(dx, dy)
-        
-        let v0 = CGPoint(x: p1.x - p0.x, y: p1.y - p0.y)
-        let v1 = CGPoint(x: dx, y: dy)
-        let v2 = CGPoint(x: p3.x - p2.x, y: p3.y - p2.y)
-        
-        var needsSubdivide = false
-        if h_chord > 500.0 { needsSubdivide = true }
-        if isMarker && h_chord > 10.0 { needsSubdivide = true }
-        if !isSafeAngle(v0, v1) || !isSafeAngle(v1, v2) { needsSubdivide = true }
-        
-        if !needsSubdivide || depth > 8 {
-            let r_max = max(r1, r2)
-            
-            // Changed from 1.5 to 1.0 for more overlap.
-            // This allows the shader to use a simple `min` instead of `smin`,
-            let shape2_max_len = min(
-                5.0 * max(0.0, (r_max - 0.82) * abs(r1 - r2)),
-                1.0 * r_max
-            )
-            
-            var segmentType: UInt32 = 0
-            if h_chord <= shape2_max_len || h_chord < 1.0 {
-                segmentType = 2
-            } else if isStraightAngle(v0, v1) && isStraightAngle(v1, v2) {
-                segmentType = 0
-            } else {
-                segmentType = 1
-            }
-            
-            // Append the final GPU struct directly
-            segments.append(GPUSplineSegment(
-                p0: SIMD2<Float>(Float(p0.x), Float(p0.y)),
-                p1: SIMD2<Float>(Float(p1.x), Float(p1.y)),
-                p2: SIMD2<Float>(Float(p2.x), Float(p2.y)),
-                p3: SIMD2<Float>(Float(p3.x), Float(p3.y)),
-                radius0: Float(r1), radius1: Float(r2),
-                opacity0: Float(o1), opacity1: Float(o2),
-                segmentType: segmentType,
-                noiseSeed: seed
-            ))
-            return
-        }
-        
-        let (leftP, rightP) = subdivideCRPoint(span)
-        let (leftR, rightR) = subdivideCRScalar(rSpan)
-        let (leftO, rightO) = subdivideCRScalar(oSpan)
-        
-        flattenAndBuild(span: leftP, rSpan: leftR, oSpan: leftO, seed: seed, depth: depth + 1, into: &segments, isPolyline: isPolyline, isMarker: isMarker)
-        flattenAndBuild(span: rightP, rSpan: rightR, oSpan: rightO, seed: seed, depth: depth + 1, into: &segments, isPolyline: isPolyline, isMarker: isMarker)
-    }
-    
-    func flattenPolyline(
-        span: CRPointSpan,
-        rSpan: CRScalarSpan,
-        oSpan: CRScalarSpan,
-        seed: UInt32,
-        into segments: inout [GPUSplineSegment]
-    ) {
-        let p1 = span.p1, p2 = span.p2
-        let dx = p2.x - p1.x, dy = p2.y - p1.y
-        let len = hypot(dx, dy)
-        
-        // 1. Base target length on the maximum radius of this span
-        let r_max = max(rSpan.s1, rSpan.s2)
-        
-        // 2. Determine how many radii long a segment should be.
-        // Adjust this multiplier based on visual testing (e.g. 2.0 to 8.0).
-        let radiusMultiplier: CGFloat = 0.5
-        
-        // We use max(..., 4.0) as a hard floor to prevent infinite subdivisions
-        // or millions of segments if the radius is 0 or extremely small.
-        let targetLen = max(4.0, r_max * radiusMultiplier)
-        
-        let n = max(1, Int((len / targetLen).rounded(.up)))
-        let invN = 1.0 / CGFloat(n)
-        
-        // 3. Emit segments
-        for i in 0..<n {
-            let t0 = CGFloat(i) * invN
-            let t1 = CGFloat(i + 1) * invN
-            
-            let a = CGPoint(x: p1.x + dx * t0, y: p1.y + dy * t0)
-            let b = CGPoint(x: p1.x + dx * t1, y: p1.y + dy * t1)
-            
-            // Straight extrapolation for tangent hints
-            let a0 = CGPoint(x: 2 * a.x - b.x, y: 2 * a.y - b.y)
-            let b3 = CGPoint(x: 2 * b.x - a.x, y: 2 * b.y - a.y)
-            
-            // Linearly interpolate radius and opacity
-            let r0 = rSpan.s1 + (rSpan.s2 - rSpan.s1) * t0
-            let r1 = rSpan.s1 + (rSpan.s2 - rSpan.s1) * t1
-            let o0 = oSpan.s1 + (oSpan.s2 - oSpan.s1) * t0
-            let o1 = oSpan.s1 + (oSpan.s2 - oSpan.s1) * t1
-            
-            segments.append(GPUSplineSegment(
-                p0: SIMD2<Float>(Float(a0.x), Float(a0.y)),
-                p1: SIMD2<Float>(Float(a.x),  Float(a.y)),
-                p2: SIMD2<Float>(Float(b.x),  Float(b.y)),
-                p3: SIMD2<Float>(Float(b3.x), Float(b3.y)),
-                radius0: Float(r0), radius1: Float(r1),
-                opacity0: Float(o0), opacity1: Float(o1),
-                segmentType: 0,
-                noiseSeed: seed
-            ))
-        }
-    }
-#endif
-//    func flattenSpan(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRScalarSpan, depth: Int = 0, into points: inout [FlatPoint]) {
-//        let p0 = span.p0, p1 = span.p1, p2 = span.p2, p3 = span.p3
-//
-//        let dx = p2.x - p1.x
-//        let dy = p2.y - p1.y
-//        let h_chord = hypot(dx, dy)
-//
-//        let v0 = CGPoint(x: p1.x - p0.x, y: p1.y - p0.y)
-//        let v1 = CGPoint(x: dx, y: dy)
-//        let v2 = CGPoint(x: p3.x - p2.x, y: p3.y - p2.y)
-//
-//        var needsSubdivide = false
-//        if h_chord > 500.0 { needsSubdivide = true }
-//        if !isSafeAngle(v0, v1) || !isSafeAngle(v1, v2) { needsSubdivide = true }
-//
-//        if !needsSubdivide || depth > 8 {
-//            points.append(FlatPoint(
-//                p0: p0, p1: p1, p2: p2, p3: p3,
-//                r0: rSpan.s0, r1: rSpan.s1, r2: rSpan.s2, r3: rSpan.s3,
-//                o0: oSpan.s0, o1: oSpan.s1, o2: oSpan.s2, o3: oSpan.s3
-//            ))
-//            return
-//        }
-//
-//        let (leftP, rightP) = subdivideCRPoint(span)
-//        let (leftR, rightR) = subdivideCRScalar(rSpan)
-//        let (leftO, rightO) = subdivideCRScalar(oSpan)
-//
-//        flattenSpan(span: leftP, rSpan: leftR, oSpan: leftO, depth: depth + 1, into: &points)
-//        flattenSpan(span: rightP, rSpan: rightR, oSpan: rightO, depth: depth + 1, into: &points)
-//    }
-//
-//    func buildBentSegmentsFromFlat(points: [FlatPoint], seed: UInt32) -> [GPUSplineSegment] {
-//        var segments: [GPUSplineSegment] = []
-//        if points.isEmpty { return segments }
-//
-//        for pt in points {
-//            let v0 = CGPoint(x: pt.p1.x - pt.p0.x, y: pt.p1.y - pt.p0.y)
-//            let v1 = CGPoint(x: pt.p2.x - pt.p1.x, y: pt.p2.y - pt.p1.y)
-//            let v2 = CGPoint(x: pt.p3.x - pt.p2.x, y: pt.p3.y - pt.p2.y)
-//
-//            let h_chord = hypot(v1.x, v1.y)
-//            let r_max = max(pt.r1, pt.r2)
-//            let shape2_max_len = 5.0 * max(0.0, r_max - 0.82 * abs(pt.r1 - pt.r2))
-//
-//            var segmentType: UInt32 = 0
-//            if h_chord <= shape2_max_len || h_chord < 1.0 {
-//                // Very short stroke. Favor Shape-2.
-//                segmentType = 2
-//            } else if isStraightAngle(v0, v1) && isStraightAngle(v1, v2) {
-//                // Near straight. Favor Straight Capsule.
-//                segmentType = 0
-//            } else {
-//                // Bent and long enough. Shape-1.
-//                segmentType = 1
-//            }
-//
-//            // segmentType = 1 // Uncomment to force test Shape-1
-//
-//            segments.append(GPUSplineSegment(
-//                p0: SIMD2<Float>(Float(pt.p0.x), Float(pt.p0.y)),
-//                p1: SIMD2<Float>(Float(pt.p1.x), Float(pt.p1.y)),
-//                p2: SIMD2<Float>(Float(pt.p2.x), Float(pt.p2.y)),
-//                p3: SIMD2<Float>(Float(pt.p3.x), Float(pt.p3.y)),
-//                radius0: Float(pt.r1), radius1: Float(pt.r2),
-//                opacity0: Float(pt.o1), opacity1: Float(pt.o2),
-//                segmentType: segmentType,
-//                noiseSeed: seed
-//            ))
-//        }
-//        return segments
-//    }
-
-
     
     // MARK: - Spline first, then uniform-distance resample + pressure interpolation -
     // --- Catmull-Rom spline + arc-length resample + pressure interpolation ---
@@ -3458,27 +4773,6 @@ public final class Renderer {
             )
             stamps.append(stamp)
         }
-        
-        // Try GPU path (Apple platforms only) // unused? renderStroke_drawDeviceResampled() only called from renderLayerWithCPU
-//        #if canImport(Metal)
-//        if let mr = self.metalRenderer, MetalRenderer.useGPURendering {
-//            let color = SIMD4<Float>(Float(pen.color.r), Float(pen.color.g), Float(pen.color.b), 1.0)
-//            
-//            do {
-//                let w = Int(self.canvasSize.width * self.scale)
-//                let h = Int(self.canvasSize.height * self.scale)
-//                
-//                if let cgImage = try mr.renderStrokesSync(stamps: stamps, width: w, height: h, color: color) {
-//                    context.draw(cgImage, in: CGRect(x: 0, y: 0, width: self.canvasSize.width * self.scale, height: self.canvasSize.height * self.scale))
-//                    return
-//                } else {
-//                    print("renderStroke_drawDeviceResampled: renderStrokesSync returned nil. Falling back to CPU.")
-//                }
-//            } catch {
-//                print("renderStroke_drawDeviceResampled: metal rendering failed with error: \(error). Falling back to CPU.")
-//            }
-//        }
-//        #endif
         
         // Fallback to CPU implementation (always available)
         renderStroke_drawDeviceResampled_CPU(
@@ -4411,6 +5705,35 @@ public final class Renderer {
         #endif
     }
     
+    private func verticallyFlipRenderedImage(_ image: CGImage) -> CGImage? {
+        let context = createBitmapContext(
+            size: canvasSize,
+            scale: scale
+        )
+        
+        let rect = CGRect(
+            x: 0,
+            y: 0,
+            width: context.width,
+            height: context.height
+        )
+        
+        context.saveGState()
+        
+        // Same convention used by the old GPU compositing path.
+        context.scaleBy(x: 1, y: -1)
+        context.translateBy(
+            x: 0,
+            y: -CGFloat(context.height)
+        )
+        
+        context.draw(image, in: rect)
+        
+        context.restoreGState()
+        
+        return context.makeImage()
+    }
+    
 }
 
 // MARK: - Test Function with Background Applied AFTER Strokes. Remove?
@@ -4473,11 +5796,442 @@ func createBitmapContext(size: CGSize, scale: CGFloat) -> CGContext {
     #endif
 }
 
-// Add the StrokeRecord struct that's used in the new functions
-struct StrokeRecord {
-    var points: [Point]
-    var pen: PenInfo
-    var penMatrixScale: CGFloat
-    var penMatrixAffine: CGAffineTransform?
-    var isPolyline: Bool
+func buildOpFromStroke(
+    _ stroke: StrokeRecord,
+    artToDevice: CGAffineTransform,
+    flipTransform: CGAffineTransform?
+) -> (segments: [GPUSplineSegment], color: SIMD4<Float>, isEraser: Bool, isMarker: Bool, meta: PasteLayerMeta?, m2Transform: CGAffineTransform?)? {
+    
+    guard stroke.points.count >= 1 else { return nil }
+    let points = stroke.points.count == 1 ? [stroke.points[0], stroke.points[0]] : stroke.points
+    
+    var effectiveRadiusScale: CGFloat = stroke.penMatrixScale
+    if let affine = stroke.pen.penMatrixAffine {
+        let scaleX = sqrt(affine.a * affine.a + affine.c * affine.c)
+        let scaleY = sqrt(affine.b * affine.b + affine.d * affine.d)
+        effectiveRadiusScale = (scaleX + scaleY) / 2.0
+    }
+    let artToDeviceScaleX = sqrt(artToDevice.a * artToDevice.a + artToDevice.c * artToDevice.c)
+    let artToDeviceScaleY = sqrt(artToDevice.b * artToDevice.b + artToDevice.d * artToDevice.d)
+    let artToDeviceScale = (artToDeviceScaleX + artToDeviceScaleY) / 2.0
+    effectiveRadiusScale *= artToDeviceScale * 0.5
+    
+    let color = SIMD4<Float>(Float(stroke.pen.color.r), Float(stroke.pen.color.g), Float(stroke.pen.color.b), 1.0)
+    let flip = flipTransform ?? .identity
+    
+    var transformedPoints: [(p: CGPoint, pressure: Float)] = []
+    for p in points {
+        var pt = CGPoint(x: CGFloat(p.x), y: CGFloat(p.y))
+        if let affine = stroke.pen.penMatrixAffine { pt = pt.applying(affine) }
+        pt = pt.applying(artToDevice)
+        pt = pt.applying(flip)
+        transformedPoints.append((pt, p.p))
+    }
+    
+    var radii: [CGFloat] = []
+    var opacities: [CGFloat] = []
+    for tp in transformedPoints {
+        let (r, op) = pressureToRadiusOpacity(pressure: tp.pressure, pen: stroke.pen, radiusScale: effectiveRadiusScale, gamma: 1.0)
+        radii.append(r)
+        opacities.append(CGFloat(op))
+    }
+    
+    var pts  = transformedPoints.map { $0.p }
+    var rads = radii
+    var opas = opacities
+    
+    let firstPt = pts[0]
+    let secondPt = pts[1]
+    pts.insert(CGPoint(x: 2.0 * firstPt.x - secondPt.x, y: 2.0 * firstPt.y - secondPt.y), at: 0)
+    rads.insert(rads[0], at: 0)
+    opas.insert(opas[0], at: 0)
+    
+    let lastPt = pts[pts.count - 1]
+    let secondToLastPt = pts[pts.count - 2]
+    pts.append(CGPoint(x: 2.0 * lastPt.x - secondToLastPt.x, y: 2.0 * lastPt.y - secondToLastPt.y))
+    rads.append(rads[rads.count - 1])
+    opas.append(opas[opas.count - 1])
+    
+    let seed = stroke.pen.type == 1 ? arc4random() + 1 : 0
+    var segmentsForStroke: [GPUSplineSegment] = []
+    segmentsForStroke.reserveCapacity((pts.count - 3) * 4)
+    
+    for i in 1..<(pts.count - 2) {
+        let pSpan = CRPointSpan(p0: pts[i-1], p1: pts[i], p2: pts[i+1], p3: pts[i+2])
+        let rSpan = CRScalarSpan(s0: rads[i-1], s1: rads[i], s2: rads[i+1], s3: rads[i+2])
+        let oSpan = CRScalarSpan(s0: opas[i-1], s1: opas[i], s2: opas[i+1], s3: opas[i+2])
+        flattenAndBuild(span: pSpan, rSpan: rSpan, oSpan: oSpan, seed: seed, depth: 0, into: &segmentsForStroke, isPolyline: stroke.isPolyline, isMarker: stroke.pen.isMarker)
+    }
+    
+    return (segments: segmentsForStroke, color: color, isEraser: stroke.pen.isEraser, isMarker: stroke.pen.isMarker, meta: nil, m2Transform: nil)
 }
+
+
+// 3) Map pressure -> effective radius & opacity (use in your render pipeline).
+// gamma: small curve to favor mid/high pressure (e.g. 0.9..1.2)
+// Optimized pressure to radius and opacity conversion
+func pressureToRadiusOpacity(pressure: Float, pen: PenInfo, radiusScale: CGFloat, gamma: Float = 1.0) -> (CGFloat, Float) {
+    // Pressure is already a normalized float value (0.0 to 1.0)
+    let p = max(0.0, min(1.0, pressure))
+    let pg = powf(p, gamma)
+    
+    // Optimized radius calculation
+    let sizeMin = pen.sizeMin
+    let sizeMax = pen.size
+    let sizeRange = sizeMax - sizeMin
+    
+    
+    var radius = CGFloat(sizeMin + sizeRange * pg) * radiusScale
+    
+    
+    // Ensure minimum visible radius with optimized threshold
+    let minVisibleRadius: CGFloat = max(0.5, CGFloat(sizeMin) * 0.5)
+    radius = max(radius, minVisibleRadius)
+    
+    // Optimized opacity calculation
+    let opMin = pen.opacityMin
+    let opMax = pen.opacity
+    let opRange = opMax - opMin
+    var opacity = opMin + opRange * p /* * pg */
+    
+    // Apply minimum visible opacity threshold
+    let minVisibleOpacity: Float = 0.02
+    opacity = max(opacity, minVisibleOpacity)
+    
+    // Clamp final values
+    opacity = max(0.0, min(1.0, opacity))
+    
+    // Add debug print
+    //        print("[P][radius_opacity] pressure=\(pressure), radius=\(radius), opacity=\(opacity), pen.type=\(pen.type ?? -1)")
+    
+    return (radius, opacity)
+}
+
+// MARK: - Segment stuff
+@inline(__always)
+func catmullRom(_ p0: CGPoint, _ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint, _ t: CGFloat) -> CGPoint {
+    func dist(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
+        let dx = a.x - b.x
+        let dy = a.y - b.y
+        // Replaces pow(dx*dx + dy*dy, 0.25). sqrt is drastically faster than pow.
+        return sqrt(sqrt(dx * dx + dy * dy))
+    }
+    
+    let d01 = max(dist(p0, p1), 1e-6)
+    let d12 = max(dist(p1, p2), 1e-6)
+    let d23 = max(dist(p2, p3), 1e-6)
+    
+    let t1 = d01
+    let t2 = t1 + d12
+    
+    let u = t1 + t * d12
+    
+    // Precompute inverse distances to turn divisions into multiplications
+    let inv_d01 = 1.0 / d01
+    let inv_d23 = 1.0 / d23
+    let inv_t2 = 1.0 / t2
+    let inv_t3_t1 = 1.0 / (d12 + d23)
+    
+    let t_d12 = t * d12
+    let one_minus_t = 1.0 - t
+    let d12_1mt = d12 * one_minus_t
+    
+    // Algebraically simplified Barry-Goldman algorithm
+    let A1x = (-t_d12 * p0.x + u * p1.x) * inv_d01
+    let A1y = (-t_d12 * p0.y + u * p1.y) * inv_d01
+    
+    // A2 is just a simple LERP
+    let A2x = p1.x + (p2.x - p1.x) * t
+    let A2y = p1.y + (p2.y - p1.y) * t
+    
+    let A3x = ((d12_1mt + d23) * p2.x - d12_1mt * p3.x) * inv_d23
+    let A3y = ((d12_1mt + d23) * p2.y - d12_1mt * p3.y) * inv_d23
+    
+    let B1x = (d12_1mt * A1x + u * A2x) * inv_t2
+    let B1y = (d12_1mt * A1y + u * A2y) * inv_t2
+    
+    let B2x = ((d12_1mt + d23) * A2x + t_d12 * A3x) * inv_t3_t1
+    let B2y = ((d12_1mt + d23) * A2y + t_d12 * A3y) * inv_t3_t1
+    
+    // C is just a simple LERP
+    let Cx = B1x + (B2x - B1x) * t
+    let Cy = B1y + (B2y - B1y) * t
+    
+    return CGPoint(x: Cx, y: Cy)
+}
+
+//    @inline(__always)
+//    func catmullRom(_ p0: CGPoint, _ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint, _ t: CGFloat, alpha: CGFloat = 0.5) -> CGPoint {
+//        // Centripetal Catmull-Rom (alpha = 0.5) prevents loops and overshoots on sharp corners
+//        func dist(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
+//            let dx = a.x - b.x
+//            let dy = a.y - b.y
+//            return pow(dx * dx + dy * dy, alpha / 2.0)
+//        }
+//
+//        let d01 = max(dist(p0, p1), 1e-6)
+//        let d12 = max(dist(p1, p2), 1e-6)
+//        let d23 = max(dist(p2, p3), 1e-6)
+//
+//        let t0: CGFloat = 0
+//        let t1: CGFloat = t0 + d01
+//        let t2: CGFloat = t1 + d12
+//        let t3: CGFloat = t2 + d23
+//
+//        let u = t1 + t * (t2 - t1)
+//
+//        // Weights for A1
+//        let w0 = (t1 - u) / (t1 - t0)
+//        let w1 = (u - t0) / (t1 - t0)
+//        let A1x = p0.x * w0 + p1.x * w1
+//        let A1y = p0.y * w0 + p1.y * w1
+//
+//        // Weights for A2
+//        let w2 = (t2 - u) / (t2 - t1)
+//        let w3 = (u - t1) / (t2 - t1)
+//        let A2x = p1.x * w2 + p2.x * w3
+//        let A2y = p1.y * w2 + p2.y * w3
+//
+//        // Weights for A3
+//        let w4 = (t3 - u) / (t3 - t2)
+//        let w5 = (u - t2) / (t3 - t2)
+//        let A3x = p2.x * w4 + p3.x * w5
+//        let A3y = p2.y * w4 + p3.y * w5
+//
+//        // Weights for B1
+//        let b1w0 = (t2 - u) / (t2 - t0)
+//        let b1w1 = (u - t0) / (t2 - t0)
+//        let B1x = A1x * b1w0 + A2x * b1w1
+//        let B1y = A1y * b1w0 + A2y * b1w1
+//
+//        // Weights for B2
+//        let b2w0 = (t3 - u) / (t3 - t1)
+//        let b2w1 = (u - t1) / (t3 - t1)
+//        let B2x = A2x * b2w0 + A3x * b2w1
+//        let B2y = A2y * b2w0 + A3y * b2w1
+//
+//        // Weights for C
+//        let cw0 = (t2 - u) / (t2 - t1)
+//        let cw1 = (u - t1) / (t2 - t1)
+//        let Cx = B1x * cw0 + B2x * cw1
+//        let Cy = B1y * cw0 + B2y * cw1
+//
+//        return CGPoint(x: Cx, y: Cy)
+//    }
+#if canImport(Metal)
+struct CRPointSpan {
+    let p0: CGPoint; let p1: CGPoint; let p2: CGPoint; let p3: CGPoint
+}
+
+struct CRScalarSpan {
+    let s0: CGFloat; let s1: CGFloat; let s2: CGFloat; let s3: CGFloat
+}
+
+// Exact mathematical subdivision of a Catmull-Rom span (CGPoint)
+func subdivideCRPoint(_ span: CRPointSpan) -> (CRPointSpan, CRPointSpan) {
+    let p0 = span.p0, p1 = span.p1, p2 = span.p2, p3 = span.p3
+    
+    // Convert CR to Bezier
+    let b0 = p1
+    let b1 = CGPoint(x: p1.x + (p2.x - p0.x) / 6.0, y: p1.y + (p2.y - p0.y) / 6.0)
+    let b2 = CGPoint(x: p2.x - (p3.x - p1.x) / 6.0, y: p2.y - (p3.y - p1.y) / 6.0)
+    let b3 = p2
+    
+    // De Casteljau split at t=0.5
+    let m01 = CGPoint(x: (b0.x + b1.x) / 2.0, y: (b0.y + b1.y) / 2.0)
+    let m12 = CGPoint(x: (b1.x + b2.x) / 2.0, y: (b1.y + b2.y) / 2.0)
+    let m23 = CGPoint(x: (b2.x + b3.x) / 2.0, y: (b2.y + b3.y) / 2.0)
+    let m012 = CGPoint(x: (m01.x + m12.x) / 2.0, y: (m01.y + m12.y) / 2.0)
+    let m123 = CGPoint(x: (m12.x + m23.x) / 2.0, y: (m12.y + m23.y) / 2.0)
+    let m = CGPoint(x: (m012.x + m123.x) / 2.0, y: (m012.y + m123.y) / 2.0)
+    
+    // Convert Left Bezier back to CR
+    let l_p0 = CGPoint(x: m.x - 6.0 * (m01.x - b0.x), y: m.y - 6.0 * (m01.y - b0.y))
+    let l_p1 = b0
+    let l_p2 = m
+    let l_p3 = CGPoint(x: b0.x + 6.0 * (m.x - m012.x), y: b0.y + 6.0 * (m.y - m012.y))
+    let left = CRPointSpan(p0: l_p0, p1: l_p1, p2: l_p2, p3: l_p3)
+    
+    // Convert Right Bezier back to CR
+    let r_p0 = CGPoint(x: b3.x - 6.0 * (m123.x - m.x), y: b3.y - 6.0 * (m123.y - m.y))
+    let r_p1 = m
+    let r_p2 = b3
+    let r_p3 = CGPoint(x: m.x + 6.0 * (b3.x - m23.x), y: m.y + 6.0 * (b3.y - m23.y))
+    let right = CRPointSpan(p0: r_p0, p1: r_p1, p2: r_p2, p3: r_p3)
+    
+    return (left, right)
+}
+
+// Exact mathematical subdivision of a Catmull-Rom span (CGFloat)
+func subdivideCRScalar(_ span: CRScalarSpan) -> (CRScalarSpan, CRScalarSpan) {
+    let s0 = span.s0, s1 = span.s1, s2 = span.s2, s3 = span.s3
+    
+    let b0 = s1
+    let b1 = s1 + (s2 - s0) / 6.0
+    let b2 = s2 - (s3 - s1) / 6.0
+    let b3 = s2
+    
+    let m01 = (b0 + b1) / 2.0
+    let m12 = (b1 + b2) / 2.0
+    let m23 = (b2 + b3) / 2.0
+    let m012 = (m01 + m12) / 2.0
+    let m123 = (m12 + m23) / 2.0
+    let m = (m012 + m123) / 2.0
+    
+    let l_s0 = m - 6.0 * (m01 - b0)
+    let l_s1 = b0
+    let l_s2 = m
+    let l_s3 = b0 + 6.0 * (m - m012)
+    let left = CRScalarSpan(s0: l_s0, s1: l_s1, s2: l_s2, s3: l_s3)
+    
+    let r_s0 = b3 - 6.0 * (m123 - m)
+    let r_s1 = m
+    let r_s2 = b3
+    let r_s3 = m + 6.0 * (b3 - m23)
+    let right = CRScalarSpan(s0: r_s0, s1: r_s1, s2: r_s2, s3: r_s3)
+    
+    return (left, right)
+}
+
+@inline(__always)
+func isSafeAngle(_ v1: CGPoint, _ v2: CGPoint) -> Bool {
+    let dot = v1.x * v2.x + v1.y * v2.y
+    if dot <= 0 { return false }
+    let len1Sq = v1.x * v1.x + v1.y * v1.y
+    let len2Sq = v2.x * v2.x + v2.y * v2.y
+    // cos(60) = 0.5. We want cos(angle) > 0.5
+    // dot / (len1 * len2) > 0.5  =>  4 * dot^2 > len1Sq * len2Sq
+    return 4.0 * dot * dot > len1Sq * len2Sq
+}
+
+@inline(__always)
+func isStraightAngle(_ v1: CGPoint, _ v2: CGPoint) -> Bool {
+    let dot = v1.x * v2.x + v1.y * v2.y
+    if dot <= 0 { return false }
+    let len1Sq = v1.x * v1.x + v1.y * v1.y
+    let len2Sq = v2.x * v2.x + v2.y * v2.y
+    // cos(3 degrees) ~= 0.9986
+    return dot * dot > len1Sq * len2Sq * 0.998
+}
+
+func flattenAndBuild(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRScalarSpan, seed: UInt32, depth: Int = 0, into segments: inout [GPUSplineSegment], isPolyline: Bool, isMarker: Bool) {
+    
+    if isPolyline {
+        flattenPolyline(span: span, rSpan: rSpan, oSpan: oSpan, seed: seed, into: &segments)
+        return
+    }
+    
+    let p0 = span.p0, p1 = span.p1, p2 = span.p2, p3 = span.p3
+    let r1 = rSpan.s1, r2 = rSpan.s2
+    let o1 = oSpan.s1, o2 = oSpan.s2
+    
+    let dx = p2.x - p1.x
+    let dy = p2.y - p1.y
+    let h_chord = hypot(dx, dy)
+    
+    let v0 = CGPoint(x: p1.x - p0.x, y: p1.y - p0.y)
+    let v1 = CGPoint(x: dx, y: dy)
+    let v2 = CGPoint(x: p3.x - p2.x, y: p3.y - p2.y)
+    
+    var needsSubdivide = false
+    if h_chord > 500.0 { needsSubdivide = true }
+    if isMarker && h_chord > 10.0 { needsSubdivide = true }
+    if !isSafeAngle(v0, v1) || !isSafeAngle(v1, v2) { needsSubdivide = true }
+    
+    if !needsSubdivide || depth > 8 {
+        let r_max = max(r1, r2)
+        
+        // Changed from 1.5 to 1.0 for more overlap.
+        // This allows the shader to use a simple `min` instead of `smin`,
+        let shape2_max_len = min(
+            5.0 * max(0.0, (r_max - 0.82) * abs(r1 - r2)),
+            1.0 * r_max
+        )
+        
+        var segmentType: UInt32 = 0
+        if h_chord <= shape2_max_len || h_chord < 1.0 {
+            segmentType = 2
+        } else if isStraightAngle(v0, v1) && isStraightAngle(v1, v2) {
+            segmentType = 0
+        } else {
+            segmentType = 1
+        }
+        
+        // Append the final GPU struct directly
+        segments.append(GPUSplineSegment(
+            p0: SIMD2<Float>(Float(p0.x), Float(p0.y)),
+            p1: SIMD2<Float>(Float(p1.x), Float(p1.y)),
+            p2: SIMD2<Float>(Float(p2.x), Float(p2.y)),
+            p3: SIMD2<Float>(Float(p3.x), Float(p3.y)),
+            radius0: Float(r1), radius1: Float(r2),
+            opacity0: Float(o1), opacity1: Float(o2),
+            segmentType: segmentType,
+            noiseSeed: seed
+        ))
+        return
+    }
+    
+    let (leftP, rightP) = subdivideCRPoint(span)
+    let (leftR, rightR) = subdivideCRScalar(rSpan)
+    let (leftO, rightO) = subdivideCRScalar(oSpan)
+    
+    flattenAndBuild(span: leftP, rSpan: leftR, oSpan: leftO, seed: seed, depth: depth + 1, into: &segments, isPolyline: isPolyline, isMarker: isMarker)
+    flattenAndBuild(span: rightP, rSpan: rightR, oSpan: rightO, seed: seed, depth: depth + 1, into: &segments, isPolyline: isPolyline, isMarker: isMarker)
+}
+
+func flattenPolyline(
+    span: CRPointSpan,
+    rSpan: CRScalarSpan,
+    oSpan: CRScalarSpan,
+    seed: UInt32,
+    into segments: inout [GPUSplineSegment]
+) {
+    let p1 = span.p1, p2 = span.p2
+    let dx = p2.x - p1.x, dy = p2.y - p1.y
+    let len = hypot(dx, dy)
+    
+    // 1. Base target length on the maximum radius of this span
+    let r_max = max(rSpan.s1, rSpan.s2)
+    
+    // 2. Determine how many radii long a segment should be.
+    // Adjust this multiplier based on visual testing (e.g. 2.0 to 8.0).
+    let radiusMultiplier: CGFloat = 0.5
+    
+    // We use max(..., 4.0) as a hard floor to prevent infinite subdivisions
+    // or millions of segments if the radius is 0 or extremely small.
+    let targetLen = max(4.0, r_max * radiusMultiplier)
+    
+    let n = max(1, Int((len / targetLen).rounded(.up)))
+    let invN = 1.0 / CGFloat(n)
+    
+    // 3. Emit segments
+    for i in 0..<n {
+        let t0 = CGFloat(i) * invN
+        let t1 = CGFloat(i + 1) * invN
+        
+        let a = CGPoint(x: p1.x + dx * t0, y: p1.y + dy * t0)
+        let b = CGPoint(x: p1.x + dx * t1, y: p1.y + dy * t1)
+        
+        // Straight extrapolation for tangent hints
+        let a0 = CGPoint(x: 2 * a.x - b.x, y: 2 * a.y - b.y)
+        let b3 = CGPoint(x: 2 * b.x - a.x, y: 2 * b.y - a.y)
+        
+        // Linearly interpolate radius and opacity
+        let r0 = rSpan.s1 + (rSpan.s2 - rSpan.s1) * t0
+        let r1 = rSpan.s1 + (rSpan.s2 - rSpan.s1) * t1
+        let o0 = oSpan.s1 + (oSpan.s2 - oSpan.s1) * t0
+        let o1 = oSpan.s1 + (oSpan.s2 - oSpan.s1) * t1
+        
+        segments.append(GPUSplineSegment(
+            p0: SIMD2<Float>(Float(a0.x), Float(a0.y)),
+            p1: SIMD2<Float>(Float(a.x),  Float(a.y)),
+            p2: SIMD2<Float>(Float(b.x),  Float(b.y)),
+            p3: SIMD2<Float>(Float(b3.x), Float(b3.y)),
+            radius0: Float(r0), radius1: Float(r1),
+            opacity0: Float(o0), opacity1: Float(o1),
+            segmentType: 0,
+            noiseSeed: seed
+        ))
+    }
+}
+#endif

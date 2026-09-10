@@ -25,14 +25,22 @@ struct GPExportLayer: Codable {
     let name: String
     let opacity: Float
     let visible: Bool
-    let strokes: [GPExportStroke]
+    var strokes: [GPExportStroke]
 }
 
 struct GPExportStroke: Codable {
-    let color: [Float]       // [r, g, b, a] normalized 0-1
+    let color: [Float]
     let is_eraser: Bool
-    let hardness: Float      // 0-1, derived from pen type
+    let hardness: Float
     let points: [GPExportPoint]
+    var cut_rect: Bool? = nil   // NEW: true = selection-cut indicator (fill shape /
+    //      erase region); points = 4 device-space rect corners
+}
+
+/// Ordered export items (draw order preserved): strokes and selection cuts.
+enum GPExportItem {
+    case stroke(StrokeRecord)
+    case cut(corners: [CGPoint])   // device space, y-down
 }
 
 struct GPExportPoint: Codable {
@@ -46,172 +54,76 @@ struct GPExportPoint: Codable {
 
 extension Renderer {
 
-    /// Process a layer's strokes into GP export format.
-    /// Reuses the same resampling, taper, transform, and radius/opacity pipeline
-    /// as the rendering path so exported data matches what the rasterizer produces.
-    func exportGPLayer(
-        layerStrokes: [StrokeRecord],
-        artToDevice: CGAffineTransform,
-        canvasHeight: CGFloat,
-        layerName: String,
-        layerOpacity: Float,
-        layerVisible: Bool,
-        resampleStep: CGFloat = 4.0,
-        catmullRom: Bool = false
-    ) -> GPExportLayer {
-        
+    /// The item pipeline (strokes + cut rects) extracted from exportGPLayer so
+    /// destination-layer content can also be appended to an existing paste layer.
+    func exportGPStrokes(items: [GPExportItem],
+                         artToDevice: CGAffineTransform,
+                         canvasHeight: CGFloat,
+                         resampleStep: CGFloat,
+                         catmullRom: Bool) -> [GPExportStroke] {
         var exportStrokes: [GPExportStroke] = []
-        
-        // Pencil step is 75% of the non-pencil base step
         let pencilStep = resampleStep * 0.75
+        let flipTransform = verticalFlipTransform(canvasHeight: canvasHeight)
         
-        for stroke in layerStrokes {
-            guard !stroke.points.isEmpty else { continue }
-            
-            // --- Common scale calculations ---
-            let artToDeviceScaleX = sqrt(artToDevice.a * artToDevice.a + artToDevice.c * artToDevice.c)
-            let artToDeviceScaleY = sqrt(artToDevice.b * artToDevice.b + artToDevice.d * artToDevice.d)
-            var avgArtToDeviceScale = (artToDeviceScaleX + artToDeviceScaleY) / 2.0
-            if avgArtToDeviceScale <= 0.0 { avgArtToDeviceScale = 1.0 }
-            
-            var effectiveRadiusScale: CGFloat = stroke.penMatrixScale
-            if let affine = stroke.pen.penMatrixAffine {
-                let scaleX = sqrt(affine.a * affine.a + affine.c * affine.c)
-                let scaleY = sqrt(affine.b * affine.b + affine.d * affine.d)
-                let affineScale = (scaleX + scaleY) / 2.0
-                effectiveRadiusScale = affineScale
-            }
-            effectiveRadiusScale *= avgArtToDeviceScale * 0.5
-            
-            let flipTransform = verticalFlipTransform(canvasHeight: canvasHeight)
-            
-            // --- Build export points ---
-            var exportPoints: [GPExportPoint] = []
-            
-            if catmullRom {
-                // ── Catmull-Rom: use raw points as control points, skip resampling ──
-                exportPoints.reserveCapacity(stroke.points.count)
-                
-                for point in stroke.points {
-                    let pressure = Float(max(0.0, point.p))
-                    var pt = CGPoint(x: CGFloat(point.x), y: CGFloat(point.y))
+        for item in items {
+            switch item {
+                case .cut(let corners):
+                    guard corners.count == 4 else { continue }
+                    // corners are already in the JSON's y convention — no flip here
+                    exportStrokes.append(GPExportStroke(
+                        color: [0, 0, 0, 1], is_eraser: false, hardness: 1.0,
+                        points: corners.map { GPExportPoint(x: Float($0.x), y: Float($0.y), radius: 1.0, opacity: 1.0) },
+                        cut_rect: true))
                     
+                case .stroke(let stroke):
+                    guard !stroke.points.isEmpty else { continue }
+                    // --- your existing scale calculations + exportGPStroke call, verbatim ---
+                    let artToDeviceScaleX = sqrt(artToDevice.a * artToDevice.a + artToDevice.c * artToDevice.c)
+                    let artToDeviceScaleY = sqrt(artToDevice.b * artToDevice.b + artToDevice.d * artToDevice.d)
+                    var avgArtToDeviceScale = (artToDeviceScaleX + artToDeviceScaleY) / 2.0
+                    if avgArtToDeviceScale <= 0.0 { avgArtToDeviceScale = 1.0 }
+                    
+                    var effectiveRadiusScale: CGFloat = stroke.penMatrixScale
                     if let affine = stroke.pen.penMatrixAffine {
-                        pt = pt.applying(affine)
+                        let scaleX = sqrt(affine.a * affine.a + affine.c * affine.c)
+                        let scaleY = sqrt(affine.b * affine.b + affine.d * affine.d)
+                        effectiveRadiusScale = (scaleX + scaleY) / 2.0
                     }
-                    pt = pt.applying(artToDevice)
-                    pt = pt.applying(flipTransform)
+                    effectiveRadiusScale *= avgArtToDeviceScale * 0.5
                     
-                    let (radius, opacity) = pressureToRadiusOpacity(
-                        pressure: pressure,
-                        pen: stroke.pen,
-                        radiusScale: effectiveRadiusScale,
-                        gamma: 1.0
-                    )
-                    
-                    exportPoints.append(GPExportPoint(
-                        x: Float(pt.x),
-                        y: Float(pt.y),
-                        radius: Float(radius),
-                        opacity: opacity
-                    ))
-                }
-            } else {
-                // ── Resampled mode: step controlled by --resample-step flag ──
-                let targetStepInDevicePx: CGFloat = stroke.pen.type == 1 ? pencilStep : resampleStep
-
-                // Calculate the total scale from art space to final device space.
-                // Both penMatrixAffine (draw-time zoom) and artToDevice (export transform)
-                // are applied to points, so the step must compensate for their combined effect.
-                var totalArtToDeviceScale = avgArtToDeviceScale
-                if let affine = stroke.pen.penMatrixAffine {
-                    let scaleY = sqrt(affine.b * affine.b + affine.d * affine.d)
-                    let affineScale = scaleY
-                    totalArtToDeviceScale *= affineScale
-                }
-                // Safety clamp to prevent degenerate steps
-//                 totalArtToDeviceScale = max(totalArtToDeviceScale, 0.01)
-
-                let stampStepPx = targetStepInDevicePx / totalArtToDeviceScale
-
-                let splinePoints = buildResampledStrokeWithSpline(
-                    stroke.points, stepPx: stampStepPx, samplesPerSegment: 6, gamma: 1.0, isPolyline: stroke.isPolyline
-                )
-                let resampledArt: [ResampledPoint] = splinePoints.map { p in
-                    ResampledPoint(x: CGFloat(p.x), y: CGFloat(p.y), p: p.p)
-                }
-                
-                if resampledArt.isEmpty { continue }
-                
-                // Apply end taper (same as rendering path)
-                //            applyEndTaperToResampled(&resampledArt, tailSamples: 4, ease: 1.8)
-                
-                exportPoints.reserveCapacity(resampledArt.count)
-                
-                for rp in resampledArt {
-                    let pressure = rp.pressure
-                    var pt = CGPoint(x: rp.x, y: rp.y)
-                    
+                    var totalScale = avgArtToDeviceScale
                     if let affine = stroke.pen.penMatrixAffine {
-                        pt = pt.applying(affine)
+                        let affineScale = sqrt(affine.b * affine.b + affine.d * affine.d)
+                        totalScale *= affineScale / scale
                     }
-                    pt = pt.applying(artToDevice)
-                    pt = pt.applying(flipTransform)
                     
-                    let (radius, opacity) = pressureToRadiusOpacity(
-                        pressure: pressure,
-                        pen: stroke.pen,
-                        radiusScale: effectiveRadiusScale,
-                        gamma: 1.0
-                    )
-                    
-                    exportPoints.append(GPExportPoint(
-                        x: Float(pt.x),
-                        y: Float(pt.y),
-                        radius: Float(radius),
-                        opacity: opacity
-                    ))
-                }
+                    if let s = exportGPStroke(stroke: stroke, pointTransform: artToDevice,
+                                              flipTransform: flipTransform, radiusScale: effectiveRadiusScale,
+                                              totalScale: totalScale, resampleStep: resampleStep,
+                                              pencilStep: pencilStep, catmullRom: catmullRom) {
+                        exportStrokes.append(s)
+                    }
             }
-            
-            guard !exportPoints.isEmpty else { continue }
-            
-            // Derive hardness from pen type / opacityMin heuristics
-            let hardness: Float
-            if stroke.pen.type == 1 {
-                // Pencil — softer edges for textured brush feel
-                hardness = 0.946
-            } else if stroke.pen.opacityMin > 0.5 {
-                // High minimum opacity — hard/flat pen behavior
-                hardness = 1.0
-            } else {
-                // Default round pen
-                hardness = 1.0
-            }
-            
-            let color: [Float] = [
-                stroke.pen.color.r,
-                stroke.pen.color.g,
-                stroke.pen.color.b,
-                1.0
-            ]
-            
-            exportStrokes.append(GPExportStroke(
-                color: color,
-                is_eraser: stroke.pen.isEraser,
-                hardness: hardness,
-                points: exportPoints
-            ))
         }
-        
-        return GPExportLayer(
+        return exportStrokes
+    }
+    
+    func exportGPLayer(items: [GPExportItem],
+                       artToDevice: CGAffineTransform,
+                       canvasHeight: CGFloat,
+                       layerName: String,
+                       layerOpacity: Float,
+                       layerVisible: Bool,
+                       resampleStep: CGFloat = 4.0,
+                       catmullRom: Bool = false) -> GPExportLayer {
+        GPExportLayer(
             name: layerName,
             opacity: layerOpacity,
             visible: layerVisible,
-            strokes: exportStrokes
-        )
+            strokes: exportGPStrokes(items: items, artToDevice: artToDevice,
+                                     canvasHeight: canvasHeight, resampleStep: resampleStep,
+                                     catmullRom: catmullRom))
     }
-
 
     /// Write accumulated GP export data to a JSON file
     func writeGPExportJSON(outputPath: String) -> Bool {

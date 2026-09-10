@@ -12,8 +12,8 @@ import UniformTypeIdentifiers
 struct Stamp {
     var center: SIMD2<Float>
     var radius: Float
-    var opacity: Float
-    var rotation: Float
+    var opacity: Float // unused?
+    var rotation: Float // unused?
     var noiseSeed: UInt32
     
     init(center: SIMD2<Float>, radius: Float, opacity: Float, rotation: Float, noiseSeed: UInt32) {
@@ -67,10 +67,18 @@ class MetalRenderer {
     private var highQualityAntiAliasPipeline: MTLComputePipelineState?
     
     // Segment pipeline
-    private var segmentSDFPipeline: MTLComputePipelineState?
+//    private var segmentSDFPipeline: MTLComputePipelineState?
     private var segmentNoiseCompositePipeline: MTLComputePipelineState?
     private var segmentAACompositePipeline: MTLComputePipelineState?
+    private var segmentPasteLayerAACompositePipeline: MTLComputePipelineState?
+    private var segmentPasteLayerNoiseCompositePipeline: MTLComputePipelineState?
+    private var segmentCutCompositePipeline: MTLComputePipelineState?
     private var segmentBuffer: MTLBuffer?
+    
+    private var mergeFlattenPipeline: MTLComputePipelineState?
+    private var mergeFragmentTexture: MTLTexture?
+    private var openMergeID: UInt64? = nil
+    private var openMergeOpacity: Float = 1.0
     
     // High-quality stamp pipeline
     private var highQualityStampPipeline: MTLComputePipelineState?
@@ -84,6 +92,9 @@ class MetalRenderer {
     private var stampBuffer: MTLBuffer?
 //    private var tileIndexBuffer: MTLBuffer? // unused?
     private var paramsBuffer: MTLBuffer?
+    private var pasteMetaBuffer: MTLBuffer?
+    private var pasteMaskBuffer: MTLBuffer?
+    private var cutMetaBuffer: MTLBuffer?
     
     // Intermediate textures for two-pass rendering
     private var distanceFieldTexture: MTLTexture?
@@ -113,6 +124,8 @@ class MetalRenderer {
     
     private var tileIndicesBuffer: MTLBuffer?
     private var tileListBuffer: MTLBuffer?
+    
+//    public static var droppedPasteMaskCount = 0
     
     // NEW: Timing measurements for performance analysis
 //    private var timingMeasurements: [String: TimeInterval] = [:] // unused?
@@ -221,18 +234,18 @@ class MetalRenderer {
                 print("Metal: distanceFieldMaskKernel not found in library")
             }
             
-            // Segment distance field mask pipeline
-            if let segmentSDFFn = library.makeFunction(name: "segmentSDFMaskKernel") {
-                do {
-                    self.segmentSDFPipeline = try device.makeComputePipelineState(function: segmentSDFFn)
-                    print("Metal: segmentSDFMaskKernel pipeline created")
-                } catch {
-                    print("Metal: failed to create segmentSDFMaskPipeline: \(error)")
-                    self.segmentSDFPipeline = nil
-                }
-            } else {
-                print("Metal: segmentSDFMaskKernel not found in library")
-            }
+//            // Segment distance field mask pipeline
+//            if let segmentSDFFn = library.makeFunction(name: "segmentSDFMaskKernel") {
+//                do {
+//                    self.segmentSDFPipeline = try device.makeComputePipelineState(function: segmentSDFFn)
+//                    print("Metal: segmentSDFMaskKernel pipeline created")
+//                } catch {
+//                    print("Metal: failed to create segmentSDFMaskPipeline: \(error)")
+//                    self.segmentSDFPipeline = nil
+//                }
+//            } else {
+//                print("Metal: segmentSDFMaskKernel not found in library")
+//            }
             
             // Segment noise pipeline
             if let segmentNoiseFn = library.makeFunction(name: "segmentNoiseCompositeKernel") {
@@ -323,6 +336,54 @@ class MetalRenderer {
                 print("Metal: eraserKernel not found in library")
             }
             
+            if let segmentPasteLayerAACompositeKernelFn = library.makeFunction(name: "segmentPasteLayerAACompositeKernel") {
+                do {
+                    self.segmentPasteLayerAACompositePipeline = try device.makeComputePipelineState(function: segmentPasteLayerAACompositeKernelFn)
+                    print("Metal: segmentPasteLayerAAComposite pipeline created successfully")
+                } catch {
+                    print("Metal: failed to create segmentPasteLayerAAComposite pipeline: \(error)")
+                    self.segmentPasteLayerAACompositePipeline = nil
+                }
+            } else {
+                print("Metal: segmentPasteLayerAACompositeKernel not found in library")
+            }
+            
+            if let segmentPasteLayerNoiseCompositeKernelFn = library.makeFunction(name: "segmentPasteLayerNoiseCompositeKernel") {
+                do {
+                    self.segmentPasteLayerNoiseCompositePipeline = try device.makeComputePipelineState(function: segmentPasteLayerNoiseCompositeKernelFn)
+                    print("Metal: segmentPasteLayerNoiseCompositeKernel pipeline created successfully")
+                } catch {
+                    print("Metal: failed to create segmentPasteLayerNoiseComposite pipeline: \(error)")
+                    self.segmentPasteLayerNoiseCompositePipeline = nil
+                }
+            } else {
+                print("Metal: segmentPasteLayerNoiseCompositeKernel not found in library")
+            }
+            
+            if let segmentCutCompositeKernelFn = library.makeFunction(name: "segmentCutCompositeKernel") {
+                do {
+                    self.segmentCutCompositePipeline = try device.makeComputePipelineState(function: segmentCutCompositeKernelFn)
+                    print("Metal: segmentCutCompositeKernel pipeline created successfully")
+                } catch {
+                    print("Metal: failed to create segmentCutComposite pipeline: \(error)")
+                    self.segmentCutCompositePipeline = nil
+                }
+            } else {
+                print("Metal: segmentCutCompositeKernel not found in library")
+            }
+            
+            if let mergeFlattenCompositeKernelFn = library.makeFunction(name: "mergeFlattenCompositeKernel") {
+                do {
+                    self.mergeFlattenPipeline = try device.makeComputePipelineState(function: mergeFlattenCompositeKernelFn)
+                    print("Metal: mergeFlattenPipeline created successfully")
+                } catch {
+                    print("Metal: failed to create mergeFlattenPipeline: \(error)")
+                    self.mergeFlattenPipeline = nil
+                }
+            } else {
+                print("Metal: mergeFlattenCompositeKernel not found in library")
+            }
+            
             // Store one of the libraries for later use
             self.library = library
             
@@ -338,6 +399,10 @@ class MetalRenderer {
             self.fxaaPipeline = nil
             self.library = nil
             self.eraserPipeline = nil
+            self.segmentPasteLayerAACompositePipeline = nil
+            self.segmentPasteLayerNoiseCompositePipeline = nil
+            self.segmentCutCompositePipeline = nil
+            self.mergeFlattenPipeline = nil
             throw error
         }
         
@@ -360,6 +425,10 @@ class MetalRenderer {
         print("High-quality stamp with noise pipeline status: \(self.highQualityStampWithNoisePipeline != nil)")
         print("FXAA pipeline status: \(self.fxaaPipeline != nil)")
         print("Eraser pipeline status: \(self.eraserPipeline != nil)")
+        print("segmentPasteLayerAAComposite pipeline status: \(self.segmentPasteLayerAACompositePipeline != nil)")
+        print("segmentPasteLayerNoiseComposite pipeline status: \(self.segmentPasteLayerNoiseCompositePipeline != nil)")
+        print("segmentCutComposite pipeline status: \(self.segmentCutCompositePipeline != nil)")
+        print("mergeFlattenPipeline status: \(self.mergeFlattenPipeline != nil)")
     }
     // MARK: - SwiftPM Helper Methods
     
@@ -455,47 +524,47 @@ class MetalRenderer {
 //    }
     
     /// Load noise image from SwiftPM bundle resources
-    private static func loadNoiseImageFromBundle() -> CGImage? {
-        let bundleURL = Bundle.module.bundleURL
-        guard let bundle = Bundle(url: bundleURL) else {
-            return nil
-        }
-        
-        let possibleNames = [
-            "noise",
-            "noise.png",
-            "Noise",
-            "Noise.png"
-        ]
-        
-        let possibleSubdirectories = [
-            "",
-            "Resources",
-            "Shaders"
-        ]
-        
-        for subdirectory in possibleSubdirectories {
-            for name in possibleNames {
-                if let url = bundle.url(forResource: name, withExtension: nil, subdirectory: subdirectory),
-                   let dataProvider = CGDataProvider(url: url as CFURL),
-                   let image = CGImage(
-                    jpegDataProviderSource: dataProvider,
-                    decode: nil,
-                    shouldInterpolate: true,
-                    intent: .defaultIntent
-                   ) ?? CGImage(
-                    pngDataProviderSource: dataProvider,
-                    decode: nil,
-                    shouldInterpolate: true,
-                    intent: .defaultIntent
-                   ) {
-                    return image
-                }
-            }
-        }
-        
-        return nil
-    }
+//    private static func loadNoiseImageFromBundle() -> CGImage? {
+//        let bundleURL = Bundle.module.bundleURL
+//        guard let bundle = Bundle(url: bundleURL) else {
+//            return nil
+//        }
+//
+//        let possibleNames = [
+//            "noise",
+//            "noise.png",
+//            "Noise",
+//            "Noise.png"
+//        ]
+//
+//        let possibleSubdirectories = [
+//            "",
+//            "Resources",
+//            "Shaders"
+//        ]
+//
+//        for subdirectory in possibleSubdirectories {
+//            for name in possibleNames {
+//                if let url = bundle.url(forResource: name, withExtension: nil, subdirectory: subdirectory),
+//                   let dataProvider = CGDataProvider(url: url as CFURL),
+//                   let image = CGImage(
+//                    jpegDataProviderSource: dataProvider,
+//                    decode: nil,
+//                    shouldInterpolate: true,
+//                    intent: .defaultIntent
+//                   ) ?? CGImage(
+//                    pngDataProviderSource: dataProvider,
+//                    decode: nil,
+//                    shouldInterpolate: true,
+//                    intent: .defaultIntent
+//                   ) {
+//                    return image
+//                }
+//            }
+//        }
+//
+//        return nil
+//    }
     
     // MARK: - Public API
     
@@ -1185,156 +1254,434 @@ class MetalRenderer {
     
     /// Renders segment groups sequentially, applies FXAA, and reads back the final CGImage.
     func renderSegmentGroupsInOrderSync(
-        segmentGroups: [(segments: [GPUSplineSegment], color: SIMD4<Float>, isEraser: Bool, isMarker: Bool)],
-        width: Int,
-        height: Int
+        layerOps: [LayerOperation],
+        width: Int, height: Int,
+        artToDevice: CGAffineTransform,
+        flipTransform: CGAffineTransform? = nil
     ) throws -> CGImage? {
         
-        // Ensure render targets exist for the specified dimensions
         try ensureRenderTargets(width: width, height: height)
-        
-        // The target is your gpuRenderTarget
-        guard let target = gpuRenderTarget else {
+        guard gpuRenderTarget != nil else {
             throw MetalRendererError.textureCreationFailed
         }
         
-        // Clear texture only once at the beginning
-        try clearTexture(target)
+        try clearTexture(gpuRenderTarget!)
+        openMergeID = nil
         
-        let segmentStride = MemoryLayout<GPUSplineSegment>.stride
+        for op in layerOps {
+            switch op {
+                    
+                case .stroke(let stroke):
+                    try flushMergeFragment()               // strokes hit accumulated target
+                    guard let strokeOp = buildOpFromStroke(
+                        stroke, artToDevice: artToDevice,
+                        flipTransform: flipTransform) else { continue }
+                    dispatchStrokeToGPU(
+                        segments: strokeOp.segments,
+                        color: strokeOp.color,
+                        isEraser: strokeOp.isEraser,
+                        isMarker: strokeOp.isMarker,
+                        width: width, height: height)
+                    
+                case .cut(let meta):
+                    try flushMergeFragment()
+                    dispatchCutToGPU(meta: meta, width: width, height: height)
+                    
+                case .paste(let segments, let color, let isEraser, let isMarker,
+                            let meta, let masks, let srcToDst,
+                            let isMerge, let mergeID):
+                    if isMerge {
+                        if let open = openMergeID, open != mergeID {
+                            try flushMergeFragment()       // adjacent, different merge
+                        }
+                        if openMergeID == nil {
+                            guard let frag = mergeFragmentTexture else {
+                                throw MetalRendererError.textureCreationFailed
+                            }
+                            try clearTexture(frag)
+                            openMergeID = mergeID
+                            openMergeOpacity = color.w     // = opacity_src (uniform per merge)
+                        }
+                        var fullColor = color
+                        fullColor.w = 1.0                  // full strength inside the fragment
+                        dispatchPasteToGPU(
+                            segments: segments, color: fullColor,
+                            isEraser: isEraser, isMarker: isMarker,
+                            meta: meta, masks: masks,
+                            sourceToDestinationGPU: srcToDst,
+                            width: width, height: height,
+                            target: mergeFragmentTexture)
+                    } else {
+                        try flushMergeFragment()
+                        dispatchPasteToGPU(
+                            segments: segments, color: color,
+                            isEraser: isEraser, isMarker: isMarker,
+                            meta: meta, masks: masks,
+                            sourceToDestinationGPU: srcToDst,
+                            width: width, height: height)  // nil target → gpuRenderTarget
+                    }
+            }
+        }
         
-        // Process each stroke group in order
-        for (segments, color, isEraser, isMarker) in segmentGroups {
-            if segments.isEmpty { continue }
-            
-            // Create a dedicated command buffer PER stroke group to prevent data races
-            guard let commandBuffer = commandQueue?.makeCommandBuffer() else {
-                throw MetalRendererError.commandBufferCreationFailed
+        try flushMergeFragment()                           // before readback
+        
+        let staging8bit = try convertFloatTextureTo8bitSync(gpuRenderTarget!)
+        return try readbackToCGImageSync(staging8bit)
+    }
+    
+    private func dispatchStrokeToGPU(segments: [GPUSplineSegment], color: SIMD4<Float>, isEraser: Bool, isMarker: Bool, width: Int, height: Int) {
+        if segments.isEmpty { return }
+        
+        guard let commandBuffer = commandQueue?.makeCommandBuffer() else { return }
+        
+        let neededBytes = MemoryLayout<GPUSplineSegment>.stride * segments.count
+        if segmentBuffer == nil || segmentBuffer!.length < neededBytes {
+            segmentBuffer = device?.makeBuffer(length: neededBytes, options: .storageModeShared)
+        }
+        if let sb = segmentBuffer {
+            let dst = sb.contents().assumingMemoryBound(to: GPUSplineSegment.self)
+            dst.assign(from: segments, count: segments.count)
+        }
+        
+        if paramsBuffer == nil {
+            paramsBuffer = device?.makeBuffer(length: MemoryLayout<Params>.stride, options: .storageModeShared)
+        }
+        let params = Params(
+            textureWidth: UInt32(width), textureHeight: UInt32(height),
+            tileSize: UInt32(tileSize),
+            tilesPerRow: (UInt32(width) + UInt32(tileSize) - 1) / UInt32(tileSize),
+            stampCount: UInt32(segments.count),
+            penColor: color, noiseScale: 0.4,
+            isEraser: isEraser, isMarker: isMarker
+        )
+        if let pb = paramsBuffer {
+            let pptr = pb.contents().assumingMemoryBound(to: Params.self)
+            pptr.pointee = params
+        }
+        
+        let (tileIndicesData, tileListData) = buildSegmentTileIndices(
+            segments: segments,
+            textureWidth: width,
+            textureHeight: height,
+            tileSize: tileSize,
+            isMarker: isMarker,
+            transform: nil
+        )
+        
+        if tileListData.isEmpty { return }
+        
+        let indicesBytes = MemoryLayout<TileIndex>.stride * tileIndicesData.count
+        let listBytes = MemoryLayout<UInt32>.stride * tileListData.count
+        
+        if tileIndicesBuffer == nil || tileIndicesBuffer!.length < indicesBytes {
+            tileIndicesBuffer = device?.makeBuffer(length: indicesBytes, options: .storageModeShared)
+        }
+        if tileListBuffer == nil || tileListBuffer!.length < listBytes {
+            tileListBuffer = device?.makeBuffer(length: listBytes, options: .storageModeShared)
+        }
+        
+        guard let tib = tileIndicesBuffer, let tlb = tileListBuffer else { return }
+        
+        memset(tib.contents(), 0, tib.length)
+        memset(tlb.contents(), 0, tlb.length)
+        memcpy(tib.contents(), tileIndicesData, indicesBytes)
+        memcpy(tlb.contents(), tileListData, listBytes)
+        
+        let hasNoise = segments.contains { $0.noiseSeed != 0 }
+        
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            if hasNoise, let p = self.segmentNoiseCompositePipeline, let noiseTex = self.noiseTexture {
+                encoder.setComputePipelineState(p)
+                encoder.setTexture(noiseTex, index: 1)
+                if let s = self.linearSampler { encoder.setSamplerState(s, index: 0) }
+            } else if let p = self.segmentAACompositePipeline {
+                encoder.setComputePipelineState(p)
             }
             
-            // --- 1. Buffer Allocation & Upload ---
-            let neededBytes = segmentStride * segments.count
-            if segmentBuffer == nil || segmentBuffer!.length < neededBytes {
-                segmentBuffer = device?.makeBuffer(length: neededBytes, options: .storageModeShared)
-            }
-            if let sb = segmentBuffer {
-                let dst = sb.contents().assumingMemoryBound(to: GPUSplineSegment.self)
-                dst.assign(from: segments, count: segments.count)
-            }
+            encoder.setBuffer(paramsBuffer, offset: 0, index: 0)
+            encoder.setBuffer(segmentBuffer, offset: 0, index: 1)
+            encoder.setBuffer(tileIndicesBuffer, offset: 0, index: 2)
+            encoder.setBuffer(tileListBuffer, offset: 0, index: 3)
+            encoder.setTexture(gpuRenderTarget, index: 0)
             
-            if paramsBuffer == nil {
-                paramsBuffer = device?.makeBuffer(length: MemoryLayout<Params>.stride, options: .storageModeShared)
-            }
+            let threadGroupSize = MTLSize(width: 8, height: 8, depth: 1)
+            let threadGroupCount = MTLSize(
+                width: (width + threadGroupSize.width - 1) / threadGroupSize.width,
+                height: (height + threadGroupSize.height - 1) / threadGroupSize.height,
+                depth: 1
+            )
+            encoder.dispatchThreadgroups(threadGroupCount, threadsPerThreadgroup: threadGroupSize)
+            encoder.endEncoding()
+        }
+        
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+    }
+    
+    private func dispatchPasteToGPU(
+        segments: [GPUSplineSegment],
+        color: SIMD4<Float>,
+        isEraser: Bool,
+        isMarker: Bool,
+        meta: PasteLayerMeta,
+        masks: [PasteMask],
+        sourceToDestinationGPU: CGAffineTransform,
+        width: Int,
+        height: Int,
+        target overrideTarget: MTLTexture? = nil   // Task 1: nil → gpuRenderTarget
+    ) {
+        guard !segments.isEmpty else { return }
+        
+        // ---- Task 2 fix: one dispatch = one shader. Never let a noise segment
+        // drag clean strokes onto the noise kernel (or vice versa).
+        let hasNoisy = segments.contains { $0.noiseSeed != 0 }
+        let hasClean = segments.contains { $0.noiseSeed == 0 }
+        if hasNoisy && hasClean {
+            let clean = segments.filter { $0.noiseSeed == 0 }
+            let noisy = segments.filter { $0.noiseSeed != 0 }
+
+//            print("PASTE mixed noise batch — splitting: clean=\(clean.count) noisy=\(noisy.count) eraser=\(isEraser)")
             
-            let params = Params(
+            dispatchPasteToGPU(segments: clean, color: color, isEraser: isEraser,
+                               isMarker: isMarker, meta: meta, masks: masks,
+                               sourceToDestinationGPU: sourceToDestinationGPU,
+                               width: width, height: height, target: overrideTarget)
+            dispatchPasteToGPU(segments: noisy, color: color, isEraser: isEraser,
+                               isMarker: isMarker, meta: meta, masks: masks,
+                               sourceToDestinationGPU: sourceToDestinationGPU,
+                               width: width, height: height, target: overrideTarget)
+            return
+        }
+        
+        guard let commandBuffer = commandQueue?.makeCommandBuffer() else { return }
+        guard let renderTarget = overrideTarget ?? gpuRenderTarget else { return }
+        
+        let neededBytes =
+        MemoryLayout<GPUSplineSegment>.stride * segments.count
+        
+        if segmentBuffer == nil ||
+            segmentBuffer!.length < neededBytes {
+            segmentBuffer = device?.makeBuffer(
+                length: neededBytes,
+                options: .storageModeShared
+            )
+        }
+        
+        guard let sb = segmentBuffer else { return }
+        
+        let dst =
+        sb.contents()
+            .assumingMemoryBound(to: GPUSplineSegment.self)
+        
+        dst.assign(
+            from: segments,
+            count: segments.count
+        )
+        
+        if paramsBuffer == nil {
+            paramsBuffer = device?.makeBuffer(
+                length: MemoryLayout<Params>.stride,
+                options: .storageModeShared
+            )
+        }
+        
+        guard let pb = paramsBuffer else { return }
+        
+        pb.contents()
+            .assumingMemoryBound(to: Params.self)
+            .pointee = Params(
                 textureWidth: UInt32(width),
                 textureHeight: UInt32(height),
                 tileSize: UInt32(tileSize),
-                tilesPerRow: (UInt32(width) + UInt32(tileSize) - 1) / UInt32(tileSize),
+                tilesPerRow:
+                    (UInt32(width) + UInt32(tileSize) - 1)
+                / UInt32(tileSize),
                 stampCount: UInt32(segments.count),
                 penColor: color,
                 noiseScale: 0.4,
                 isEraser: isEraser,
                 isMarker: isMarker
             )
-            if let pb = paramsBuffer {
-                let pptr = pb.contents().assumingMemoryBound(to: Params.self)
-                pptr.pointee = params
-            }
-            
-            // --- 2. Tile Indexing ---
-            let (tileIndicesData, tileListData) = buildSegmentTileIndices(
-                segments: segments,
-                textureWidth: width,
-                textureHeight: height,
-                tileSize: tileSize,
-                isMarker: isMarker
+        
+        if pasteMetaBuffer == nil ||
+            pasteMetaBuffer!.length <
+            MemoryLayout<PasteLayerMeta>.stride {
+            pasteMetaBuffer = device?.makeBuffer(
+                length: MemoryLayout<PasteLayerMeta>.stride,
+                options: .storageModeShared
             )
-            
-            if tileListData.isEmpty { continue }
-            
-            let indicesBytes = MemoryLayout<TileIndex>.stride * tileIndicesData.count
-            let listBytes = MemoryLayout<UInt32>.stride * tileListData.count
-            
-            // Reuse tileIndicesBuffer if large enough, otherwise recreate
-            if tileIndicesBuffer == nil || tileIndicesBuffer!.length < indicesBytes {
-                tileIndicesBuffer = device?.makeBuffer(length: indicesBytes, options: .storageModeShared)
-            }
-            if tileListBuffer == nil || tileListBuffer!.length < listBytes {
-                tileListBuffer = device?.makeBuffer(length: listBytes, options: .storageModeShared)
-            }
-            
-            guard let tib = tileIndicesBuffer, let tlb = tileListBuffer else {
-                throw MetalRendererError.bufferCreationFailed
-            }
-            
-            // CRITICAL FIX: Zero out the buffers to prevent stale out-of-bounds reads!
-            memset(tib.contents(), 0, tib.length)
-            memset(tlb.contents(), 0, tlb.length)
-            
-            memcpy(tib.contents(), tileIndicesData, indicesBytes)
-            memcpy(tlb.contents(), tileListData, listBytes)
-            
-            // --- 3. Composite Pass (SDF + AA or SDF + Noise merged) ---
-            let hasNoise = segments.contains { $0.noiseSeed != 0 }
-            
-            if let encoder = commandBuffer.makeComputeCommandEncoder() {
-                if hasNoise,
-                   let noisePipeline = self.segmentNoiseCompositePipeline,
-                   let noiseTex = self.noiseTexture {
-                    
-                    // Noise Path
-                    encoder.setComputePipelineState(noisePipeline)
-                    encoder.setBuffer(paramsBuffer, offset: 0, index: 0)
-                    encoder.setBuffer(segmentBuffer, offset: 0, index: 1)
-                    encoder.setBuffer(tileIndicesBuffer, offset: 0, index: 2)
-                    encoder.setBuffer(tileListBuffer, offset: 0, index: 3)
-                    
-                    encoder.setTexture(target, index: 0)
-                    encoder.setTexture(noiseTex, index: 1)
-                    if let samp = self.linearSampler { encoder.setSamplerState(samp, index: 0) }
-                    
-                } else if let aaPipeline = self.segmentAACompositePipeline {
-                    // Standard Hard Stroke AA Path
-                    encoder.setComputePipelineState(aaPipeline)
-                    encoder.setBuffer(paramsBuffer, offset: 0, index: 0)
-                    encoder.setBuffer(segmentBuffer, offset: 0, index: 1)
-                    encoder.setBuffer(tileIndicesBuffer, offset: 0, index: 2)
-                    encoder.setBuffer(tileListBuffer, offset: 0, index: 3)
-                    
-                    encoder.setTexture(target, index: 0)
-                }
-                
-                let threadGroupSize = MTLSize(width: 8, height: 8, depth: 1)
-                let threadGroupCount = MTLSize(
-                    width: (width + threadGroupSize.width - 1) / threadGroupSize.width,
-                    height: (height + threadGroupSize.height - 1) / threadGroupSize.height,
-                    depth: 1
-                )
-                encoder.dispatchThreadgroups(threadGroupCount, threadsPerThreadgroup: threadGroupSize)
-                encoder.endEncoding()
-            }
-            
-            // --- Commit and wait for THIS stroke group before proceeding to the next ---
-            commandBuffer.commit()
-            commandBuffer.waitUntilCompleted()
-            
-            if let err = commandBuffer.error {
-                print("renderSegmentGroupsInOrderSync: command buffer error: \(err)")
-                throw err
+        }
+        
+        guard let mb = pasteMetaBuffer else { return }
+        
+        mb.contents()
+            .assumingMemoryBound(to: PasteLayerMeta.self)
+            .pointee = meta
+        
+        let (tileIndicesData, tileListData) = buildSegmentTileIndices(
+            segments: segments,
+            textureWidth: width,
+            textureHeight: height,
+            tileSize: tileSize,
+            isMarker: isMarker,
+            transform: sourceToDestinationGPU)
+        
+//        if tileListData.isEmpty {
+//            return
+//        }
+        if tileListData.isEmpty {
+            print("PASTE dropped: empty tile list (segments=\(segments.count), binning=\(sourceToDestinationGPU))")
+            return
+        }
+        
+        let indicesBytes =
+        MemoryLayout<TileIndex>.stride *
+        tileIndicesData.count
+        
+        let listBytes =
+        MemoryLayout<UInt32>.stride *
+        tileListData.count
+        
+        if tileIndicesBuffer == nil ||
+            tileIndicesBuffer!.length < indicesBytes {
+            tileIndicesBuffer = device?.makeBuffer(
+                length: indicesBytes,
+                options: .storageModeShared
+            )
+        }
+        
+        if tileListBuffer == nil ||
+            tileListBuffer!.length < listBytes {
+            tileListBuffer = device?.makeBuffer(
+                length: listBytes,
+                options: .storageModeShared
+            )
+        }
+        
+        guard let tib = tileIndicesBuffer, let tlb = tileListBuffer else { return }
+        
+        // Hardening (same guard the stroke path already has): these buffers are
+        // reused across dispatches; a smaller paste after a larger dispatch must
+        // not leave stale tileList/tileIndices tails that tiles can read.
+        memset(tib.contents(), 0, tib.length)
+        memset(tlb.contents(), 0, tlb.length)
+        
+        // Shared mask buffer, re-uploaded per dispatch. Safe because every
+        // dispatch waits until completed before the next one starts.
+        let maskBytes = max(1, masks.count) * MemoryLayout<PasteMask>.stride
+        if pasteMaskBuffer == nil || pasteMaskBuffer!.length < maskBytes {
+            pasteMaskBuffer = device?.makeBuffer(length: maskBytes, options: .storageModeShared)
+        }
+        if let mb = pasteMaskBuffer, !masks.isEmpty {
+            masks.withUnsafeBytes { raw in
+                _ = memcpy(mb.contents(), raw.baseAddress, masks.count * MemoryLayout<PasteMask>.stride)
             }
         }
         
-        // Apply FXAA if enabled
-//        if useFXAA {
-//            applyFXAAAndFinish()
-//        }
+        memcpy(
+            tib.contents(),
+            tileIndicesData,
+            indicesBytes
+        )
         
-        // Convert to 8-bit and read back
-        let staging8bit = try convertFloatTextureTo8bitSync(target)
-        let result = try readbackToCGImageSync(staging8bit)
+        memcpy(
+            tlb.contents(),
+            tileListData,
+            listBytes
+        )
         
-        return result
+        let hasNoise = segments.contains { $0.noiseSeed != 0 }   // homogeneous now
+        
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        
+        if hasNoise, let p = segmentPasteLayerNoiseCompositePipeline,
+           let noiseTex = noiseTexture {
+            encoder.setComputePipelineState(p)
+            encoder.setTexture(noiseTex, index: 1)
+            if let sampler = linearSampler { encoder.setSamplerState(sampler, index: 0) }
+        } else if let p = segmentPasteLayerAACompositePipeline {
+            encoder.setComputePipelineState(p)
+        }
+        
+        encoder.setBuffer(paramsBuffer, offset: 0, index: 0)
+        encoder.setBuffer(segmentBuffer, offset: 0, index: 1)
+        encoder.setBuffer(tileIndicesBuffer, offset: 0, index: 2)
+        encoder.setBuffer(tileListBuffer, offset: 0, index: 3)
+        encoder.setBuffer(pasteMetaBuffer, offset: 0, index: 4)
+        encoder.setBuffer(pasteMaskBuffer, offset: 0, index: 5)
+        encoder.setTexture(renderTarget, index: 0)
+        
+        let tg = MTLSize(width: 8, height: 8, depth: 1)
+        
+        let groups = MTLSize(
+            width: (width + 7) / 8,
+            height: (height + 7) / 8,
+            depth: 1
+        )
+        
+        encoder.dispatchThreadgroups(
+            groups,
+            threadsPerThreadgroup: tg
+        )
+        
+        encoder.endEncoding()
+        
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+    }
+    
+    private func dispatchCutToGPU(
+        meta: CutMeta,
+        width: Int,
+        height: Int
+    ) {
+        guard let commandBuffer =
+                commandQueue?.makeCommandBuffer() else {
+            return
+        }
+        
+        if cutMetaBuffer == nil ||
+            cutMetaBuffer!.length <
+            MemoryLayout<CutMeta>.stride {
+            cutMetaBuffer = device?.makeBuffer(
+                length: MemoryLayout<CutMeta>.stride,
+                options: .storageModeShared
+            )
+        }
+        
+        guard let buffer = cutMetaBuffer else {
+            return
+        }
+        
+        buffer.contents()
+            .assumingMemoryBound(to: CutMeta.self)
+            .pointee = meta
+        
+        guard let encoder =
+                commandBuffer.makeComputeCommandEncoder(),
+              let pipeline = segmentCutCompositePipeline else {
+            return
+        }
+        
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(buffer, offset: 0, index: 0)
+        encoder.setTexture(gpuRenderTarget, index: 0)
+        
+        let tg = MTLSize(width: 8, height: 8, depth: 1)
+        
+        encoder.dispatchThreadgroups(
+            MTLSize(
+                width: (width + 7) / 8,
+                height: (height + 7) / 8,
+                depth: 1
+            ),
+            threadsPerThreadgroup: tg
+        )
+        
+        encoder.endEncoding()
+        
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
     }
     
     
@@ -1654,7 +2001,8 @@ class MetalRenderer {
         textureWidth: Int,
         textureHeight: Int,
         tileSize: Int,
-        isMarker: Bool = false
+        isMarker: Bool = false,
+        transform: CGAffineTransform? = nil
     ) -> ([TileIndex], [UInt32]) {
         let tilesPerRow = (textureWidth + tileSize - 1) / tileSize
         let tilesPerCol = (textureHeight + tileSize - 1) / tileSize
@@ -1671,12 +2019,25 @@ class MetalRenderer {
         // --- PASS 1: Count overlaps per tile ---
         for seg in segments {
             let maxRadius = max(seg.radius0, seg.radius1)
-            let padding = (maxRadius * paddingScale) + 1.0 // Added +1.0 for AA. Might not be needed
+            let padding = (maxRadius * paddingScale) + 1.0
             
-            let minX = min(seg.p1.x, seg.p2.x) - padding
-            let maxX = max(seg.p1.x, seg.p2.x) + padding
-            let minY = min(seg.p1.y, seg.p2.y) - padding
-            let maxY = max(seg.p1.y, seg.p2.y) + padding
+            var minX = min(seg.p1.x, seg.p2.x) - padding
+            var maxX = max(seg.p1.x, seg.p2.x) + padding
+            var minY = min(seg.p1.y, seg.p2.y) - padding
+            var maxY = max(seg.p1.y, seg.p2.y) + padding
+            
+            // Expand bbox by transform for paste layers
+            if let t = transform {
+                let c1 = CGPoint(x: CGFloat(minX), y: CGFloat(minY)).applying(t)
+                let c2 = CGPoint(x: CGFloat(maxX), y: CGFloat(minY)).applying(t)
+                let c3 = CGPoint(x: CGFloat(minX), y: CGFloat(maxY)).applying(t)
+                let c4 = CGPoint(x: CGFloat(maxX), y: CGFloat(maxY)).applying(t)
+                
+                minX = Float(min(c1.x, c2.x, c3.x, c4.x))
+                maxX = Float(max(c1.x, c2.x, c3.x, c4.x))
+                minY = Float(min(c1.y, c2.y, c3.y, c4.y))
+                maxY = Float(max(c1.y, c2.y, c3.y, c4.y))
+            }
             
             if maxX < 0.0 || minX > Float(textureWidth) ||
                 maxY < 0.0 || minY > Float(textureHeight) { continue }
@@ -1712,10 +2073,23 @@ class MetalRenderer {
             let maxRadius = max(seg.radius0, seg.radius1)
             let padding = (maxRadius * paddingScale) + 1.0 // Added +1.0 for AA. Might not be needed
             
-            let minX = min(seg.p1.x, seg.p2.x) - padding
-            let maxX = max(seg.p1.x, seg.p2.x) + padding
-            let minY = min(seg.p1.y, seg.p2.y) - padding
-            let maxY = max(seg.p1.y, seg.p2.y) + padding
+            var minX = min(seg.p1.x, seg.p2.x) - padding
+            var maxX = max(seg.p1.x, seg.p2.x) + padding
+            var minY = min(seg.p1.y, seg.p2.y) - padding
+            var maxY = max(seg.p1.y, seg.p2.y) + padding
+            
+            // Expand bbox by transform for paste layers
+            if let t = transform {
+                let c1 = CGPoint(x: CGFloat(minX), y: CGFloat(minY)).applying(t)
+                let c2 = CGPoint(x: CGFloat(maxX), y: CGFloat(minY)).applying(t)
+                let c3 = CGPoint(x: CGFloat(minX), y: CGFloat(maxY)).applying(t)
+                let c4 = CGPoint(x: CGFloat(maxX), y: CGFloat(maxY)).applying(t)
+                
+                minX = Float(min(c1.x, c2.x, c3.x, c4.x))
+                maxX = Float(max(c1.x, c2.x, c3.x, c4.x))
+                minY = Float(min(c1.y, c2.y, c3.y, c4.y))
+                maxY = Float(max(c1.y, c2.y, c3.y, c4.y))
+            }
             
             if maxX < 0.0 || minX > Float(textureWidth) ||
                 maxY < 0.0 || minY > Float(textureHeight) { continue }
@@ -1771,6 +2145,23 @@ class MetalRenderer {
             }
             
             print("Created render targets successfully")
+            
+            if let rt = gpuRenderTarget,
+               mergeFragmentTexture == nil ||
+                mergeFragmentTexture!.width != width ||
+                mergeFragmentTexture!.height != height ||
+                mergeFragmentTexture!.pixelFormat != rt.pixelFormat {
+                let d = MTLTextureDescriptor.texture2DDescriptor(
+                    pixelFormat: rt.pixelFormat,
+                    width: width, height: height, mipmapped: false)
+                d.usage = [.shaderRead, .shaderWrite]      // required for read_write kernels
+                d.storageMode = rt.storageMode
+                mergeFragmentTexture = device?.makeTexture(descriptor: d)
+                openMergeID = nil
+            }
+            if mergeFragmentTexture == nil {
+                throw MetalRendererError.textureCreationFailed
+            }
         }
     }
     
@@ -1810,6 +2201,31 @@ class MetalRenderer {
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
+    }
+    
+    private func flushMergeFragment() throws {
+        guard openMergeID != nil else { return }
+        openMergeID = nil
+        guard let frag = mergeFragmentTexture,
+              let target = gpuRenderTarget,
+              let pipeline = mergeFlattenPipeline,
+              let cb = commandQueue?.makeCommandBuffer(),
+              let enc = cb.makeComputeCommandEncoder() else { return }
+        
+        var opacity = openMergeOpacity
+        enc.setComputePipelineState(pipeline)
+        enc.setTexture(frag, index: 0)
+        enc.setTexture(target, index: 1)
+        enc.setBytes(&opacity, length: MemoryLayout<Float>.stride, index: 0)
+        
+        let tg = MTLSize(width: 8, height: 8, depth: 1)
+        let groups = MTLSize(width: (target.width + 7) / 8,
+                             height: (target.height + 7) / 8, depth: 1)
+        enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        if let err = cb.error { throw err }
     }
     
     // MARK: - Static Helper Methods
