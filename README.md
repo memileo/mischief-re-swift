@@ -69,6 +69,5 @@ App that contains a quick look extension to preview .art files. Select a file in
 4. Second build **ArtQuickLook** scheme
 
 # State:
-The .art format implementation/reverse engineering is incomplete. There are several known bugs.
-
-Simpler documents with only brush strokes (no copy paste, free transforms, layer merge) saved with the latest Mischief version should render mostly fine.
+There are several known bugs.
+Most files saved with the latest Mischief version should render mostly fine.

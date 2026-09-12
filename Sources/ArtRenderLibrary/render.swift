@@ -41,7 +41,7 @@ public struct Point: Equatable  {
 }
 
 
-#if canImport(Metal)
+// #if canImport(Metal)
 public struct GPUSplineSegment {
     public var p0: SIMD2<Float>    // CR Control Point 0 (Prev tangent)
     public var p1: SIMD2<Float>    // CR Control Point 1 (Segment start)
@@ -74,7 +74,7 @@ public struct GPUSplineSegment {
         self.padding2 = 0
     }
 }
-#endif
+// #endif
 
 struct StrokeRecord {
     var points: [Point]
@@ -1103,11 +1103,11 @@ public final class Renderer {
 //        print("PasteLayerMeta stride:", MemoryLayout<PasteLayerMeta>.stride, "should be 48")
 //        print("PasteMask stride:", MemoryLayout<PasteMask>.stride, "should be 64")
 //        Self.droppedPasteMaskCount = 0
-        
+#if os(macOS)
         // MAKE MAIN CONTEXT Y-DOWN
         context.scaleBy(x: 1, y: -1)
         context.translateBy(x: 0, y: -CGFloat(context.height))
-        
+#endif
         // Start with transparent context
         Self.clearContext(context, rect: CGRect(x: 0, y: 0, width: context.width, height: context.height))
         
@@ -1835,12 +1835,28 @@ public final class Renderer {
         let det = deviceToFrame.a * deviceToFrame.d - deviceToFrame.b * deviceToFrame.c
         guard abs(det) > 1e-12 else { return nil }
         let frameToDevice = deviceToFrame.inverted()
+
         let rectYFlip = verticalFlipTransform(canvasHeight: canvasSize.height * scale)
         let x = CGFloat(rect[0]), y = CGFloat(rect[1]), w = CGFloat(rect[2]), h = CGFloat(rect[3])
+
+#if os(Linux)
+        if gpExportMode {
+            return [
+                CGPoint(x: x, y: y), CGPoint(x: x + w, y: y),
+                CGPoint(x: x + w, y: y + h), CGPoint(x: x, y: y + h)
+            ].map { $0.applying(frameToDevice).applying(rectYFlip) }
+        } else {
+            return [
+                CGPoint(x: x, y: y), CGPoint(x: x + w, y: y),
+                      CGPoint(x: x + w, y: y + h), CGPoint(x: x, y: y + h)
+            ].map { $0.applying(frameToDevice) }
+        }
+#else
         return [
             CGPoint(x: x, y: y), CGPoint(x: x + w, y: y),
-            CGPoint(x: x + w, y: y + h), CGPoint(x: x, y: y + h)
+                            CGPoint(x: x + w, y: y + h), CGPoint(x: x, y: y + h)
         ].map { $0.applying(frameToDevice).applying(rectYFlip) }
+#endif
     }
     
     /// Paste-mask rect corners in device y-down space (frame math + y conversion + destMap).
@@ -1852,10 +1868,24 @@ public final class Renderer {
         let frameToSource = maskInv.inverted()
         let rectYFlip = verticalFlipTransform(canvasHeight: canvasSize.height * scale)
         let x = CGFloat(rect[0]), y = CGFloat(rect[1]), w = CGFloat(rect[2]), h = CGFloat(rect[3])
+#if os(Linux)
+        if gpExportMode {
+            return [
+                CGPoint(x: x, y: y), CGPoint(x: x + w, y: y),
+                      CGPoint(x: x + w, y: y + h), CGPoint(x: x, y: y + h)
+            ].map { $0.applying(frameToSource).applying(destMap).applying(rectYFlip) }
+        } else {
+            return [
+                CGPoint(x: x, y: y), CGPoint(x: x + w, y: y),
+                      CGPoint(x: x + w, y: y + h), CGPoint(x: x, y: y + h)
+            ].map { $0.applying(frameToSource).applying(destMap) }
+        }
+#else
         return [
             CGPoint(x: x, y: y), CGPoint(x: x + w, y: y),
             CGPoint(x: x + w, y: y + h), CGPoint(x: x, y: y + h)
         ].map { $0.applying(frameToSource).applying(destMap).applying(rectYFlip) }
+#endif
     }
     
     private func applyCutRectCPU(context: CGContext, action: [String: Any], art: ArtParser,
@@ -2507,37 +2537,68 @@ public final class Renderer {
 //        return context.makeImage()
 //    }
     
-    private func applyErasePolygons(image: CGImage, polygons: [[CGPoint]]) -> CGImage? {
-        let w = image.width
-        let h = image.height
-        guard let context = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
-        
-        let rect = CGRect(x: 0, y: 0, width: w, height: h)
-        
-        // MAKE CONTEXT Y-DOWN
-//        context.scaleBy(x: 1, y: -1)
-//        context.translateBy(x: 0, y: -CGFloat(h))
-        
-        // 1. Draw the image. It now aligns perfectly right-side up in memory.
-        context.draw(image, in: rect)
-        
-        context.saveGState()
-        context.setBlendMode(.destinationOut)
-        context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
-        
-        for polygon in polygons {
-            if polygon.count > 2 {
-                context.beginPath()
-                // 2. Polygons are Y-down. Context is Y-down. Perfect alignment.
-                context.addLines(between: polygon)
-                context.closePath()
-                context.fillPath()
-            }
-        }
-        context.restoreGState()
-        
-        return context.makeImage()
-    }
+//     private func applyErasePolygons(image: CGImage, polygons: [[CGPoint]]) -> CGImage? {
+//         let w = image.width
+//         let h = image.height
+//         let rect = CGRect(x: 0, y: 0, width: w, height: h)
+//
+// #if os(Linux)
+//         // Linux/Silica path: Manual memory management required
+//         let bytesPerRow = w * 4
+//         let bufSize = h * bytesPerRow
+//         guard let ctxData = malloc(bufSize) else { return nil }
+//
+//         guard let context = createLinuxBitmapContext(width: w, height: h, data: ctxData, bytesPerRow: bytesPerRow) else {
+//             free(ctxData)
+//             return nil
+//         }
+//
+// #else
+//         guard let context = CGContext(
+//             data: nil,
+//             width: w,
+//             height: h,
+//             bitsPerComponent: 8,
+//             bytesPerRow: 0,
+//             space: CGColorSpaceCreateDeviceRGB(),
+//                                       bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+//         ) else {
+//             return nil
+//         }
+// #endif
+//
+//         // 1. Draw the image. It aligns perfectly right-side up in memory.
+//         context.draw(image, in: rect)
+//
+//         context.saveGState()
+//         context.setBlendMode(.destinationOut)
+//         context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+//
+//         for polygon in polygons {
+//             if polygon.count > 2 {
+//                 context.beginPath()
+//                 // 2. Polygons are Y-down. Context is Y-down. Perfect alignment.
+//                 context.addLines(between: polygon)
+//                 context.closePath()
+//                 context.fillPath()
+//             }
+//         }
+//         context.restoreGState()
+//
+//         // Create the final CGImage
+//         guard let outputImage = context.makeImage() else {
+//             #if os(Linux)
+//             free(ctxData)
+//             #endif
+//             return nil
+//         }
+//
+// #if os(Linux)
+//         free(ctxData)
+// #endif
+//
+//         return outputImage
+//     }
     
     /// AABB of a cut_rect entry's corner points (JSON space).
     private func cutEntryBox(_ s: GPExportStroke) -> CGRect {
@@ -3616,7 +3677,7 @@ public final class Renderer {
     }
     
     // MARK: - Paste/merge resolution for the stamp & CPU point paths
-    
+
     private struct BakedMask: Equatable {
         var inv: CGAffineTransform     // source device -> selection frame
         var rect: [Float]
@@ -6018,7 +6079,8 @@ func catmullRom(_ p0: CGPoint, _ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint, _ t:
 //
 //        return CGPoint(x: Cx, y: Cy)
 //    }
-#if canImport(Metal)
+
+// #if canImport(Metal)
 struct CRPointSpan {
     let p0: CGPoint; let p1: CGPoint; let p2: CGPoint; let p3: CGPoint
 }
@@ -6115,39 +6177,39 @@ func isStraightAngle(_ v1: CGPoint, _ v2: CGPoint) -> Bool {
 }
 
 func flattenAndBuild(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRScalarSpan, seed: UInt32, depth: Int = 0, into segments: inout [GPUSplineSegment], isPolyline: Bool, isMarker: Bool) {
-    
+
     if isPolyline {
         flattenPolyline(span: span, rSpan: rSpan, oSpan: oSpan, seed: seed, into: &segments)
         return
     }
-    
+
     let p0 = span.p0, p1 = span.p1, p2 = span.p2, p3 = span.p3
     let r1 = rSpan.s1, r2 = rSpan.s2
     let o1 = oSpan.s1, o2 = oSpan.s2
-    
+
     let dx = p2.x - p1.x
     let dy = p2.y - p1.y
     let h_chord = hypot(dx, dy)
-    
+
     let v0 = CGPoint(x: p1.x - p0.x, y: p1.y - p0.y)
     let v1 = CGPoint(x: dx, y: dy)
     let v2 = CGPoint(x: p3.x - p2.x, y: p3.y - p2.y)
-    
+
     var needsSubdivide = false
     if h_chord > 500.0 { needsSubdivide = true }
     if isMarker && h_chord > 10.0 { needsSubdivide = true }
     if !isSafeAngle(v0, v1) || !isSafeAngle(v1, v2) { needsSubdivide = true }
-    
+
     if !needsSubdivide || depth > 8 {
         let r_max = max(r1, r2)
-        
+
         // Changed from 1.5 to 1.0 for more overlap.
         // This allows the shader to use a simple `min` instead of `smin`,
         let shape2_max_len = min(
             5.0 * max(0.0, (r_max - 0.82) * abs(r1 - r2)),
             1.0 * r_max
         )
-        
+
         var segmentType: UInt32 = 0
         if h_chord <= shape2_max_len || h_chord < 1.0 {
             segmentType = 2
@@ -6156,7 +6218,7 @@ func flattenAndBuild(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRScalarSpan
         } else {
             segmentType = 1
         }
-        
+
         // Append the final GPU struct directly
         segments.append(GPUSplineSegment(
             p0: SIMD2<Float>(Float(p0.x), Float(p0.y)),
@@ -6170,11 +6232,11 @@ func flattenAndBuild(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRScalarSpan
         ))
         return
     }
-    
+
     let (leftP, rightP) = subdivideCRPoint(span)
     let (leftR, rightR) = subdivideCRScalar(rSpan)
     let (leftO, rightO) = subdivideCRScalar(oSpan)
-    
+
     flattenAndBuild(span: leftP, rSpan: leftR, oSpan: leftO, seed: seed, depth: depth + 1, into: &segments, isPolyline: isPolyline, isMarker: isMarker)
     flattenAndBuild(span: rightP, rSpan: rightR, oSpan: rightO, seed: seed, depth: depth + 1, into: &segments, isPolyline: isPolyline, isMarker: isMarker)
 }
@@ -6234,4 +6296,4 @@ func flattenPolyline(
         ))
     }
 }
-#endif
+// #endif

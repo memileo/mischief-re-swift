@@ -509,6 +509,31 @@ public final class CGContext {
         
         internalContext.line(to: (x: Double(point.x), y: Double(point.y)))
     }
+
+    /// Appends a sequence of straight line segments as a new subpath.
+//     public func addLines(between points: [CGPoint]) {
+//         guard !points.isEmpty else { return }
+//
+//         // Move to the starting point of the sequence
+//         move(to: points[0])
+//
+//         // Append lines between the remaining points
+//         for i in 1..<points.count {
+//             addLine(to: points[i])
+//         }
+//     }
+    public func addLines(between points: [CGPoint]) {
+        guard !points.isEmpty else { return }
+
+        // Move to the starting point of the sequence
+        internalContext.move(to: (x: Double(points[0].x), y: Double(points[0].y)))
+
+        // Append lines between the remaining points
+        for i in 1..<points.count {
+            internalContext.line(to: (x: Double(points[i].x), y: Double(points[i].y)))
+        }
+    }
+
     
     /// Adds a cubic Bézier curve to the current path, with the specified end point and control points.
     func addCurve(to end: CGPoint, control1: CGPoint, control2: CGPoint) {
