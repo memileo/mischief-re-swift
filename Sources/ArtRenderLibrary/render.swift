@@ -5395,8 +5395,8 @@ public final class Renderer {
         tileOrigin: inout CGPoint,
         buf: inout TileBuffer
     ) -> (UnsafeMutablePointer<UInt8>?, Int, Int) {
-        print("[P][falloff_tile] radius=\(radius), opacity=\(opacity)")
-        print("DEBUG: makeFalloffCircleTileInto - center: \(center), radius: \(radius), opacity: \(opacity)")
+//        print("[P][falloff_tile] radius=\(radius), opacity=\(opacity)")
+//        print("DEBUG: makeFalloffCircleTileInto - center: \(center), radius: \(radius), opacity: \(opacity)")
         
         let pad: CGFloat = 2
         let minX = floor(center.x - radius - pad)
@@ -5406,7 +5406,7 @@ public final class Renderer {
         let w = max(1, Int(maxX - minX))
         let h = max(1, Int(maxY - minY))
         
-        print("DEBUG: makeFalloffCircleTileInto - tile bounds: \(w)x\(h)")
+//        print("DEBUG: makeFalloffCircleTileInto - tile bounds: \(w)x\(h)")
         
         // Skip if fully off-canvas
         if Int(maxX) <= 0 || Int(maxY) <= 0 || Int(minX) >= canvasW || Int(minY) >= canvasH {
@@ -5429,7 +5429,7 @@ public final class Renderer {
         let r = Float(radius)
         let alpha = UInt8(max(0, min(1, opacity)) * 255)
         
-        print("DEBUG: makeFalloffCircleTileInto - center in tile: (\(cx), \(cy)), radius: \(r), alpha: \(alpha)")
+//        print("DEBUG: makeFalloffCircleTileInto - center in tile: (\(cx), \(cy)), radius: \(r), alpha: \(alpha)")
         
         guard let out = buf.ptr else {
             print("DEBUG: makeFalloffCircleTileInto - no buffer pointer")
@@ -5486,7 +5486,7 @@ public final class Renderer {
             }
         }
         
-        print("DEBUG: makeFalloffCircleTileInto - nonZeroCount: \(nonZeroCount), maxAlpha: \(maxAlpha), zeroCount: \(zeroCount)")
+//        print("DEBUG: makeFalloffCircleTileInto - nonZeroCount: \(nonZeroCount), maxAlpha: \(maxAlpha), zeroCount: \(zeroCount)")
         
         return (buf.ptr, w, h)
     }

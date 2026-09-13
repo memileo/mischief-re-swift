@@ -480,10 +480,20 @@ class MetalRenderer {
         opacityFieldDesc.usage = [.shaderRead, .shaderWrite]
         opacityFieldDesc.storageMode = .private
         
+        let mergeFragmentDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        mergeFragmentDesc.usage = [.shaderWrite, .shaderRead, .renderTarget]
+        mergeFragmentDesc.storageMode = .private
+        
         self.gpuRenderTarget = device.makeTexture(descriptor: gpuDesc)
         self.stagingTexture = device.makeTexture(descriptor: stagingDesc)
         self.distanceFieldTexture = device.makeTexture(descriptor: distanceFieldDesc)
         self.opacityFieldTexture = device.makeTexture(descriptor: opacityFieldDesc)
+        self.mergeFragmentTexture = device.makeTexture(descriptor: mergeFragmentDesc)
         
         if let gpu = self.gpuRenderTarget {
             print("DEBUG: gpuRenderTarget created: \(gpu.width)x\(gpu.height), format=\(gpu.pixelFormat.rawValue)")
@@ -507,6 +517,12 @@ class MetalRenderer {
             print("DEBUG: opacityFieldTexture created: \(opacityField.width)x\(opacityField.height), format=\(opacityField.pixelFormat.rawValue)")
         } else {
             print("DEBUG: opacityFieldTexture creation failed")
+        }
+        
+        if let mergeFragment = self.mergeFragmentTexture {
+            print("DEBUG: mergeFragmentTexture created: \(mergeFragment.width)x\(mergeFragment.height), format=\(mergeFragment.pixelFormat.rawValue)")
+        } else {
+            print("DEBUG: mergeFragmentTexture creation failed")
         }
     }
 
