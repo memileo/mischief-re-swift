@@ -281,6 +281,8 @@ private final class AlphaPlane {
     let height: Int
     let bytesPerRow: Int
     let data: UnsafeMutablePointer<UInt8>
+    /// Region written during last use; zeroed on next acquire.
+    var stale: DirtyRect = .null
     
     init(width: Int, height: Int) {
         self.width = width
@@ -304,17 +306,26 @@ private enum AlphaPlanePool {
         cached = nil
         lock.unlock()
         
-        let plane: AlphaPlane
-        if let p = pooled, p.width == width, p.height == height {
-            plane = p
-        } else {
-            plane = AlphaPlane(width: width, height: height)
+        guard let p = pooled, p.width == width, p.height == height else {
+            let plane = AlphaPlane(width: width, height: height)
+            plane.data.initialize(repeating: 0, count: width * height)
+            return plane
         }
-        plane.data.initialize(repeating: 0, count: width * height)
-        return plane
+        
+        let s = p.stale
+        if !s.isEmpty {
+            for y in s.y0..<s.y1 {
+                memset(p.data + y * p.bytesPerRow + s.x0, 0, s.x1 - s.x0)
+            }
+        }
+        p.stale = .null
+        return p
     }
     
-    static func recycle(_ plane: AlphaPlane) {
+    /// `dirty` must cover every byte written since acquire
+    /// (union of maxBlitOptimized return values).
+    static func recycle(_ plane: AlphaPlane, dirty: DirtyRect) {
+        plane.stale = dirty
         lock.lock()
         if cached == nil, plane.width * plane.height <= maxCachedBytes {
             cached = plane
@@ -1747,32 +1758,182 @@ public final class Renderer {
             }
             return
         }
-        let temp = createBitmapContext(size: canvasSize, scale: scale)
-        Self.clearContext(temp, rect: CGRect(x: 0, y: 0, width: temp.width, height: temp.height))
+        let keeps = g.maskEntries.filter { !$0.erase }.map { ($0.inv, $0.rect) }
+        let cropPx0 = keepCropPx(keeps: keeps, destMap: resolved.destMap,
+                                 pxW: Int(canvasSize.width * scale), pxH: Int(canvasSize.height * scale))
+        if cropPx0 == .zero { return } // nothing of this group can survive the keeps
+        
+        let temp = TempContextPool.shared.acquire(size: canvasSize, scale: scale)
+        let cropPx: CGRect? = cropPx0
+        defer { TempContextPool.shared.release(temp, dirtyPx: cropPx) }
+        
         for stroke in g.strokes {
             var s = stroke
-            if g.isEraser {
-                // alpha coverage; composited with .destinationOut below
-                s.pen.isEraser = false
-                s.pen.isMarker = false
-            }
+            if g.isEraser { s.pen.isEraser = false; s.pen.isMarker = false }
             drawStrokeOnCPU(stroke: s, lb: g.lb, accNow: g.accNow, destMap: resolved.destMap, context: temp)
         }
-        for m in g.maskEntries {
-            applyPasteMaskCPU(context: temp, maskInv: m.inv, rect: m.rect, erase: m.erase, destMap: resolved.destMap)
+        clearKeepMasksCPU(temp, keeps: keeps, destMap: resolved.destMap)
+        for m in g.maskEntries where m.erase {
+            eraseQuadPixelsCPU(temp, maskInv: m.inv, rect: m.rect, destMap: resolved.destMap)
         }
+        
         guard let image = temp.makeImage() else { return }
-        compositeImageCPU(image: image, erase: g.isEraser, alpha: groupAlpha, into: target)
+        if let c = cropPx, let sub = image.cropping(to: c) {
+            compositeImageCPU(image: sub, erase: g.isEraser, alpha: groupAlpha,
+                              into: target, offsetPx: c)
+        } else {
+            compositeImageCPU(image: image, erase: g.isEraser, alpha: groupAlpha, into: target)
+        }
+    }
+    
+    private func quadBBox(_ c: [CGPoint]) -> CGRect {
+        var r = CGRect(origin: c[0], size: .zero)
+        for p in c.dropFirst() { r = r.union(CGRect(origin: p, size: .zero)) }
+        return r
+    }
+    
+    final class TempContextPool {
+        static let shared = TempContextPool()
+        private var freeCtx: [CGContext] = []
+        private var stale: [CGContext: CGRect] = [:] // top-left px rect drawn since release
+        
+        func acquire(size: CGSize, scale: CGFloat) -> CGContext {
+            if let c = freeCtx.popLast() {
+                if let d = stale.removeValue(forKey: c) { zeroPixels(c, d) }
+                return c
+            }
+            let ctx = createBitmapContext(size: size, scale: scale)
+            memset(ctx.data!, 0, ctx.bytesPerRow * ctx.height) // first-touch, paid once per pool slot
+            return ctx
+        }
+        
+        func release(_ ctx: CGContext, dirtyPx: CGRect?) {
+            let full = CGRect(x: 0, y: 0, width: ctx.width, height: ctx.height)
+            stale[ctx] = dirtyPx ?? full
+            freeCtx.append(ctx)
+        }
+        
+        private func zeroPixels(_ ctx: CGContext, _ r: CGRect) {
+            guard let base = ctx.data else { return }
+            let x0 = max(0, Int(r.minX.rounded(.down)))
+            let x1 = min(ctx.width, Int(r.maxX.rounded(.up)))
+            let y0 = max(0, Int(r.minY.rounded(.down)))
+            let y1 = min(ctx.height, Int(r.maxY.rounded(.up)))
+            for y in y0..<y1 {
+                memset(base.advanced(by: y * ctx.bytesPerRow + x0 * 4), 0, (x1 - x0) * 4)
+            }
+        }
+    }
+    
+    /// Intersection of keep-quad bboxes, converted to top-left pixel rect, 1px pad.
+    /// nil = no valid keeps (full canvas), .zero = empty intersection (nothing visible).
+    private func keepCropPx(keeps: [(inv: CGAffineTransform, rect: [Float])],
+                            destMap: CGAffineTransform, pxW: Int, pxH: Int) -> CGRect? {
+        var b = CGRect.null
+        for k in keeps {
+            guard let c = maskRectDeviceCorners(maskInv: k.inv, rect: k.rect, destMap: destMap) else { continue }
+            b = b.isNull ? quadBBox(c) : b.intersection(quadBBox(c))
+        }
+        if b.isNull { return nil }
+        guard !b.isEmpty else { return .zero }
+        let x0 = max(0, floor(b.minX) - 1)
+        let x1 = min(CGFloat(pxW), ceil(b.maxX) + 1)
+        let y0 = max(0, CGFloat(pxH) - ceil(b.maxY) - 1)
+        let y1 = min(CGFloat(pxH), CGFloat(pxH) - floor(b.minY) + 1)
+        return CGRect(x: x0, y: y0, width: max(0, x1 - x0), height: max(0, y1 - y0))
     }
     
     /// Composites a layer-space CGImage into a (y-up) layer context with a RAW draw
     /// (pixel-exact copy; the y-down main context's raw draw fixes final orientation).
-    private func compositeImageCPU(image: CGImage, erase: Bool = false, alpha: CGFloat = 1.0, into context: CGContext) {
+    /// `offsetPx`: top-left pixel-space rect the image was cropped from; the image is
+    /// drawn at the position it occupied in the full canvas. nil = full-canvas draw.
+    private func compositeImageCPU(image: CGImage, erase: Bool = false, alpha: CGFloat = 1.0,
+                                   into context: CGContext, offsetPx: CGRect? = nil) {
         context.saveGState()
+        defer { context.restoreGState() }
         if erase { context.setBlendMode(.destinationOut) }
         if alpha < 1.0 { context.setAlpha(alpha) }
-        context.draw(image, in: CGRect(x: 0, y: 0, width: context.width, height: context.height))
-        context.restoreGState()
+        guard let c = offsetPx else {
+            context.draw(image, in: CGRect(x: 0, y: 0,
+                                           width: context.width,
+                                           height: context.height))
+            return
+        }
+        guard !c.isEmpty else { return } // cropped region was empty; draw nothing
+        context.draw(image, in: CGRect(x: c.minX,
+                                       y: CGFloat(context.height) - c.maxY,
+                                       width: c.width,
+                                       height: c.height))
+    }
+    
+    @inline(__always)
+    private func quadSpan(_ c: [CGPoint], yc: CGFloat) -> (lo: Int, hi: Int)? {
+        var mn = CGFloat.greatestFiniteMagnitude, mx = -mn, crossed = false
+        for i in 0..<4 {
+            let a = c[i], b = c[(i + 1) & 3]
+            if (a.y <= yc) != (b.y <= yc) {
+                let x = a.x + (yc - a.y) / (b.y - a.y) * (b.x - a.x)
+                if x < mn { mn = x }
+                if x > mx { mx = x }
+                crossed = true
+            }
+        }
+        guard crossed else { return nil }
+        let lo = Int((mn - 0.5).rounded(.up)), hi = Int((mx - 0.5).rounded(.down))
+        return lo <= hi ? (lo, hi) : nil
+    }
+    
+    /// keep-masks: clear everything outside the intersection of all quads (one full-canvas sweep).
+    private func clearKeepMasksCPU(_ ctx: CGContext,
+                                   keeps: [(inv: CGAffineTransform, rect: [Float])],
+                                   destMap: CGAffineTransform,
+                                   boundsPx: CGRect? = nil) {
+        guard ctx.bitsPerPixel == 32, let base = ctx.data else { return }
+        let quads = keeps.compactMap { maskRectDeviceCorners(maskInv: $0.inv, rect: $0.rect, destMap: destMap) }
+        guard !quads.isEmpty else { return }
+        let w = ctx.width, h = ctx.height, bpr = ctx.bytesPerRow
+        // boundsPx is top-left pixel space == buffer row/col space (no y flip here).
+        let rowLo = boundsPx.map { max(0, Int($0.minY.rounded(.down))) } ?? 0
+        let rowHi = boundsPx.map { min(h, Int($0.maxY.rounded(.up))) } ?? h
+        let colLo = boundsPx.map { max(0, Int($0.minX.rounded(.down))) } ?? 0
+        let colHiEx = boundsPx.map { min(w, Int($0.maxX.rounded(.up))) } ?? w
+        guard rowLo < rowHi, colLo < colHiEx else { return }
+        for y in rowLo..<rowHi {
+            let yc = CGFloat(h - 1 - y) + 0.5
+            var lo = colLo, hi = colHiEx - 1
+            for q in quads {
+                guard let s = quadSpan(q, yc: yc) else { lo = colLo; hi = colLo - 1; break }
+                lo = max(lo, s.lo); hi = min(hi, s.hi)
+                if lo > hi { break }
+            }
+            let row = base.advanced(by: y * bpr)
+            if lo > hi {
+                memset(row.advanced(by: colLo * 4), 0, (colHiEx - colLo) * 4)
+            } else {
+                if lo > colLo { memset(row.advanced(by: colLo * 4), 0, (lo - colLo) * 4) }
+                if hi < colHiEx - 1 { memset(row.advanced(by: (hi + 1) * 4), 0, (colHiEx - hi - 1) * 4) }
+            }
+        }
+    }
+    
+    /// erase-masks: clear inside the quad only.
+    private func eraseQuadPixelsCPU(_ ctx: CGContext, maskInv: CGAffineTransform,
+                                    rect: [Float], destMap: CGAffineTransform) {
+        guard ctx.bitsPerPixel == 32, let base = ctx.data,
+              let c = maskRectDeviceCorners(maskInv: maskInv, rect: rect, destMap: destMap) else { return }
+        let w = ctx.width, h = ctx.height, bpr = ctx.bytesPerRow
+        let yMinV = c.map { $0.y }.min()!, yMaxV = c.map { $0.y }.max()!
+        // value-space [yMinV, yMaxV] → buffer rows [h - ceil(yMaxV), h - 1 - floor(yMinV)]
+        let y0 = max(0, h - Int(yMaxV.rounded(.up)))
+        let y1 = min(h - 1, h - 1 - Int(yMinV.rounded(.down)))
+        guard y0 <= y1 else { return }
+        for y in y0...y1 {
+            let yc = CGFloat(h - 1 - y) + 0.5
+            guard let s = quadSpan(c, yc: yc) else { continue }
+            let lo = max(0, s.lo), hi = min(w - 1, s.hi)
+            guard lo <= hi else { continue }
+            memset(base.advanced(by: y * bpr + lo * 4), 0, (hi - lo + 1) * 4)
+        }
     }
     
     /// Cut rect corners in device y-down space (frame math + y conversion).
@@ -2881,13 +3042,17 @@ public final class Renderer {
     ) -> Bool {
         let w = Int(canvasSize.width * scale)
         let h = Int(canvasSize.height * scale)
+        let fullPx = CGRect(x: 0, y: 0, width: w, height: h)
         
-        // MERGE: render through an isolated fragment (see renderPasteGroupsCPU).
-        // PASTES stay flat: eraser groups composite .destinationOut against the layer.
         var fragment: CGContext? = nil
         if resolved.isMerge {
-            fragment = createBitmapContext(size: canvasSize, scale: scale)
-            Self.clearContext(fragment!, rect: CGRect(x: 0, y: 0, width: fragment!.width, height: fragment!.height))
+            fragment = TempContextPool.shared.acquire(size: canvasSize, scale: scale)
+        }
+        var fragDirty = CGRect.null // .null = nothing written; full rect = full canvas
+        defer {
+            if let frag = fragment {
+                TempContextPool.shared.release(frag, dirtyPx: fragDirty.isNull ? CGRect.zero : fragDirty)
+            }
         }
         let target = fragment ?? context
         
@@ -2898,6 +3063,10 @@ public final class Renderer {
                 batches.append((stamps: batch.stamps, color: g.color, isMarker: batch.isMarker))
             }
             guard !batches.isEmpty else { continue }
+            
+            let keepPairs = g.maskEntries.filter { !$0.erase }.map { ($0.inv, $0.rect) }
+            let cropPx = keepCropPx(keeps: keepPairs, destMap: resolved.destMap, pxW: w, pxH: h)
+            if cropPx == .zero { continue } // keep-intersection empty → group renders nothing; skip GPU work
             
             let groups = batches.map {
                 (stamps: $0.stamps, color: $0.color, isEraser: false,
@@ -2916,25 +3085,39 @@ public final class Renderer {
             }
             
             var outImage = image
+            let outCrop: CGRect? = cropPx // nil = full canvas
             if !g.maskEntries.isEmpty {
-                let maskContext = createBitmapContext(size: canvasSize, scale: scale)
-                Self.clearContext(maskContext, rect: CGRect(x: 0, y: 0, width: maskContext.width, height: maskContext.height))
-                compositeImageCPU(image: image, into: maskContext)
-                for m in g.maskEntries {
-                    applyPasteMaskCPU(context: maskContext, maskInv: m.inv, rect: m.rect, erase: m.erase,
-                                      destMap: resolved.destMap)
+                let temp = TempContextPool.shared.acquire(size: canvasSize, scale: scale)
+                defer { TempContextPool.shared.release(temp, dirtyPx: cropPx) }
+                // Composite only the keep-bounded region; the rest stays zero, which is
+                // exactly what the keep clears would produce there.
+                if let c = cropPx, let sub = image.cropping(to: c) {
+                    compositeImageCPU(image: sub, into: temp, offsetPx: c)
+                } else {
+                    compositeImageCPU(image: image, into: temp)
                 }
-                if let masked = maskContext.makeImage() { outImage = masked }
+                clearKeepMasksCPU(temp, keeps: keepPairs, destMap: resolved.destMap, boundsPx: cropPx)
+                for m in g.maskEntries where m.erase {
+                    eraseQuadPixelsCPU(temp, maskInv: m.inv, rect: m.rect, destMap: resolved.destMap)
+                }
+                guard let masked = temp.makeImage() else { return false }
+                outImage = masked
             }
             
-            // full opacity inside a merge fragment — the fragment carries the merge
-            // alpha when it lands on the layer; pastes keep the per-group alpha
             let groupAlpha = resolved.isMerge ? CGFloat(1) : CGFloat(min(max(g.color.w, 0), 1))
-            compositeImageCPU(image: outImage, erase: g.isEraser, alpha: groupAlpha, into: target)
+            if let c = outCrop, let sub = outImage.cropping(to: c) {
+                compositeImageCPU(image: sub, erase: g.isEraser, alpha: groupAlpha, into: target, offsetPx: c)
+                fragDirty = fragDirty.union(c)
+            } else {
+                compositeImageCPU(image: outImage, erase: g.isEraser, alpha: groupAlpha, into: target)
+                fragDirty = fullPx
+            }
         }
         
-        if let frag = fragment, let image = frag.makeImage() {
+        if let frag = fragment {
+            if fragDirty.isNull { return true } // no group wrote to the fragment
             let mergeAlpha = CGFloat(min(max(resolved.groups.first?.color.w ?? 1, 0), 1))
+            guard let image = frag.makeImage() else { return false }
             compositeImageCPU(image: image, alpha: mergeAlpha, into: context)
         }
         return true
@@ -4917,8 +5100,9 @@ public final class Renderer {
         let canvasW = context.width
         let canvasH = context.height
         
+        var dirty = DirtyRect.null
         let plane = AlphaPlanePool.acquire(width: canvasW, height: canvasH)
-        defer { AlphaPlanePool.recycle(plane) }
+        defer { AlphaPlanePool.recycle(plane, dirty: dirty) }
         
         let bufferPool = TileBufferPool.shared
         var tileBuf = bufferPool.getBuffer()
@@ -4936,7 +5120,6 @@ public final class Renderer {
         }
         if visiblePoints.isEmpty { return }
         
-        var dirty = DirtyRect.null
         for p in visiblePoints {
             var tileOrigin = CGPoint.zero
             let (tilePtr, tileW, tileH) = makeCircleTileInto(
@@ -5012,8 +5195,9 @@ public final class Renderer {
         
         let bufferPool = TileBufferPool.shared
         
+        var dirty = DirtyRect.null
         let plane = AlphaPlanePool.acquire(width: canvasW, height: canvasH)
-        defer { AlphaPlanePool.recycle(plane) }
+        defer { AlphaPlanePool.recycle(plane, dirty: dirty) }
         
         var circleTileBuf = bufferPool.getBuffer()
         defer { bufferPool.returnBuffer(circleTileBuf) }
@@ -5035,7 +5219,6 @@ public final class Renderer {
         
         let isPencilType1 = pen.type == 1
         
-        var dirty = DirtyRect.null
         for (index, r, a) in visiblePoints {
             let p = resampledPoints[index].location
             
