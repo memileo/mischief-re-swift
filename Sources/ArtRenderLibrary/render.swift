@@ -251,165 +251,119 @@ extension Array where Element: Comparable {
 }
 
 // MARK: - Render Structures
-private struct AlphaPlane {
+private struct DirtyRect {
+    var x0: Int, y0: Int, x1: Int, y1: Int   // x1/y1 exclusive
+    
+    var isEmpty: Bool { x0 >= x1 || y0 >= y1 }
+    
+    static var null: DirtyRect { DirtyRect(x0: Int.max, y0: Int.max, x1: Int.min, y1: Int.min) }
+    
+    mutating func formUnion(_ other: DirtyRect) {
+        if other.isEmpty { return }
+        if isEmpty { self = other; return }
+        x0 = min(x0, other.x0); y0 = min(y0, other.y0)
+        x1 = max(x1, other.x1); y1 = max(y1, other.y1)
+    }
+    
+    /// Rect in CG user space (y-up). Plane rows are top-down, so the rect's
+    /// origin y is canvasH - y1, NOT y0.
+    func cgRect(canvasHeight: Int) -> CGRect {
+        CGRect(x: CGFloat(x0),
+               y: CGFloat(canvasHeight - y1),
+               width: CGFloat(x1 - x0),
+               height: CGFloat(y1 - y0))
+    }
+
+}
+
+private final class AlphaPlane {
     let width: Int
     let height: Int
     let bytesPerRow: Int
-    var data: UnsafeMutablePointer<UInt8>
+    let data: UnsafeMutablePointer<UInt8>
     
     init(width: Int, height: Int) {
         self.width = width
         self.height = height
         self.bytesPerRow = width
         self.data = UnsafeMutablePointer<UInt8>.allocate(capacity: width * height)
-        self.data.initialize(repeating: 0, count: width * height)
     }
     
-//    mutating func reset() { // unused?
-//        data.assign(repeating: 0, count: width * height) // previously initialize
-//    }
+    deinit { data.deallocate() }
+}
+
+private enum AlphaPlanePool {
+    private static let lock = NSLock()
+    private static var cached: AlphaPlane?
+    private static let maxCachedBytes = 64 << 20
     
-    func dealloc() { data.deallocate() }
+    /// Contract: the returned plane is ALL ZERO. Never returns stale pixels.
+    static func acquire(width: Int, height: Int) -> AlphaPlane {
+        lock.lock()
+        let pooled = cached
+        cached = nil
+        lock.unlock()
+        
+        let plane: AlphaPlane
+        if let p = pooled, p.width == width, p.height == height {
+            plane = p
+        } else {
+            plane = AlphaPlane(width: width, height: height)
+        }
+        plane.data.initialize(repeating: 0, count: width * height)
+        return plane
+    }
     
-//    @inline(__always)
-//    func ptr(x: Int, y: Int) -> UnsafeMutablePointer<UInt8> { // unused?
-//        data.advanced(by: y * bytesPerRow + x)
-//    }
-//
-    // Max-blit an 8-bit tile into the plane at (dstX,dstY).
-//    func maxBlit(tile: UnsafePointer<UInt8>, tileW: Int, tileH: Int, dstX: Int, dstY: Int) { // unused?
-//        let startY = max(0, dstY)
-//        let startX = max(0, dstX)
-//        let endY = min(height, dstY + tileH)
-//        let endX = min(width,  dstX + tileW)
-//        if startX >= endX || startY >= endY { return }
-//
-//        let srcBase = tile
-//
-//        for y in startY..<endY {
-//            let sy = y - dstY
-//            let dstRow = data.advanced(by: y * bytesPerRow + startX)
-//            let srcRow = srcBase.advanced(by: sy * tileW + (startX - dstX))
-//
-//            // Process 8 bytes at a time for better performance
-//            var i = startX
-//            while i + 8 <= endX {
-//                // Process 8 bytes
-//                for k in 0..<8 {
-//                    let s = srcRow[i - startX + k]
-//                    let d = dstRow[i - startX + k]
-//                    dstRow[i - startX + k] = max(s, d)
-//                }
-//                i += 8
-//            }
-//
-//            // Process remaining bytes
-//            while i < endX {
-//                let s = srcRow[i - startX]
-//                let d = dstRow[i - startX]
-//                dstRow[i - startX] = max(s, d)
-//                i += 1
-//            }
-//        }
-//    }
+    static func recycle(_ plane: AlphaPlane) {
+        lock.lock()
+        if cached == nil, plane.width * plane.height <= maxCachedBytes {
+            cached = plane
+        }
+        lock.unlock()
+    }
 }
 
 extension AlphaPlane {
-    // Optimized max-blit using pointer arithmetic for better performance
-    func maxBlitOptimized(tile: UnsafePointer<UInt8>, tileW: Int, tileH: Int, dstX: Int, dstY: Int) {
-        let startY = max(0, dstY)
-        let startX = max(0, dstX)
-        let endY = min(height, dstY + tileH)
-        let endX = min(width,  dstX + tileW)
-        if startX >= endX || startY >= endY { return }
+    /// Max-blits `tile` at (dstX, dstY), clipped to plane bounds.
+    /// Returns the rect actually written, or nil if fully clipped.
+    @discardableResult
+    func maxBlitOptimized(tile: UnsafePointer<UInt8>, tileW: Int, tileH: Int,
+                          dstX: Int, dstY: Int) -> DirtyRect? {
+        let x0 = max(0, dstX)
+        let y0 = max(0, dstY)
+        let x1 = min(width,  dstX + tileW)
+        let y1 = min(height, dstY + tileH)
+        if x0 >= x1 || y0 >= y1 { return nil }
         
-        let srcBase = tile
-        let rowWidth = endX - startX
+        let rowBytes = x1 - x0
+        var srcRow = UnsafeRawPointer(tile) + (y0 - dstY) * tileW + (x0 - dstX)
+        var dstRow = UnsafeMutableRawPointer(data) + y0 * bytesPerRow + x0
         
-        var dstRowOffsets: [Int] = []
-        var srcRowOffsets: [Int] = []
-        dstRowOffsets.reserveCapacity(endY - startY)
-        srcRowOffsets.reserveCapacity(endY - startY)
-        
-        for y in startY..<endY {
-            let sy = y - dstY
-            dstRowOffsets.append(y * bytesPerRow + startX)
-            srcRowOffsets.append(sy * tileW + (startX - dstX))
-        }
-        
-        for (rowIdx, dstOffset) in dstRowOffsets.enumerated() {
-            let srcOffset = srcRowOffsets[rowIdx]
-            let dstRow = data.advanced(by: dstOffset)
-            let srcRow = srcBase.advanced(by: srcOffset)
-            
-            // Use memcpy for large contiguous blocks where possible
-            if rowWidth >= 16 {
-                // Process in chunks of 16 bytes
-                var i = 0
-                while i + 16 <= rowWidth {
-                    // Load 16 bytes from source and destination
-                    var srcBytes: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                                   UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (0, 0, 0, 0, 0, 0, 0, 0,
-                                                                                              0, 0, 0, 0, 0, 0, 0, 0)
-                    var dstBytes: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                                   UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (0, 0, 0, 0, 0, 0, 0, 0,
-                                                                                              0, 0, 0, 0, 0, 0, 0, 0)
-                    
-                    // Copy bytes into tuples
-                    withUnsafeMutablePointer(to: &srcBytes) { ptr in
-                        let buffer = UnsafeMutableRawBufferPointer(start: ptr, count: 16)
-                        buffer.copyMemory(from: UnsafeRawBufferPointer(start: srcRow.advanced(by: i), count: 16))
-                    }
-                    
-                    withUnsafeMutablePointer(to: &dstBytes) { ptr in
-                        let buffer = UnsafeMutableRawBufferPointer(start: ptr, count: 16)
-                        buffer.copyMemory(from: UnsafeRawBufferPointer(start: dstRow.advanced(by: i), count: 16))
-                    }
-                    
-                    // Calculate max for each byte
-                    let result: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                                 UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (
-                                    max(srcBytes.0, dstBytes.0),
-                                    max(srcBytes.1, dstBytes.1),
-                                    max(srcBytes.2, dstBytes.2),
-                                    max(srcBytes.3, dstBytes.3),
-                                    max(srcBytes.4, dstBytes.4),
-                                    max(srcBytes.5, dstBytes.5),
-                                    max(srcBytes.6, dstBytes.6),
-                                    max(srcBytes.7, dstBytes.7),
-                                    max(srcBytes.8, dstBytes.8),
-                                    max(srcBytes.9, dstBytes.9),
-                                    max(srcBytes.10, dstBytes.10),
-                                    max(srcBytes.11, dstBytes.11),
-                                    max(srcBytes.12, dstBytes.12),
-                                    max(srcBytes.13, dstBytes.13),
-                                    max(srcBytes.14, dstBytes.14),
-                                    max(srcBytes.15, dstBytes.15)
-                                 )
-                    
-                    // Copy result back
-                    withUnsafePointer(to: result) { ptr in
-                        let buffer = UnsafeRawBufferPointer(start: ptr, count: 16)
-                        UnsafeMutableRawBufferPointer(start: dstRow.advanced(by: i), count: 16).copyMemory(from: buffer)
-                    }
-                    
-                    i += 16
-                }
-                
-                // Process remaining bytes
-                while i < rowWidth {
-                    dstRow[i] = max(srcRow[i], dstRow[i])
-                    i += 1
-                }
-            } else {
-                // For small rows, just process byte by byte
-                for i in 0..<rowWidth {
-                    dstRow[i] = max(srcRow[i], dstRow[i])
-                }
+        for _ in y0..<y1 {
+            var i = 0
+#if swift(>=5.7)
+            while i + 64 <= rowBytes {
+                let s: SIMD64<UInt8> = srcRow.loadUnaligned(fromByteOffset: i, as: SIMD64<UInt8>.self)
+                let d: SIMD64<UInt8> = dstRow.loadUnaligned(fromByteOffset: i, as: SIMD64<UInt8>.self)
+                dstRow.storeBytes(of: d.replacing(with: s, where: s .> d),
+                                  toByteOffset: i, as: SIMD64<UInt8>.self)
+                i += 64
             }
+#endif
+            let s8 = srcRow.assumingMemoryBound(to: UInt8.self)
+            let d8 = dstRow.assumingMemoryBound(to: UInt8.self)
+            while i < rowBytes {
+                let s = s8[i], d = d8[i]
+                d8[i] = s > d ? s : d
+                i += 1
+            }
+            srcRow += tileW
+            dstRow += bytesPerRow
         }
+        return DirtyRect(x0: x0, y0: y0, x1: x1, y1: y1)
     }
 }
+
 
 // MARK: - Cross-Platform Compatibility Helpers
 
@@ -1116,9 +1070,11 @@ public final class Renderer {
         let baseTransform = transformFromMatrix(viewMatrix, scale: scale)
         // TEMPORARY, for diagnosis only:
 //        let baseTransform = CGAffineTransform.identity
-        print("actions per layer:",
-              Dictionary(grouping: art.actions, by: { $0["layer"] as? Int ?? -1 })
-            .mapValues(\.count))
+//        print("actions per layer:",
+//              Dictionary(grouping: art.actions, by: { $0["layer"] as? Int ?? -1 })
+//            .mapValues(\.count))
+        
+        invalidateReplayCaches()
         
         // Process layers in order
         for layerIndex in art.layerOrder {
@@ -1568,6 +1524,7 @@ public final class Renderer {
         // Render all strokes for this layer with Metal if available
         //        let useSegmentRendering: Bool = true
         print("useSegmentRendering: ", useSegmentRendering )
+        print("forceCPU: ", forceCPU)
         if useSegmentRendering,
            let mr = self.metalRenderer,
            !layerOps.isEmpty,
@@ -2193,6 +2150,97 @@ public final class Renderer {
         return (stampStepPx, effectiveRadiusScale)
     }
 
+    private final class ReplayContext {
+        struct Key: Hashable {
+            let layerIndex: Int
+            let visited: Set<Int>
+        }
+        
+        unowned let renderer: Renderer
+        let art: ArtParser
+        let baseTransform: CGAffineTransform
+        let baseTransformInv: CGAffineTransform
+        let actionsByLayer: [Int: [Int]]
+        /// action index -> does this paste follow a same-rect cut on its layer
+        let followsCutByAction: [Int: Bool]
+        /// action index -> view matrix of the next paste_layer after it (parseable matrix_1 only)
+        let nextPasteViewAfter: [CGAffineTransform?]
+        var replayCache: [Key: [ResolvedStroke]] = [:]
+        private var layerMatrixCache: [Int: CGAffineTransform] = [:]
+        
+        init(renderer: Renderer, art: ArtParser, baseTransform: CGAffineTransform) {
+            self.renderer = renderer
+            self.art = art
+            self.baseTransform = baseTransform
+            self.baseTransformInv = baseTransform.inverted()
+            
+            var byLayer: [Int: [Int]] = [:]
+            var fc = [Int: Bool]()
+            var pendingCuts: [Int: [[Float]]] = [:]
+            for (idx, a) in art.actions.enumerated() {
+                guard let l = a["layer"] as? Int else { continue }
+                switch a["action_name"] as? String {
+                    case "cut":
+                        if let r = renderer.parseFloatArray(a["selection_rect"]), r.count == 4 {
+                            pendingCuts[l, default: []].append(r)
+                        }
+                    case "paste_layer":
+                        var follows = false
+                        if let rect = renderer.parseFloatArray(a["selection_rect"]), rect.count == 4 {
+                            for r in pendingCuts[l] ?? [] {
+                                if abs(r[0]-rect[0]) < 0.01, abs(r[1]-rect[1]) < 0.01,
+                                   abs(r[2]-rect[2]) < 0.01, abs(r[3]-rect[3]) < 0.01 {
+                                    follows = true
+                                    break
+                                }
+                            }
+                        }
+                        fc[idx] = follows
+                        pendingCuts[l] = nil   // paste_layer restarts the cycle
+                    default:
+                        break
+                }
+                if let l = a["layer"] as? Int {
+                    byLayer[l, default: []].append(idx)
+                }
+            }
+            self.followsCutByAction = fc
+            self.actionsByLayer = byLayer
+            
+            var after = [CGAffineTransform?](repeating: nil, count: art.actions.count)
+            var scan: CGAffineTransform? = nil
+            for i in stride(from: art.actions.count - 1, through: 0, by: -1) {
+                after[i] = scan
+                if art.actions[i]["action_name"] as? String == "paste_layer",
+                   let raw = renderer.parseMatrixRobust(art.actions[i]["matrix_1"]) {
+                    scan = renderer.transformFromMatrix(raw.map { $0.map { Float($0) } }, scale: 1.0)
+                }
+            }
+            self.nextPasteViewAfter = after
+        }
+        
+        func layerMatrix(ofLayer i: Int) -> CGAffineTransform {
+            if let m = layerMatrixCache[i] { return m }
+            let m = renderer.layerMatrix(ofLayer: i, in: art)
+            layerMatrixCache[i] = m
+            return m
+        }
+    }
+    
+    // Renderer stored properties. CGAffineTransform isn't Hashable, hence the wrapper.
+    private struct ReplayCtxKey: Hashable {
+        let a, b, c, d, tx, ty: CGFloat
+        init(_ t: CGAffineTransform) {
+            (a, b, c, d, tx, ty) = (t.a, t.b, t.c, t.d, t.tx, t.ty)
+        }
+    }
+    private var replayContextPool: [ReplayCtxKey: ReplayContext] = [:]
+    
+    /// Call as the FIRST line of render(art:). Validity relies on `art`
+    /// being immutable during the pass; this resets state between passes.
+    func invalidateReplayCaches() {
+        replayContextPool.removeAll()
+    }
     
     private func buildStrokesForLayer(
         layerIndex: Int,
@@ -2200,25 +2248,39 @@ public final class Renderer {
         baseTransform: CGAffineTransform,
         visited: Set<Int> = []
     ) -> [ResolvedStroke] {
+        let key = ReplayCtxKey(baseTransform)
+        let context: ReplayContext
+        if let pooled = replayContextPool[key] {
+            context = pooled
+        } else {
+            context = ReplayContext(renderer: self, art: art, baseTransform: baseTransform)
+            replayContextPool[key] = context
+        }
+        return buildStrokesForLayer(layerIndex: layerIndex, context: context, visited: visited)
+    }
+    
+    private func buildStrokesForLayer(
+        layerIndex: Int,
+        context: ReplayContext,
+        visited: Set<Int>
+    ) -> [ResolvedStroke] {
+        let art = context.art
+        guard layerIndex >= 0, layerIndex < art.layers.count else { return [] }
+        if visited.contains(layerIndex) { return [] }
+        
+        let cacheKey = ReplayContext.Key(layerIndex: layerIndex, visited: visited)
+        if let cached = context.replayCache[cacheKey] { return cached }
         
         var resolvedStrokes: [ResolvedStroke] = []
         var currentPen = defaultPenInfo()
         var penMatrixScale: CGFloat = 1.0
+        var shapeStrokes: [StrokeRecord] = []
         
-        guard layerIndex >= 0, layerIndex < art.layers.count else { return [] }
-        if visited.contains(layerIndex) {
-//            print("REPLAY L\(layerIndex): cyclic reference \(visited) — skipped")
-            return []
-        }
-        
-        for (actionIdx, action) in art.actions.enumerated() {
-                        
-            guard let actionLayer = action["layer"] as? Int,
-                  actionLayer == layerIndex,
-                  let actionName = action["action_name"] as? String else { continue }
+        for actionIdx in context.actionsByLayer[layerIndex] ?? [] {
+            let action = art.actions[actionIdx]
+            guard let actionName = action["action_name"] as? String else { continue }
             
             switch actionName {
-                    
                 case "pen_properties":
                     actionPenProperties(action: action, currentPen: &currentPen)
                     
@@ -2232,47 +2294,24 @@ public final class Renderer {
                 case "pen_color":
                     actionPenColor(action: action, currentPen: &currentPen)
                     
-                case "stroke":
-                    var strokes: [StrokeRecord] = []
-                    actionStroke(action: action, currentPen: currentPen,
-                                 penMatrixScale: penMatrixScale, layerStrokes: &strokes)
-                    for stroke in strokes {
-                        resolvedStrokes.append(ResolvedStroke(
-                            stroke: stroke,
-                            accumulatedDeviceTransform: .identity,
-                            sourceLayerIndex: layerIndex,
-                            selectionRect: []))
+                case "stroke", "polyline", "rect", "ellipse":
+                    shapeStrokes.removeAll(keepingCapacity: true)
+                    switch actionName {
+                        case "stroke":
+                            actionStroke(action: action, currentPen: currentPen,
+                                         penMatrixScale: penMatrixScale, layerStrokes: &shapeStrokes)
+                        case "polyline":
+                            actionPolyline(action: action, currentPen: currentPen,
+                                           penMatrixScale: penMatrixScale, layerStrokes: &shapeStrokes)
+                        case "rect":
+                            actionRect(action: action, currentPen: currentPen,
+                                       penMatrixScale: penMatrixScale, layerStrokes: &shapeStrokes)
+                        default:
+                            actionEllipse(action: action, currentPen: currentPen,
+                                          penMatrixScale: penMatrixScale, layerStrokes: &shapeStrokes)
                     }
-                    
-                case "polyline":
-                    var strokes: [StrokeRecord] = []
-                    actionPolyline(action: action, currentPen: currentPen,
-                                   penMatrixScale: penMatrixScale, layerStrokes: &strokes)
-                    for stroke in strokes {
-                        resolvedStrokes.append(ResolvedStroke(
-                            stroke: stroke,
-                            accumulatedDeviceTransform: .identity,
-                            sourceLayerIndex: layerIndex,
-                            selectionRect: []))
-                    }
-                    
-                case "rect":
-                    var strokes: [StrokeRecord] = []
-                    actionRect(action: action, currentPen: currentPen,
-                               penMatrixScale: penMatrixScale, layerStrokes: &strokes)
-                    for stroke in strokes {
-                        resolvedStrokes.append(ResolvedStroke(
-                            stroke: stroke,
-                            accumulatedDeviceTransform: .identity,
-                            sourceLayerIndex: layerIndex,
-                            selectionRect: []))
-                    }
-                    
-                case "ellipse":
-                    var strokes: [StrokeRecord] = []
-                    actionEllipse(action: action, currentPen: currentPen,
-                                  penMatrixScale: penMatrixScale, layerStrokes: &strokes)
-                    for stroke in strokes {
+                    resolvedStrokes.reserveCapacity(resolvedStrokes.count + shapeStrokes.count)
+                    for stroke in shapeStrokes {
                         resolvedStrokes.append(ResolvedStroke(
                             stroke: stroke,
                             accumulatedDeviceTransform: .identity,
@@ -2283,21 +2322,14 @@ public final class Renderer {
                 case "cut":
                     guard let rect = parseFloatArray(action["selection_rect"]),
                           rect.count == 4 else { continue }
-                    // Cuts carry no matrix of their own; borrow the action-time view
-                    // from the next paste_layer in global order. A trailing cut (no
-                    // following paste) falls back to identity — the rect is device px,
-                    // the same convention as the destination-layer cut path. (Skipping
-                    // these left trailing source-layer cuts with no effect on any
-                    // paste of that layer.)
                     let m1cut: CGAffineTransform
                     if let own = parseMatrixRobust(action["matrix_1"]) {
                         m1cut = transformFromMatrix(own.map { $0.map { Float($0) } }, scale: 1.0)
-                    } else if let next = nextPasteViewMatrix(in: art.actions, after: actionIdx) {
+                    } else if let next = context.nextPasteViewAfter[actionIdx] {
                         m1cut = next
                     } else {
                         m1cut = .identity
                     }
-                    // Erases everything collected so far in this layer's replay.
                     for i in resolvedStrokes.indices {
                         resolvedStrokes[i].masks.append(StrokeMask(
                             m1: m1cut, rect: rect,
@@ -2315,35 +2347,33 @@ public final class Renderer {
                     
                     let matrix1 = transformFromMatrix(m1raw.map { $0.map { Float($0) } }, scale: 1.0)
                     let matrix2 = transformFromMatrix(m2raw.map { $0.map { Float($0) } }, scale: 1.0)
-                    let Bi = baseTransform.inverted()
+                    let dstLayerMatrix = context.layerMatrix(ofLayer: layerIndex)
                     
+                    let followsCut = context.followsCutByAction[actionIdx] ?? false
                     let pen: CGAffineTransform
                     let sel2Dev: CGAffineTransform
                     if isIdentityTransform(matrix1) {
                         pen = currentPen.penMatrixAffine ?? .identity
-                        sel2Dev = matrix1.inverted().concatenating(pen) // rotationOnlyInverse(matrix1).concatenating(pen)
-                            .concatenating(layerMatrix(ofLayer: layerIndex, in: art))
-                    } else if pasteFollowsCut(art: art, layerIndex: layerIndex,
-                                              pasteActionIndex: actionIdx, pasteRect: selectionRect) {
+                        sel2Dev = matrix1.inverted().concatenating(pen)
+                            .concatenating(dstLayerMatrix)
+                    } else if followsCut {
                         pen = .identity
                         sel2Dev = matrix1.inverted()
                     } else {
                         pen = currentPen.penMatrixAffine ?? .identity
-                        sel2Dev = pen.concatenating(layerMatrix(ofLayer: layerIndex, in: art))
+                        sel2Dev = pen.concatenating(dstLayerMatrix)
                     }
-                    let pasteDeviceMap = Bi.concatenating(matrix1).concatenating(matrix2)
-                        .concatenating(sel2Dev).concatenating(baseTransform)
-
+                    let pasteDeviceMap = context.baseTransformInv
+                        .concatenating(matrix1).concatenating(matrix2)
+                        .concatenating(sel2Dev).concatenating(context.baseTransform)
                     
                     // Clipboard semantics: the ENTIRE source layer is the paste source.
                     let sourceStrokes = buildStrokesForLayer(
                         layerIndex: fromLayer,
-                        art: art,
-                        baseTransform: baseTransform,
+                        context: context,
                         visited: visited.union([layerIndex]))
                     
-//                    print("REPLAY merge@\(actionIdx) L\(layerIndex)<-L\(fromLayer): \(sourceStrokes.count) strokes (full replay)")
-                    
+                    resolvedStrokes.reserveCapacity(resolvedStrokes.count + sourceStrokes.count)
                     for resolved in sourceStrokes {
                         var masks = resolved.masks
                         // Keep-mask for THIS paste's selection, recorded pre-move.
@@ -2363,22 +2393,17 @@ public final class Renderer {
                 case "merge_layer":
                     guard let fromLayer = action["from_layer"] as? Int,
                           fromLayer >= 0, fromLayer < art.layers.count else { continue }
-                    // NOTE: `matrix`+`zoom` is an action-time view snapshot (like
-                    // matrix_1/zoom_1 in pastes) — deliberately NOT parsed or applied.
-                    // Snapshot semantics: source layer as it exists AT the merge.
+                    
                     let sourceStrokes = buildStrokesForLayer(
                         layerIndex: fromLayer,
-                        art: art,
-                        baseTransform: baseTransform,
+                        context: context,
                         visited: visited.union([layerIndex]))
                     
-//                    print("REPLAY merge@\(actionIdx) L\(layerIndex)<-L\(fromLayer): \(sourceStrokes.count) strokes (cutoff=\(actionIdx))")
+                    let mergeDeviceMap = context.baseTransformInv
+                        .concatenating(context.layerMatrix(ofLayer: layerIndex))
+                        .concatenating(context.baseTransform)
                     
-                    // Merge preserves canvas position: B ∘ Ldst ∘ B⁻¹
-                    let mergeDeviceMap = baseTransform.inverted()
-                        .concatenating(layerMatrix(ofLayer: layerIndex, in: art))
-                        .concatenating(baseTransform)
-                    
+                    resolvedStrokes.reserveCapacity(resolvedStrokes.count + sourceStrokes.count)
                     for resolved in sourceStrokes {
                         resolvedStrokes.append(ResolvedStroke(
                             stroke: resolved.stroke,
@@ -2389,16 +2414,15 @@ public final class Renderer {
                             masks: resolved.masks))
                     }
                     
-                default: break
+                default:
+                    break
             }
         }
         
-//        let bySrc = Dictionary(grouping: resolvedStrokes, by: { $0.sourceLayerIndex })
-//            .map { "L\($0.key)=\($0.value.count)" }
-//            .sorted().joined(separator: ", ")
-//        print("REPLAY L\(layerIndex) done: \(resolvedStrokes.count) strokes {\(bySrc)}")
+        context.replayCache[cacheKey] = resolvedStrokes
         return resolvedStrokes
     }
+
 
     
     private func parseMatrixRobust(_ v: Any?) -> [[Double]]? {
@@ -3051,7 +3075,7 @@ public final class Renderer {
         // Assign derived result back into pen snapshot
         currentPen.opacityMin = derivedOpacityMin
         
-        print("stroke pen snapshot -> type=\(penTypeVal ?? -1), subType=\(rawSubType ?? -1), opacity=\(currentPen.opacity), opacityMin=\(currentPen.opacityMin)")
+//        print("stroke pen snapshot -> type=\(penTypeVal ?? -1), subType=\(rawSubType ?? -1), opacity=\(currentPen.opacity), opacityMin=\(currentPen.opacityMin)")
         
     }
     
@@ -3124,7 +3148,7 @@ public final class Renderer {
             currentPen.penMatrixAffine = affine
             penMatrixScale = computedScale
             
-            print("Parsed pen_matrix: a=\(a) b=\(b) c=\(c) d=\(d) tx=\(tx) ty=\(ty) scale=\(computedScale)")
+//            print("Parsed pen_matrix: a=\(a) b=\(b) c=\(c) d=\(d) tx=\(tx) ty=\(ty) scale=\(computedScale)")
         } else {
             print("Warning: couldn't parse pen_matrix action: \(action)")
         }
@@ -4810,8 +4834,8 @@ public final class Renderer {
         in context: CGContext,
         radiusScale: CGFloat
     ) {
-        let inputPressureRange = (resampledPoints.map { $0.pressure }.min() ?? 0, resampledPoints.map { $0.pressure }.max() ?? 0)
-        print("[P][draw_stroke] count=\(resampledPoints.count), p.min=\(inputPressureRange.0), p.max=\(inputPressureRange.1)")
+//        let inputPressureRange = (resampledPoints.map { $0.pressure }.min() ?? 0, resampledPoints.map { $0.pressure }.max() ?? 0)
+//        print("[P][draw_stroke] count=\(resampledPoints.count), p.min=\(inputPressureRange.0), p.max=\(inputPressureRange.1)")
         
         guard resampledPoints.count > 0 else { return }
         
@@ -4890,88 +4914,59 @@ public final class Renderer {
         radiusScale: CGFloat
     ) {
         guard !deviceResampled.isEmpty else { return }
-        
-        // Add debug print for input pressure range
-        let inputPressureRange = (deviceResampled.map { $0.pressure }.min() ?? 0, deviceResampled.map { $0.pressure }.max() ?? 0)
-        print("[P][bitmap_circles] count=\(deviceResampled.count), p.min=\(inputPressureRange.0), p.max=\(inputPressureRange.1)")
-        
         let canvasW = context.width
         let canvasH = context.height
         
-        // Create a single alpha plane for the entire stroke
-        let plane = AlphaPlane(width: canvasW, height: canvasH)
-        defer { plane.dealloc() }
+        let plane = AlphaPlanePool.acquire(width: canvasW, height: canvasH)
+        defer { AlphaPlanePool.recycle(plane) }
         
-        // Use a single tile buffer for all circles
         let bufferPool = TileBufferPool.shared
         var tileBuf = bufferPool.getBuffer()
         defer { bufferPool.returnBuffer(tileBuf) }
         
-        // Pre-filter visible points to avoid processing invisible ones
         var visiblePoints: [(location: CGPoint, radius: CGFloat, opacity: Float)] = []
         visiblePoints.reserveCapacity(deviceResampled.count)
         
         for point in deviceResampled {
-            let pressure = point.pressure
             let (radius, opacity) = pressureToRadiusOpacity(
-                pressure: pressure,
-                pen: pen,
-                radiusScale: radiusScale,
-                gamma: 1.1
-            )
-            
-            // Skip invisible points
-            if radius < 0.5 || opacity < 0.01 {
-                continue
-            }
-            
+                pressure: point.pressure, pen: pen,
+                radiusScale: radiusScale, gamma: 1.1)
+            if radius < 0.5 || opacity < 0.01 { continue }
             visiblePoints.append((point.location, radius, opacity))
         }
+        if visiblePoints.isEmpty { return }
         
-        // Early rejection if no visible points
-        if visiblePoints.isEmpty {
-            return
-        }
-        
-        // Then process only the visible points
-        for (location, radius, opacity) in visiblePoints {
-            // Create a tile for this circle
+        var dirty = DirtyRect.null
+        for p in visiblePoints {
             var tileOrigin = CGPoint.zero
             let (tilePtr, tileW, tileH) = makeCircleTileInto(
-                center: location,
-                radius: radius,
-                opacity: opacity,
-                canvasW: canvasW,
-                canvasH: canvasH,
-                tileOrigin: &tileOrigin,
-                buf: &tileBuf
-            )
+                center: p.location, radius: p.radius, opacity: p.opacity,
+                canvasW: canvasW, canvasH: canvasH,
+                tileOrigin: &tileOrigin, buf: &tileBuf)
             
-            // Blit the tile to the alpha plane
-            if let tilePtr = tilePtr, tileW > 0, tileH > 0 {
-                plane.maxBlitOptimized(tile: tilePtr, tileW: tileW, tileH: tileH, dstX: Int(tileOrigin.x), dstY: Int(tileOrigin.y))
+            if let tilePtr = tilePtr, tileW > 0, tileH > 0,
+               let d = plane.maxBlitOptimized(tile: tilePtr, tileW: tileW, tileH: tileH,
+                                              dstX: Int(tileOrigin.x), dstY: Int(tileOrigin.y)) {
+                dirty.formUnion(d)
             }
         }
+        guard !dirty.isEmpty, let mask = makeMaskFromAlphaPlane(plane: plane, dirty: dirty) else { return }
         
-        // Render the alpha plane to the context
-        if let mask = makeMaskFromAlphaPlane(plane: plane) {
-            context.saveGState()
-
-            if pen.isEraser {
-                context.setBlendMode(.destinationOut)
-                context.clip(to: CGRect(x: 0, y: 0, width: canvasW, height: canvasH), mask: mask)
-                context.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
-                context.fill(CGRect(x: 0, y: 0, width: canvasW, height: canvasH))
-            } else {
-                context.setBlendMode(.normal)
-                context.clip(to: CGRect(x: 0, y: 0, width: canvasW, height: canvasH), mask: mask)
-                context.setFillColor(red: CGFloat(pen.color.r), green: CGFloat(pen.color.g), blue: CGFloat(pen.color.b), alpha: 1)
-                context.fill(CGRect(x: 0, y: 0, width: canvasW, height: canvasH))
-            }
-
-            context.restoreGState()
+        let rect = dirty.cgRect(canvasHeight: canvasH)
+        context.saveGState()
+        if pen.isEraser {
+            context.setBlendMode(.destinationOut)
+            context.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+        } else {
+            context.setBlendMode(.normal)
+            context.setFillColor(red: CGFloat(pen.color.r), green: CGFloat(pen.color.g),
+                                 blue: CGFloat(pen.color.b), alpha: 1)
         }
+        context.clip(to: rect, mask: mask)
+        context.fill(rect)
+        context.restoreGState()
     }
+
     
     // Helper method to render a group of circles with the same opacity
     private func renderCircleGroup(
@@ -5008,7 +5003,6 @@ public final class Renderer {
         in context: CGContext,
         radiusScale: CGFloat
     ) {
-        // Early rejection for strokes that are too small to be visible
         if !isStrokeVisible(resampledPoints, pen: pen) {
             return
         }
@@ -5016,41 +5010,32 @@ public final class Renderer {
         let canvasW = context.width
         let canvasH = context.height
         
-        // Use object pool for tile buffers
         let bufferPool = TileBufferPool.shared
-        let plane = AlphaPlane(width: canvasW, height: canvasH)
-        defer { plane.dealloc() }
+        
+        let plane = AlphaPlanePool.acquire(width: canvasW, height: canvasH)
+        defer { AlphaPlanePool.recycle(plane) }
         
         var circleTileBuf = bufferPool.getBuffer()
         defer { bufferPool.returnBuffer(circleTileBuf) }
         
         // disable-noise
-//        var noiseTileBuf = bufferPool.getBuffer()
-//        defer { bufferPool.returnBuffer(noiseTileBuf) }
+        //    var noiseTileBuf = bufferPool.getBuffer()
+        //    defer { bufferPool.returnBuffer(noiseTileBuf) }
         
-        // Pre-calculate which points are visible to avoid processing invisible ones
         var visiblePoints: [(index: Int, radius: CGFloat, opacity: Float)] = []
         visiblePoints.reserveCapacity(resampledPoints.count)
         
         for i in 0..<resampledPoints.count {
-            let pressure = max(0, resampledPoints[i].pressure) // Handle negative pressure
+            let pressure = max(0, resampledPoints[i].pressure)
             let (r, a) = pressureToRadiusOpacity(pressure: pressure, pen: pen, radiusScale: radiusScale, gamma: 1.0)
-            
-            // Skip invisible points
-            if r < 0.5 || a < 0.01 {
-                continue
-            }
-            
+            if r < 0.5 || a < 0.01 { continue }
             visiblePoints.append((i, r, a))
         }
-        
-        // Early rejection if no visible points
-        if visiblePoints.isEmpty {
-            return
-        }
+        if visiblePoints.isEmpty { return }
         
         let isPencilType1 = pen.type == 1
         
+        var dirty = DirtyRect.null
         for (index, r, a) in visiblePoints {
             let p = resampledPoints[index].location
             
@@ -5060,115 +5045,75 @@ public final class Renderer {
             var tileH: Int = 0
             
             if isPencilType1 {
-                // Pencil brush with texture
-                // disable-noise
-//                var seed: UInt64 = 0
-//                var rotation: CGFloat = 0
-//                var offset: CGPoint = .zero
-//
-//                // Generate unique seed for rotation and offset
-//                seed = UInt64(abs(p.x.hashValue ^ p.y.hashValue ^ index.hashValue ^ Int.random(in: 0..<Int.max)))
-//                rotation = (Double(seed % 360) / 180.0) * Double.pi
-//                offset = CGPoint(
-//                    x: CGFloat(seed >> 16).truncatingRemainder(dividingBy: noiseImageSize.width),
-//                    y: CGFloat(seed >> 32).truncatingRemainder(dividingBy: noiseImageSize.height)
-//                )
-                
-                // Create circle tile
                 var circleOrigin = CGPoint.zero
                 let (circleBuf, circleW, circleH) = makeFalloffCircleTileInto(
-                    center: p,
-                    radius: r,
-                    opacity: a,
-                    canvasW: canvasW,
-                    canvasH: canvasH,
-                    tileOrigin: &circleOrigin,
-                    buf: &circleTileBuf
-                )
+                    center: p, radius: r, opacity: a,
+                    canvasW: canvasW, canvasH: canvasH,
+                    tileOrigin: &circleOrigin, buf: &circleTileBuf)
                 
                 if let circleBuf = circleBuf {
-                    // Create noise tile
-                    // Current noise on CPU rendering is slow and sometimes broken, disable for now
-                    // disable-noise
-//                    var noiseOrigin = CGPoint.zero
-//                    let (noiseBuf, noiseW, noiseH) = makeNoiseTileInto(
-//                        center: p,
-//                        radius: r,
-//                        rotation: rotation,
-//                        offset: offset,
-//                        canvasW: canvasW,
-//                        canvasH: canvasH,
-//                        tileOrigin: &noiseOrigin,
-//                        buf: &noiseTileBuf
-//                    )
-//
-//                    if let noiseBuf = noiseBuf, circleW == noiseW, circleH == noiseH {
-//                        // Combine tiles
-//                        let combinedPixelCount: Int = circleW * circleH
-//                        let combinedBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: combinedPixelCount)
-//                        defer { combinedBuf.deallocate() }
-//
-//                        multiplyAlphaTiles(
-//                            circlePtr: circleBuf,
-//                            noisePtr: noiseBuf,
-//                            outPtr: combinedBuf,
-//                            w: circleW,
-//                            h: circleH
-//                        )
-//
-//                        tileBufPtr = combinedBuf
-//                        tileW = circleW
-//                        tileH = circleH
-//                        tileOrigin = circleOrigin
-//                    } else {
-                        tileBufPtr = circleBuf
-                        tileW = circleW
-                        tileH = circleH
-                        tileOrigin = circleOrigin
-//                    }
+                    // disable-noise (kept for re-enabling later)
+                    //                var seed: UInt64 = 0
+                    //                var rotation: CGFloat = 0
+                    //                var offset: CGPoint = .zero
+                    //                seed = UInt64(abs(p.x.hashValue ^ p.y.hashValue ^ index.hashValue ^ Int.random(in: 0..<Int.max)))
+                    //                rotation = (Double(seed % 360) / 180.0) * Double.pi
+                    //                offset = CGPoint(
+                    //                    x: CGFloat(seed >> 16).truncatingRemainder(dividingBy: noiseImageSize.width),
+                    //                    y: CGFloat(seed >> 32).truncatingRemainder(dividingBy: noiseImageSize.height)
+                    //                )
+                    //                var noiseOrigin = CGPoint.zero
+                    //                let (noiseBuf, noiseW, noiseH) = makeNoiseTileInto(
+                    //                    center: p, radius: r, rotation: rotation, offset: offset,
+                    //                    canvasW: canvasW, canvasH: canvasH,
+                    //                    tileOrigin: &noiseOrigin, buf: &noiseTileBuf)
+                    //
+                    //                if let noiseBuf = noiseBuf, circleW == noiseW, circleH == noiseH {
+                    //                    let combinedBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: circleW * circleH)
+                    //                    defer { combinedBuf.deallocate() }
+                    //                    multiplyAlphaTiles(circlePtr: circleBuf, noisePtr: noiseBuf,
+                    //                                       outPtr: combinedBuf, w: circleW, h: circleH)
+                    //                    tileBufPtr = combinedBuf; tileW = circleW; tileH = circleH; tileOrigin = circleOrigin
+                    //                } else {
+                    tileBufPtr = circleBuf
+                    tileW = circleW
+                    tileH = circleH
+                    tileOrigin = circleOrigin
+                    //                }
                 }
             } else {
-                // Non-pencil brush
                 let (circleBuf, circleW, circleH) = makeCircleTileInto(
-                    center: p,
-                    radius: r,
-                    opacity: a,
-                    canvasW: canvasW,
-                    canvasH: canvasH,
-                    tileOrigin: &tileOrigin,
-                    buf: &circleTileBuf
-                )
-                
+                    center: p, radius: r, opacity: a,
+                    canvasW: canvasW, canvasH: canvasH,
+                    tileOrigin: &tileOrigin, buf: &circleTileBuf)
                 tileBufPtr = circleBuf
                 tileW = circleW
                 tileH = circleH
             }
             
-            // Blit the tile
-            if let tileBuf = tileBufPtr, tileW > 0, tileH > 0 {
-                plane.maxBlitOptimized(tile: tileBuf, tileW: tileW, tileH: tileH, dstX: Int(tileOrigin.x), dstY: Int(tileOrigin.y))
+            if let tileBuf = tileBufPtr, tileW > 0, tileH > 0,
+               let d = plane.maxBlitOptimized(tile: tileBuf, tileW: tileW, tileH: tileH,
+                                              dstX: Int(tileOrigin.x), dstY: Int(tileOrigin.y)) {
+                dirty.formUnion(d)
             }
         }
+        guard !dirty.isEmpty, let mask = makeMaskFromAlphaPlane(plane: plane, dirty: dirty) else { return }
         
-        // Render the alpha plane
-        if let mask = makeMaskFromAlphaPlane(plane: plane) {
-            context.saveGState()
-            
-            if pen.isEraser {
-                context.setBlendMode(.destinationOut)
-                context.clip(to: CGRect(x: 0, y: 0, width: canvasW, height: canvasH), mask: mask)
-                context.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
-                context.fill(CGRect(x: 0, y: 0, width: canvasW, height: canvasH))
-            } else {
-                context.setBlendMode(.normal)
-                context.clip(to: CGRect(x: 0, y: 0, width: canvasW, height: canvasH), mask: mask)
-                context.setFillColor(red: CGFloat(pen.color.r), green: CGFloat(pen.color.g), blue: CGFloat(pen.color.b), alpha: 1)
-                context.fill(CGRect(x: 0, y: 0, width: canvasW, height: canvasH))
-            }
-            
-            context.restoreGState()
+        let rect = dirty.cgRect(canvasHeight: canvasH)
+        context.saveGState()
+        if pen.isEraser {
+            context.setBlendMode(.destinationOut)
+            context.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+        } else {
+            context.setBlendMode(.normal)
+            context.setFillColor(red: CGFloat(pen.color.r), green: CGFloat(pen.color.g),
+                                 blue: CGFloat(pen.color.b), alpha: 1)
         }
+        context.clip(to: rect, mask: mask)
+        context.fill(rect)
+        context.restoreGState()
     }
+
     
 //    func cleanup() {
 //        // Clear the noise context pool
@@ -5182,33 +5127,59 @@ public final class Renderer {
 //    }
     
     
-    private func makeMaskFromAlphaPlane(plane: AlphaPlane) -> CGImage? {
-        #if os(Linux)
-        // On Linux, we create a Swift Data copy of the alpha plane.
-        // The CGImage initializer will handle copying this into a Cairo Surface.
-        let planeData = Data(bytes: plane.data, count: plane.width * plane.height)
-
-        return CGImage(alphaData: planeData,
-                       width: plane.width,
-                       height: plane.height,
-                       bytesPerRow: plane.width)
-        #else
-        // CoreGraphics implementation for macOS/iOS (keep existing)
-        guard let provider = CGDataProvider(data: CFDataCreate(nil, plane.data, plane.width * plane.height)) else { return nil }
-        return CGImage(
-            width: plane.width,
-            height: plane.height,
-            bitsPerComponent: 8,
-            bitsPerPixel: 8,
-            bytesPerRow: plane.bytesPerRow,
-            space: Self.maskColorSpace,
-            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+    private func makeMaskFromAlphaPlane(plane: AlphaPlane, dirty: DirtyRect) -> CGImage? {
+        guard !dirty.isEmpty else { return nil }
+        let x0 = max(0, dirty.x0), y0 = max(0, dirty.y0)
+        let x1 = min(plane.width, dirty.x1), y1 = min(plane.height, dirty.y1)
+        let w = x1 - x0, h = y1 - y0
+        guard w > 0, h > 0 else { return nil }
+        
+        let bpr = plane.bytesPerRow
+        let byteCount = w * h
+        
+#if os(Linux)
+        var packed = Data(count: byteCount)
+        packed.withUnsafeMutableBytes { raw in
+            guard var dst = raw.baseAddress else { return }
+            var src = UnsafeRawPointer(plane.data) + y0 * bpr + x0
+            for _ in 0..<h {
+                memcpy(dst, src, w)
+                dst = dst.advanced(by: w)
+                src = src.advanced(by: bpr)
+            }
+        }
+        return CGImage(alphaData: packed, width: w, height: h, bytesPerRow: w)
+#else
+        guard let buf = malloc(byteCount)?.assumingMemoryBound(to: UInt8.self) else { return nil }
+        var dst = buf
+        var src = UnsafeRawPointer(plane.data) + y0 * bpr + x0
+        for _ in 0..<h {
+            memcpy(dst, src, w)
+            dst = dst.advanced(by: w)
+            src = src.advanced(by: bpr)
+        }
+        guard let cfData = CFDataCreateWithBytesNoCopy(nil, buf, byteCount, kCFAllocatorMalloc) else {
+            free(buf)
+            return nil
+        }
+        guard let provider = CGDataProvider(data: cfData) else { return nil }
+        return CGImage(width: w, height: h,
+                       bitsPerComponent: 8,
+                       bitsPerPixel: 8,
+                       bytesPerRow: w,
+                       space: Self.maskColorSpace,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
                        provider: provider,
                        decode: nil,
                        shouldInterpolate: true,
-                       intent: .defaultIntent
-        )
-        #endif
+                       intent: .defaultIntent)
+#endif
+    }
+    
+    /// Full-plane convenience wrapper. Delete this if nothing else calls it.
+    private func makeMaskFromAlphaPlane(plane: AlphaPlane) -> CGImage? {
+        makeMaskFromAlphaPlane(plane: plane,
+                               dirty: DirtyRect(x0: 0, y0: 0, x1: plane.width, y1: plane.height))
     }
     
     func calculateOpacityFromPressure(pen: PenInfo, pressure: Float) -> Float {
@@ -5385,7 +5356,39 @@ public final class Renderer {
         return (buf.ptr, w, h)
     }
     
-    // Create a separate function for pencil brushes with alpha falloff
+    // Static falloff curve (built ONCE, shared by every stamp)
+    
+    private static let falloffLutSize = 4096
+    
+    /// bins[i] = coverage at d/r = sqrt((i + 0.5) / n)
+    /// zeroNd2 = (d/r)² beyond which coverage == 0 (lets the span loop skip work)
+    private static let falloffCurve: (bins: UnsafeMutablePointer<Float>, zeroNd2: Float) = {
+        let n = falloffLutSize
+        let p = UnsafeMutablePointer<Float>.allocate(capacity: n + 1)
+        var lastNonZero = 0
+        for i in 0...n {
+            let nd = ((Float(i) + 0.5) / Float(n)).squareRoot()
+            
+            // === original curve, evaluated n+1 times total ===
+            var coverage: Float
+            if nd <= 0.2 {
+                coverage = 1.0
+            } else if nd >= 1.0 {
+                coverage = 0.0
+            } else {
+                let t = (nd - 0.2) / 0.8
+                let sCurve = t * t * (2.8 - 1.4 * t)
+                let c = 1.0 - powf(sCurve, 0.7)
+                coverage = c > 0 ? c : 0
+            }
+            // =================================================
+            
+            p[i] = coverage
+            if coverage > 0 { lastNonZero = i }
+        }
+        return (p, (Float(lastNonZero) + 1) / Float(n))
+    }()
+    
     private func makeFalloffCircleTileInto(
         center: CGPoint,
         radius: CGFloat,
@@ -5395,102 +5398,65 @@ public final class Renderer {
         tileOrigin: inout CGPoint,
         buf: inout TileBuffer
     ) -> (UnsafeMutablePointer<UInt8>?, Int, Int) {
-//        print("[P][falloff_tile] radius=\(radius), opacity=\(opacity)")
-//        print("DEBUG: makeFalloffCircleTileInto - center: \(center), radius: \(radius), opacity: \(opacity)")
+        guard radius > 0, radius.isFinite, center.x.isFinite, center.y.isFinite, opacity.isFinite else {
+            return (nil, 0, 0)
+        }
         
         let pad: CGFloat = 2
-        let minX = floor(center.x - radius - pad)
-        let minY = floor(center.y - radius - pad)
-        let maxX = ceil(center.x + radius + pad)
-        let maxY = ceil(center.y + radius + pad)
-        let w = max(1, Int(maxX - minX))
-        let h = max(1, Int(maxY - minY))
+        let minX = max(0, (center.x - radius - pad).rounded(.down))
+        let minY = max(0, (center.y - radius - pad).rounded(.down))
+        let maxX = min(CGFloat(canvasW), (center.x + radius + pad).rounded(.up))
+        let maxY = min(CGFloat(canvasH), (center.y + radius + pad).rounded(.up))
         
-//        print("DEBUG: makeFalloffCircleTileInto - tile bounds: \(w)x\(h)")
-        
-        // Skip if fully off-canvas
-        if Int(maxX) <= 0 || Int(maxY) <= 0 || Int(minX) >= canvasW || Int(minY) >= canvasH {
-            print("DEBUG: makeFalloffCircleTileInto - tile off canvas")
-            return (nil, 0, 0)
-        }
-        
-        // Safety cap (defensive)
-        if w > 8192 || h > 8192 {
-            print("DEBUG: makeFalloffCircleTileInto - tile too large")
-            return (nil, 0, 0)
-        }
+        let w = Int(maxX - minX)
+        let h = Int(maxY - minY)
+        guard w > 0, h > 0 else { return (nil, 0, 0) }
+        if w > 8192 || h > 8192 { return (nil, 0, 0) }
         
         buf.ensureCapacity(w * h)
         buf.zero(count: w * h)
         tileOrigin = CGPoint(x: minX, y: minY)
+        guard let out = buf.ptr else { return (nil, 0, 0) }
         
+        let alpha = UInt8(max(0, min(1, opacity)) * 255)
+        if alpha == 0 { return (nil, 0, 0) }   // tile would be all zeros; skipping the blit is equivalent
+        
+        let r  = Float(radius)
         let cx = Float(center.x - minX)
         let cy = Float(center.y - minY)
-        let r = Float(radius)
-        let alpha = UInt8(max(0, min(1, opacity)) * 255)
         
-//        print("DEBUG: makeFalloffCircleTileInto - center in tile: (\(cx), \(cy)), radius: \(r), alpha: \(alpha)")
-        
-        guard let out = buf.ptr else {
-            print("DEBUG: makeFalloffCircleTileInto - no buffer pointer")
-            return (nil, 0, 0)
-        }
-        
-        var nonZeroCount = 0
-        var maxAlpha: UInt8 = 0
-        var zeroCount = 0
+        // Per pixel: bin = d² · n / r²  →  coverage  →  alpha. No per-stamp LUT, no allocation.
+        let curve   = Self.falloffCurve.bins            // raw pointer: no bounds checks in the loop
+        let n       = Self.falloffLutSize
+        let d2ToBin = Float(n) / (r * r)
+        let zeroD2  = Self.falloffCurve.zeroNd2 * r * r
+        let alphaF  = Float(alpha)
         
         for j in 0..<h {
-            let y = Float(j) + 0.5
+            let dy  = (Float(j) + 0.5) - cy
+            let dy2 = dy * dy
+            if dy2 >= zeroD2 { continue }               // row misses the circle entirely
+            
+            let halfSpan = (zeroD2 - dy2).squareRoot()
+            var i0 = Int((cx - halfSpan - 0.5).rounded(.up))
+            let i1 = min(w - 1, Int((cx + halfSpan - 0.5).rounded(.down)))
+            if i0 < 0 { i0 = 0 }
+            if i0 > i1 { continue }
+            
             let row = out.advanced(by: j * w)
-            for i in 0..<w {
-                let x = Float(i) + 0.5
-                let dx = x - cx
-                let dy = y - cy
-                let distance = sqrtf(dx*dx + dy*dy)
-                
-                // More gradual falloff curve - shift center to have less opaque center
-                let normalizedDistance = distance / r
-                var coverage: Float
-                
-                if normalizedDistance <= 0.2 {
-                    // Only inner 20% has full opacity (reduced from 50%)
-                    coverage = 1.0
-                } else if normalizedDistance >= 1.0 {
-                    // Beyond radius has no coverage
-                    coverage = 0.0
-                } else {
-                    // More gradual falloff in the outer 80% (increased from 50%)
-                    let t = (normalizedDistance - 0.2) / 0.8  // Normalize to [0, 1]
-                    
-                    // Use a smoother curve for the falloff - shifted S-curve
-                    // This gives more gradual falloff and less opaque center
-                    let sCurve = t * t * (2.8 - 1.4 * t)  // Standard smoothstep
-                    
-                    // Apply a power curve to make it even more gradual
-                    let gradual = powf(sCurve, 0.7)  // Less than 1 makes it more gradual
-                    
-                    coverage = 1.0 - gradual
-                }
-                
-                if coverage <= 0 {
-                    row[i] = 0  // Explicitly set to 0 for transparency
-                    zeroCount += 1
-                    continue
-                }
-                
-                let v = UInt8(min(255, Int(Float(alpha) * coverage + 0.5)))
-                row[i] = v
-                if v > 0 { nonZeroCount += 1 }
-                if v > maxAlpha { maxAlpha = v }
+            var dx = (Float(i0) + 0.5) - cx
+            var i = i0
+            while i <= i1 {
+                let cov = curve[Int((dx * dx + dy2) * d2ToBin)]
+                let v   = alphaF * cov + 0.5
+                row[i] = v >= 255 ? 255 : UInt8(v)      // v ≤ 255.5, so UInt8(v) never traps
+                dx += 1.0
+                i += 1
             }
         }
         
-//        print("DEBUG: makeFalloffCircleTileInto - nonZeroCount: \(nonZeroCount), maxAlpha: \(maxAlpha), zeroCount: \(zeroCount)")
-        
         return (buf.ptr, w, h)
     }
-    
     
     private func getOrCreateNoiseContext(width: Int, height: Int) -> CGContext? {
         // Check if we have a suitable context in the pool
@@ -5632,7 +5598,7 @@ public final class Renderer {
     // TODO: Composit noise per stroke instead. Per dab is too slow on cpu.
     private func multiplyAlphaTiles(circlePtr: UnsafePointer<UInt8>, noisePtr: UnsafePointer<UInt8>,
                                     outPtr: UnsafeMutablePointer<UInt8>, w: Int, h: Int) {
-        print("[P][multiply_tiles] w=\(w), h=\(h)")
+//        print("[P][multiply_tiles] w=\(w), h=\(h)")
 //        print("DEBUG: multiplyAlphaTiles - multiplying \(w)x\(h) tiles")
         
         var nonZeroCount = 0
@@ -5641,8 +5607,8 @@ public final class Renderer {
         var circleZeroCount = 0
         
         // Debug: Check first few values in each tile
-        print("DEBUG: First 5 circle values: \(circlePtr[0]), \(circlePtr[1]), \(circlePtr[2]), \(circlePtr[3]), \(circlePtr[4])")
-        print("DEBUG: First 5 noise values: \(noisePtr[0]), \(noisePtr[1]), \(noisePtr[2]), \(noisePtr[3]), \(noisePtr[4])")
+//        print("DEBUG: First 5 circle values: \(circlePtr[0]), \(circlePtr[1]), \(circlePtr[2]), \(circlePtr[3]), \(circlePtr[4])")
+//        print("DEBUG: First 5 noise values: \(noisePtr[0]), \(noisePtr[1]), \(noisePtr[2]), \(noisePtr[3]), \(noisePtr[4])")
         
         for i in 0..<(w*h) {
             let ca = Int(circlePtr[i])  // Circle alpha (shape with falloff)

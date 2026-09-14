@@ -2012,6 +2012,128 @@ class MetalRenderer {
      */
     
     // New Tile Indexing for Segments
+//    func buildSegmentTileIndices(
+//        segments: [GPUSplineSegment],
+//        textureWidth: Int,
+//        textureHeight: Int,
+//        tileSize: Int,
+//        isMarker: Bool = false,
+//        transform: CGAffineTransform? = nil
+//    ) -> ([TileIndex], [UInt32]) {
+//        let tilesPerRow = (textureWidth + tileSize - 1) / tileSize
+//        let tilesPerCol = (textureHeight + tileSize - 1) / tileSize
+//        let numTiles = tilesPerRow * tilesPerCol
+//
+//        var tileCounts = [UInt32](repeating: 0, count: numTiles)
+//        let invTileSize = 1.0 / Float(tileSize)
+//
+//        // Marker capsule extends ±4r along the 45° axis from each spline point.
+//        // Projection onto x/y ≈ ±2√2·r, plus the radius itself for thickness.
+//        // Total padding ≈ (1 + 2√2) · maxRadius ≈ 3.83 · maxRadius.
+//        let paddingScale: Float = isMarker ? (1.0 + 2.0 * sqrt(2.0)) : 1.4 // extra padding for noise strokes 1.4 from 1.0, not sure if needed
+//
+//        // --- PASS 1: Count overlaps per tile ---
+//        for seg in segments {
+//            let maxRadius = max(seg.radius0, seg.radius1)
+//            let padding = (maxRadius * paddingScale) + 1.0
+//
+//            var minX = min(seg.p1.x, seg.p2.x) - padding
+//            var maxX = max(seg.p1.x, seg.p2.x) + padding
+//            var minY = min(seg.p1.y, seg.p2.y) - padding
+//            var maxY = max(seg.p1.y, seg.p2.y) + padding
+//
+//            // Expand bbox by transform for paste layers
+//            if let t = transform {
+//                let c1 = CGPoint(x: CGFloat(minX), y: CGFloat(minY)).applying(t)
+//                let c2 = CGPoint(x: CGFloat(maxX), y: CGFloat(minY)).applying(t)
+//                let c3 = CGPoint(x: CGFloat(minX), y: CGFloat(maxY)).applying(t)
+//                let c4 = CGPoint(x: CGFloat(maxX), y: CGFloat(maxY)).applying(t)
+//
+//                minX = Float(min(c1.x, c2.x, c3.x, c4.x))
+//                maxX = Float(max(c1.x, c2.x, c3.x, c4.x))
+//                minY = Float(min(c1.y, c2.y, c3.y, c4.y))
+//                maxY = Float(max(c1.y, c2.y, c3.y, c4.y))
+//            }
+//
+//            if maxX < 0.0 || minX > Float(textureWidth) ||
+//                maxY < 0.0 || minY > Float(textureHeight) { continue }
+//
+//            let minTileX = max(0, Int(minX * invTileSize))
+//            let maxTileX = min(tilesPerRow - 1, Int(maxX * invTileSize))
+//            let minTileY = max(0, Int(minY * invTileSize))
+//            let maxTileY = min(tilesPerCol - 1, Int(maxY * invTileSize))
+//
+//            guard minTileX <= maxTileX && minTileY <= maxTileY else { continue }
+//
+//            for ty in minTileY...maxTileY {
+//                for tx in minTileX...maxTileX {
+//                    tileCounts[ty * tilesPerRow + tx] += 1
+//                }
+//            }
+//        }
+//
+//        // --- PREFIX SUM ---
+//        var tileIndices = [TileIndex](repeating: TileIndex(start: 0, count: 0),
+//                                      count: numTiles)
+//        var currentStart: UInt32 = 0
+//        for i in 0..<numTiles {
+//            tileIndices[i].start = currentStart
+//            currentStart += tileCounts[i]
+//        }
+//
+//        // --- PASS 2: Populate ---
+//        var tileList = [UInt32](repeating: 0, count: Int(currentStart))
+//        var writeHeads = [UInt32](repeating: 0, count: numTiles)
+//
+//        for (i, seg) in segments.enumerated() {
+//            let maxRadius = max(seg.radius0, seg.radius1)
+//            let padding = (maxRadius * paddingScale) + 1.0 // Added +1.0 for AA. Might not be needed
+//
+//            var minX = min(seg.p1.x, seg.p2.x) - padding
+//            var maxX = max(seg.p1.x, seg.p2.x) + padding
+//            var minY = min(seg.p1.y, seg.p2.y) - padding
+//            var maxY = max(seg.p1.y, seg.p2.y) + padding
+//
+//            // Expand bbox by transform for paste layers
+//            if let t = transform {
+//                let c1 = CGPoint(x: CGFloat(minX), y: CGFloat(minY)).applying(t)
+//                let c2 = CGPoint(x: CGFloat(maxX), y: CGFloat(minY)).applying(t)
+//                let c3 = CGPoint(x: CGFloat(minX), y: CGFloat(maxY)).applying(t)
+//                let c4 = CGPoint(x: CGFloat(maxX), y: CGFloat(maxY)).applying(t)
+//
+//                minX = Float(min(c1.x, c2.x, c3.x, c4.x))
+//                maxX = Float(max(c1.x, c2.x, c3.x, c4.x))
+//                minY = Float(min(c1.y, c2.y, c3.y, c4.y))
+//                maxY = Float(max(c1.y, c2.y, c3.y, c4.y))
+//            }
+//
+//            if maxX < 0.0 || minX > Float(textureWidth) ||
+//                maxY < 0.0 || minY > Float(textureHeight) { continue }
+//
+//            let minTileX = max(0, Int(minX * invTileSize))
+//            let maxTileX = min(tilesPerRow - 1, Int(maxX * invTileSize))
+//            let minTileY = max(0, Int(minY * invTileSize))
+//            let maxTileY = min(tilesPerCol - 1, Int(maxY * invTileSize))
+//
+//            guard minTileX <= maxTileX && minTileY <= maxTileY else { continue }
+//
+//            for ty in minTileY...maxTileY {
+//                for tx in minTileX...maxTileX {
+//                    let tileIdx = ty * tilesPerRow + tx
+//                    let writePos = Int(tileIndices[tileIdx].start + writeHeads[tileIdx])
+//                    tileList[writePos] = UInt32(i)
+//                    writeHeads[tileIdx] += 1
+//                }
+//            }
+//        }
+//
+//        for i in 0..<numTiles {
+//            tileIndices[i].count = writeHeads[i]
+//        }
+//
+//        return (tileIndices, tileList)
+//    }
+    
     func buildSegmentTileIndices(
         segments: [GPUSplineSegment],
         textureWidth: Int,
@@ -2023,112 +2145,105 @@ class MetalRenderer {
         let tilesPerRow = (textureWidth + tileSize - 1) / tileSize
         let tilesPerCol = (textureHeight + tileSize - 1) / tileSize
         let numTiles = tilesPerRow * tilesPerCol
-        
-        var tileCounts = [UInt32](repeating: 0, count: numTiles)
+        let fTexW = Float(textureWidth)
+        let fTexH = Float(textureHeight)
         let invTileSize = 1.0 / Float(tileSize)
+        let paddingScale: Float = isMarker ? (1.0 + 2.0 * sqrt(2.0)) : 1.4
+        let t = transform ?? .identity
+        let hasTransform = transform != nil
         
-        // Marker capsule extends ±4r along the 45° axis from each spline point.
-        // Projection onto x/y ≈ ±2√2·r, plus the radius itself for thickness.
-        // Total padding ≈ (1 + 2√2) · maxRadius ≈ 3.83 · maxRadius.
-        let paddingScale: Float = isMarker ? (1.0 + 2.0 * sqrt(2.0)) : 1.4 // extra padding for noise strokes 1.4 from 1.0, not sure if needed
+        // Per-segment tile ranges, computed once (bbox + transform application
+        // shared by both passes).
+        struct TileRange { var minTX: Int32; var maxTX: Int32; var minTY: Int32; var maxTY: Int32 }
+        var ranges = [TileRange](repeating: TileRange(minTX: 1, maxTX: 0, minTY: 0, maxTY: 0),
+                                 count: segments.count)
         
-        // --- PASS 1: Count overlaps per tile ---
-        for seg in segments {
-            let maxRadius = max(seg.radius0, seg.radius1)
-            let padding = (maxRadius * paddingScale) + 1.0
-            
-            var minX = min(seg.p1.x, seg.p2.x) - padding
-            var maxX = max(seg.p1.x, seg.p2.x) + padding
-            var minY = min(seg.p1.y, seg.p2.y) - padding
-            var maxY = max(seg.p1.y, seg.p2.y) + padding
-            
-            // Expand bbox by transform for paste layers
-            if let t = transform {
-                let c1 = CGPoint(x: CGFloat(minX), y: CGFloat(minY)).applying(t)
-                let c2 = CGPoint(x: CGFloat(maxX), y: CGFloat(minY)).applying(t)
-                let c3 = CGPoint(x: CGFloat(minX), y: CGFloat(maxY)).applying(t)
-                let c4 = CGPoint(x: CGFloat(maxX), y: CGFloat(maxY)).applying(t)
-                
-                minX = Float(min(c1.x, c2.x, c3.x, c4.x))
-                maxX = Float(max(c1.x, c2.x, c3.x, c4.x))
-                minY = Float(min(c1.y, c2.y, c3.y, c4.y))
-                maxY = Float(max(c1.y, c2.y, c3.y, c4.y))
-            }
-            
-            if maxX < 0.0 || minX > Float(textureWidth) ||
-                maxY < 0.0 || minY > Float(textureHeight) { continue }
-            
-            let minTileX = max(0, Int(minX * invTileSize))
-            let maxTileX = min(tilesPerRow - 1, Int(maxX * invTileSize))
-            let minTileY = max(0, Int(minY * invTileSize))
-            let maxTileY = min(tilesPerCol - 1, Int(maxY * invTileSize))
-            
-            guard minTileX <= maxTileX && minTileY <= maxTileY else { continue }
-            
-            for ty in minTileY...maxTileY {
-                for tx in minTileX...maxTileX {
-                    tileCounts[ty * tilesPerRow + tx] += 1
+        segments.withUnsafeBufferPointer { segs in
+            ranges.withUnsafeMutableBufferPointer { rp in
+                for i in segs.indices {
+                    let seg = segs[i]
+                    let padding = (max(seg.radius0, seg.radius1) * paddingScale) + 1.0
+                    
+                    var minX = min(seg.p1.x, seg.p2.x) - padding
+                    var maxX = max(seg.p1.x, seg.p2.x) + padding
+                    var minY = min(seg.p1.y, seg.p2.y) - padding
+                    var maxY = max(seg.p1.y, seg.p2.y) + padding
+                    
+                    if hasTransform {
+                        let c1 = CGPoint(x: CGFloat(minX), y: CGFloat(minY)).applying(t)
+                        let c2 = CGPoint(x: CGFloat(maxX), y: CGFloat(minY)).applying(t)
+                        let c3 = CGPoint(x: CGFloat(minX), y: CGFloat(maxY)).applying(t)
+                        let c4 = CGPoint(x: CGFloat(maxX), y: CGFloat(maxY)).applying(t)
+                        minX = Float(min(c1.x, c2.x, c3.x, c4.x))
+                        maxX = Float(max(c1.x, c2.x, c3.x, c4.x))
+                        minY = Float(min(c1.y, c2.y, c3.y, c4.y))
+                        maxY = Float(max(c1.y, c2.y, c3.y, c4.y))
+                    }
+                    
+                    if maxX < 0.0 || minX > fTexW || maxY < 0.0 || minY > fTexH { continue }
+                    
+                    let minTileX = max(0, Int(minX * invTileSize))
+                    let maxTileX = min(tilesPerRow - 1, Int(maxX * invTileSize))
+                    let minTileY = max(0, Int(minY * invTileSize))
+                    let maxTileY = min(tilesPerCol - 1, Int(maxY * invTileSize))
+                    guard minTileX <= maxTileX && minTileY <= maxTileY else { continue }
+                    rp[i] = TileRange(minTX: Int32(minTileX), maxTX: Int32(maxTileX),
+                                      minTY: Int32(minTileY), maxTY: Int32(maxTileY))
                 }
             }
         }
         
-        // --- PREFIX SUM ---
-        var tileIndices = [TileIndex](repeating: TileIndex(start: 0, count: 0),
-                                      count: numTiles)
+        var tileIndices = [TileIndex](repeating: TileIndex(start: 0, count: 0), count: numTiles)
+        
+        // --- PASS 1: count overlaps per tile (into .count) ---
+        tileIndices.withUnsafeMutableBufferPointer { tp in
+            ranges.withUnsafeBufferPointer { rp in
+                for r in rp {
+                    if r.minTX > r.maxTX { continue }
+                    var rowBase = Int(r.minTY) * tilesPerRow + Int(r.minTX)
+                    for _ in r.minTY...r.maxTY {
+                        var idx = rowBase
+                        for _ in r.minTX...r.maxTX {
+                            tp[idx].count += 1
+                            idx += 1
+                        }
+                        rowBase += tilesPerRow
+                    }
+                }
+            }
+        }
+        
+        // --- PREFIX SUM (into .start; .count keeps the per-tile count) ---
         var currentStart: UInt32 = 0
         for i in 0..<numTiles {
             tileIndices[i].start = currentStart
-            currentStart += tileCounts[i]
+            currentStart += tileIndices[i].count
         }
         
-        // --- PASS 2: Populate ---
+        // --- PASS 2: populate; write heads start at each tile's .start ---
         var tileList = [UInt32](repeating: 0, count: Int(currentStart))
-        var writeHeads = [UInt32](repeating: 0, count: numTiles)
+        var writeHeads = tileIndices.map { $0.start }
         
-        for (i, seg) in segments.enumerated() {
-            let maxRadius = max(seg.radius0, seg.radius1)
-            let padding = (maxRadius * paddingScale) + 1.0 // Added +1.0 for AA. Might not be needed
-            
-            var minX = min(seg.p1.x, seg.p2.x) - padding
-            var maxX = max(seg.p1.x, seg.p2.x) + padding
-            var minY = min(seg.p1.y, seg.p2.y) - padding
-            var maxY = max(seg.p1.y, seg.p2.y) + padding
-            
-            // Expand bbox by transform for paste layers
-            if let t = transform {
-                let c1 = CGPoint(x: CGFloat(minX), y: CGFloat(minY)).applying(t)
-                let c2 = CGPoint(x: CGFloat(maxX), y: CGFloat(minY)).applying(t)
-                let c3 = CGPoint(x: CGFloat(minX), y: CGFloat(maxY)).applying(t)
-                let c4 = CGPoint(x: CGFloat(maxX), y: CGFloat(maxY)).applying(t)
-                
-                minX = Float(min(c1.x, c2.x, c3.x, c4.x))
-                maxX = Float(max(c1.x, c2.x, c3.x, c4.x))
-                minY = Float(min(c1.y, c2.y, c3.y, c4.y))
-                maxY = Float(max(c1.y, c2.y, c3.y, c4.y))
-            }
-            
-            if maxX < 0.0 || minX > Float(textureWidth) ||
-                maxY < 0.0 || minY > Float(textureHeight) { continue }
-            
-            let minTileX = max(0, Int(minX * invTileSize))
-            let maxTileX = min(tilesPerRow - 1, Int(maxX * invTileSize))
-            let minTileY = max(0, Int(minY * invTileSize))
-            let maxTileY = min(tilesPerCol - 1, Int(maxY * invTileSize))
-            
-            guard minTileX <= maxTileX && minTileY <= maxTileY else { continue }
-            
-            for ty in minTileY...maxTileY {
-                for tx in minTileX...maxTileX {
-                    let tileIdx = ty * tilesPerRow + tx
-                    let writePos = Int(tileIndices[tileIdx].start + writeHeads[tileIdx])
-                    tileList[writePos] = UInt32(i)
-                    writeHeads[tileIdx] += 1
+        tileList.withUnsafeMutableBufferPointer { lp in
+            writeHeads.withUnsafeMutableBufferPointer { wp in
+                ranges.withUnsafeBufferPointer { rp in
+                    for (i, r) in rp.enumerated() {
+                        if r.minTX > r.maxTX { continue }
+                        let segIdx = UInt32(i)
+                        var rowBase = Int(r.minTY) * tilesPerRow + Int(r.minTX)
+                        for _ in r.minTY...r.maxTY {
+                            var idx = rowBase
+                            for _ in r.minTX...r.maxTX {
+                                let pos = wp[idx]
+                                lp[Int(pos)] = segIdx
+                                wp[idx] = pos + 1
+                                idx += 1
+                            }
+                            rowBase += tilesPerRow
+                        }
+                    }
                 }
             }
-        }
-        
-        for i in 0..<numTiles {
-            tileIndices[i].count = writeHeads[i]
         }
         
         return (tileIndices, tileList)
