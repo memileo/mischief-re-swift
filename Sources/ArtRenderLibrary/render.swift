@@ -253,25 +253,28 @@ extension Array where Element: Comparable {
 // MARK: - Render Structures
 private struct DirtyRect {
     var x0: Int, y0: Int, x1: Int, y1: Int   // x1/y1 exclusive
-    
+
     var isEmpty: Bool { x0 >= x1 || y0 >= y1 }
-    
+
     static var null: DirtyRect { DirtyRect(x0: Int.max, y0: Int.max, x1: Int.min, y1: Int.min) }
-    
+
     mutating func formUnion(_ other: DirtyRect) {
         if other.isEmpty { return }
         if isEmpty { self = other; return }
         x0 = min(x0, other.x0); y0 = min(y0, other.y0)
         x1 = max(x1, other.x1); y1 = max(y1, other.y1)
     }
-    
+
     /// Rect in CG user space (y-up). Plane rows are top-down, so the rect's
     /// origin y is canvasH - y1, NOT y0.
     func cgRect(canvasHeight: Int) -> CGRect {
-        CGRect(x: CGFloat(x0),
-               y: CGFloat(canvasHeight - y1),
-               width: CGFloat(x1 - x0),
-               height: CGFloat(y1 - y0))
+#if os(Linux)
+        CGRect(x: CGFloat(x0), y: CGFloat(y0),
+               width: CGFloat(x1 - x0), height: CGFloat(y1 - y0))
+#else
+        CGRect(x: CGFloat(x0), y: CGFloat(canvasHeight - y1),
+               width: CGFloat(x1 - x0), height: CGFloat(y1 - y0))
+#endif
     }
 
 }
@@ -283,14 +286,14 @@ private final class AlphaPlane {
     let data: UnsafeMutablePointer<UInt8>
     /// Region written during last use; zeroed on next acquire.
     var stale: DirtyRect = .null
-    
+
     init(width: Int, height: Int) {
         self.width = width
         self.height = height
         self.bytesPerRow = width
         self.data = UnsafeMutablePointer<UInt8>.allocate(capacity: width * height)
     }
-    
+
     deinit { data.deallocate() }
 }
 
@@ -298,20 +301,20 @@ private enum AlphaPlanePool {
     private static let lock = NSLock()
     private static var cached: AlphaPlane?
     private static let maxCachedBytes = 64 << 20
-    
+
     /// Contract: the returned plane is ALL ZERO. Never returns stale pixels.
     static func acquire(width: Int, height: Int) -> AlphaPlane {
         lock.lock()
         let pooled = cached
         cached = nil
         lock.unlock()
-        
+
         guard let p = pooled, p.width == width, p.height == height else {
             let plane = AlphaPlane(width: width, height: height)
             plane.data.initialize(repeating: 0, count: width * height)
             return plane
         }
-        
+
         let s = p.stale
         if !s.isEmpty {
             for y in s.y0..<s.y1 {
@@ -321,7 +324,7 @@ private enum AlphaPlanePool {
         p.stale = .null
         return p
     }
-    
+
     /// `dirty` must cover every byte written since acquire
     /// (union of maxBlitOptimized return values).
     static func recycle(_ plane: AlphaPlane, dirty: DirtyRect) {
@@ -345,11 +348,11 @@ extension AlphaPlane {
         let x1 = min(width,  dstX + tileW)
         let y1 = min(height, dstY + tileH)
         if x0 >= x1 || y0 >= y1 { return nil }
-        
+
         let rowBytes = x1 - x0
         var srcRow = UnsafeRawPointer(tile) + (y0 - dstY) * tileW + (x0 - dstX)
         var dstRow = UnsafeMutableRawPointer(data) + y0 * bytesPerRow + x0
-        
+
         for _ in y0..<y1 {
             var i = 0
 #if swift(>=5.7)
@@ -1915,7 +1918,7 @@ public final class Renderer {
             }
         }
     }
-    
+
     /// erase-masks: clear inside the quad only.
     private func eraseQuadPixelsCPU(_ ctx: CGContext, maskInv: CGAffineTransform,
                                     rect: [Float], destMap: CGAffineTransform) {

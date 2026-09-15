@@ -1097,6 +1097,43 @@ public final class CGContext {
     }
 }
 
+extension CGContext: Hashable {
+    public static func == (lhs: CGContext, rhs: CGContext) -> Bool {
+        lhs === rhs
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(ObjectIdentifier(self))
+    }
+}
+
+extension CGContext {
+
+    /// Returns the bits per pixel of the bitmap context.
+    /// Returns `0` if the context does not target a bitmap (image) surface,
+    /// matching Core Graphics behavior for non-bitmap contexts.
+    public var bitsPerPixel: Int {
+        guard let format = imageFormat else { return 0 }
+        return Self.bitsPerPixel(for: format)
+    }
+
+    // MARK: - Private
+
+    /// The underlying image surface's format, if the context targets one.
+    private var imageFormat: ImageFormat? {
+        (surface as? Cairo.Surface.Image)?.format
+    }
+
+    private static func bitsPerPixel(for format: ImageFormat) -> Int {
+        switch format {
+            case .argb32, .rgb24, .rgb30: return 32   // stored in 32-bit units
+            case .rgb16565:               return 16
+            case .a8:                     return 8
+            case .a1:                     return 1    // bit-packed, not byte-aligned
+        }
+    }
+}
+
 // MARK: - Private
 
 /// Default black pattern

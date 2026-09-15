@@ -7,6 +7,7 @@
 //
 
 import struct Foundation.Data
+import Foundation
 import Cairo
 
 /// Represents bitmap images and bitmap image masks, based on sample data that you supply. 
@@ -85,6 +86,67 @@ public final class CGImage {
 
         } catch {
             // If surface creation or copying fails, return nil.
+            return nil
+        }
+    }
+}
+
+extension CGImage {
+
+    public func cropping(to rect: CGRect) -> CGImage? {
+        // Snap to whole pixels, then clip to the image bounds (CG semantics).
+        let requested = rect.integral
+        guard !requested.isEmpty else { return nil }
+
+        let bounds = CGRect(x: 0, y: 0, width: Double(width), height: Double(height))
+        let clipped = requested.intersection(bounds)
+        guard !clipped.isEmpty else { return nil }
+
+        let cropWidth  = Int(clipped.width)
+        let cropHeight = Int(clipped.height)
+        guard cropWidth > 0, cropHeight > 0 else { return nil }
+
+        // Bytes per pixel; .a1 is bit-packed and can't be row-copied safely.
+        guard let format = surface.format else { return nil }
+        let bytesPerPixel: Int
+        switch format {
+            case .argb32, .rgb24, .rgb30: bytesPerPixel = 4
+            case .rgb16565:               bytesPerPixel = 2
+            case .a8:                     bytesPerPixel = 1
+            default:                      return nil   // .a1 or unknown format
+        }
+
+        let sourceStride = surface.stride
+        let sourceX = Int(clipped.minX)
+        let sourceY = Int(clipped.minY)
+
+        do {
+            let croppedSurface = try Cairo.Surface.Image(
+                format: format,
+                    width: cropWidth,
+                    height: cropHeight
+            )
+
+            let copied = croppedSurface.withUnsafeMutableBytes { dest -> Bool in
+                // Reading through the mutable accessor is fine; we never write to `source`.
+                let ok = surface.withUnsafeMutableBytes { src -> Bool in
+                    let rowBytes = cropWidth * bytesPerPixel
+                    for y in 0..<cropHeight {
+                        let srcOffset = (sourceY + y) * sourceStride + sourceX * bytesPerPixel
+                        let dstOffset = y * croppedSurface.stride
+                        dest.advanced(by: dstOffset)
+                        .update(from: src.advanced(by: srcOffset), count: rowBytes)
+                    }
+                    return true
+                }
+                return ok ?? false   // inner wrapper returns R? (nil = invalid data pointer)
+            }
+
+            guard copied == true else { return nil }
+
+            croppedSurface.markDirty()
+            return CGImage(surface: croppedSurface)
+        } catch {
             return nil
         }
     }
