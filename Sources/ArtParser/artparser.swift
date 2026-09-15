@@ -1319,7 +1319,7 @@ public struct ArtParser {
         let count = Int(readUInt32LE())
         
         // Validate count to prevent excessive memory usage
-        if count < 0 || count > 1000 {
+        if count < 0 || count > 50_000 {
             print("Warning: Invalid layer count \(count), resetting to 0")
             layers = []
             return
