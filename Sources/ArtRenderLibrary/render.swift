@@ -571,9 +571,9 @@ extension CGContext {
         // Use strokePath() ?
     }
 
-    public func strokeEllipse(in rect: CGRect) {
-        // TODO: Implement using Silica/Cairo ellipse + stroke
-    }
+//    public func strokeEllipse(in rect: CGRect) {
+//        // TODO: Implement using Silica/Cairo ellipse + stroke
+//    }
 
 //     public func addEllipse(in rect: CGRect) {
 //         // TODO: Implement using Silica/Cairo ellipse path
@@ -1250,7 +1250,6 @@ public final class Renderer {
         let artToDevice = CGAffineTransformConcat(layerTransform, baseTransform)
         
 //        let viewMatrix = art.viewMatrix
-//        let yDownBaseTransform = baseTransform // They are identical now
         
         let layerContext = createBitmapContext(size: canvasSize, scale: scale)
         Self.clearContext(layerContext, rect: CGRect(x: 0, y: 0, width: layerContext.width, height: layerContext.height))
@@ -1321,7 +1320,6 @@ public final class Renderer {
                         actionIndex: actionIdx,
                         dstPenAffine: currentPen.penMatrixAffine ?? .identity,
                         baseTransform: baseTransform,
-                        yDownBaseTransform: baseTransform,
                         flipTransform: flipTransform))
                     
                 case "merge_layer":
@@ -1869,23 +1867,6 @@ public final class Renderer {
                                        height: c.height))
     }
     
-    @inline(__always)
-    private func quadSpan(_ c: [CGPoint], yc: CGFloat) -> (lo: Int, hi: Int)? {
-        var mn = CGFloat.greatestFiniteMagnitude, mx = -mn, crossed = false
-        for i in 0..<4 {
-            let a = c[i], b = c[(i + 1) & 3]
-            if (a.y <= yc) != (b.y <= yc) {
-                let x = a.x + (yc - a.y) / (b.y - a.y) * (b.x - a.x)
-                if x < mn { mn = x }
-                if x > mx { mx = x }
-                crossed = true
-            }
-        }
-        guard crossed else { return nil }
-        let lo = Int((mn - 0.5).rounded(.up)), hi = Int((mx - 0.5).rounded(.down))
-        return lo <= hi ? (lo, hi) : nil
-    }
-    
     /// keep-masks: clear everything outside the intersection of all quads (one full-canvas sweep).
     private func clearKeepMasksCPU(_ ctx: CGContext,
                                    keeps: [(inv: CGAffineTransform, rect: [Float])],
@@ -1901,20 +1882,51 @@ public final class Renderer {
         let colLo = boundsPx.map { max(0, Int($0.minX.rounded(.down))) } ?? 0
         let colHiEx = boundsPx.map { min(w, Int($0.maxX.rounded(.up))) } ?? w
         guard rowLo < rowHi, colLo < colHiEx else { return }
+        var covs: [(xL: CGFloat, xR: CGFloat, v: CGFloat)] = []
+        // ^ declare once: var covs: [...] = []; covs.reserveCapacity(quads.count)
         for y in rowLo..<rowHi {
             let yc = CGFloat(h - 1 - y) + 0.5
-            var lo = colLo, hi = colHiEx - 1
+            covs.removeAll(keepingCapacity: true)
+            var rowDead = false
             for q in quads {
-                guard let s = quadSpan(q, yc: yc) else { lo = colLo; hi = colLo - 1; break }
-                lo = max(lo, s.lo); hi = min(hi, s.hi)
-                if lo > hi { break }
+                guard let cv = quadRowCoverageAA(q, yc: yc) else { rowDead = true; break }
+                covs.append(cv)
             }
             let row = base.advanced(by: y * bpr)
-            if lo > hi {
+            if rowDead {
                 memset(row.advanced(by: colLo * 4), 0, (colHiEx - colLo) * 4)
-            } else {
-                if lo > colLo { memset(row.advanced(by: colLo * 4), 0, (lo - colLo) * 4) }
-                if hi < colHiEx - 1 { memset(row.advanced(by: (hi + 1) * 4), 0, (colHiEx - hi - 1) * 4) }
+                continue
+            }
+            var iLo = covs[0].xL, iHi = covs[0].xR, rowKeep = covs[0].v
+            for cv in covs.dropFirst() {
+                iLo = max(iLo, cv.xL); iHi = min(iHi, cv.xR); rowKeep *= cv.v
+            }
+            guard iHi > iLo, rowKeep > 0 else {
+                memset(row.advanced(by: colLo * 4), 0, (colHiEx - colLo) * 4)
+                continue
+            }
+            let runLo = max(colLo, Int((iLo - 0.5).rounded(.up)))
+            let runHi = min(colHiEx - 1, Int((iHi + 0.5).rounded(.down)))
+            let fullLo = max(runLo, Int((iLo + 0.5).rounded(.up)))   // first fully-kept px
+            let fullHi = min(runHi, Int((iHi - 0.5).rounded(.down))) // last fully-kept px
+            if runLo > colLo { memset(row.advanced(by: colLo * 4), 0, (runLo - colLo) * 4) }
+            if runHi < colHiEx - 1 { memset(row.advanced(by: (runHi + 1) * 4), 0, (colHiEx - runHi - 1) * 4) }
+            let leftEnd = min(fullLo, runHi + 1)                     // exclusive
+            for px in runLo..<leftEnd {
+                var keep = rowKeep
+                for cv in covs { keep *= horizCoverage(cv.xL, cv.xR, px) }
+                scaleRunCPU(row, px, px + 1, keep)
+            }
+            if fullLo <= fullHi {
+                scaleRunCPU(row, fullLo, fullHi + 1, rowKeep)        // no-op when rowKeep == 1
+            }
+            let rightStart = max(fullHi + 1, leftEnd)
+            if rightStart <= runHi {
+                for px in rightStart...runHi {
+                    var keep = rowKeep
+                    for cv in covs { keep *= horizCoverage(cv.xL, cv.xR, px) }
+                    scaleRunCPU(row, px, px + 1, keep)
+                }
             }
         }
     }
@@ -1932,10 +1944,78 @@ public final class Renderer {
         guard y0 <= y1 else { return }
         for y in y0...y1 {
             let yc = CGFloat(h - 1 - y) + 0.5
-            guard let s = quadSpan(c, yc: yc) else { continue }
-            let lo = max(0, s.lo), hi = min(w - 1, s.hi)
-            guard lo <= hi else { continue }
-            memset(base.advanced(by: y * bpr + lo * 4), 0, (hi - lo + 1) * 4)
+            guard let cv = quadRowCoverageAA(c, yc: yc) else { continue }
+            let runLo = max(0, Int((cv.xL - 0.5).rounded(.up)))
+            let runHi = min(w - 1, Int((cv.xR + 0.5).rounded(.down)))
+            guard runLo <= runHi else { continue }
+            let fullLo = max(runLo, Int((cv.xL + 0.5).rounded(.up)))
+            let fullHi = min(runHi, Int((cv.xR - 0.5).rounded(.down)))
+            let row = base.advanced(by: y * bpr)
+            let leftEnd = min(fullLo, runHi + 1)
+            for px in runLo..<leftEnd {
+                scaleRunCPU(row, px, px + 1, 1 - cv.v * horizCoverage(cv.xL, cv.xR, px))
+            }
+            if fullLo <= fullHi {
+                scaleRunCPU(row, fullLo, fullHi + 1, 1 - cv.v)       // memset when v == 1
+            }
+            let rightStart = max(fullHi + 1, leftEnd)
+            if rightStart <= runHi {
+                for px in rightStart...runHi {
+                    scaleRunCPU(row, px, px + 1, 1 - cv.v * horizCoverage(cv.xL, cv.xR, px))
+                }
+            }
+        }
+    }
+    
+    /// AA row coverage of a convex quad (device/value space, y-down values).
+    /// nil = quad doesn't cover this row at all.
+    ///   xL/xR: subpixel covered interval; pixel px has horizontal coverage
+    ///          clamp(min(px+0.5, xR) - max(px-0.5, xL), 0, 1)
+    ///   v:     vertical fraction of the row band inside the quad
+    private func quadRowCoverageAA(_ c: [CGPoint], yc: CGFloat)
+    -> (xL: CGFloat, xR: CGFloat, v: CGFloat)? {
+        var xL = CGFloat.greatestFiniteMagnitude, xR = -xL
+        for i in 0..<4 {
+            let a = c[i], b = c[(i + 1) & 3]
+            if (a.y <= yc) != (b.y <= yc) {
+                let x = a.x + (yc - a.y) / (b.y - a.y) * (b.x - a.x)
+                xL = min(xL, x); xR = max(xR, x)
+            }
+        }
+        guard xR > xL else { return nil }
+        let xm = (xL + xR) * 0.5
+        var yT = CGFloat.greatestFiniteMagnitude, yB = -yT
+        var hits = 0
+        for i in 0..<4 {
+            let a = c[i], b = c[(i + 1) & 3]
+            if (a.x <= xm) != (b.x <= xm) {
+                let yv = a.y + (xm - a.x) / (b.x - a.x) * (b.y - a.y)
+                yT = min(yT, yv); yB = max(yB, yv); hits += 1
+            }
+        }
+        guard hits >= 2 else { return nil }
+        let v = max(0, min(1, min(yc + 0.5, yB) - max(yc - 0.5, yT)))
+        return v > 0 ? (xL, xR, v) : nil
+    }
+    
+    @inline(__always)
+    private func horizCoverage(_ xL: CGFloat, _ xR: CGFloat, _ px: Int) -> CGFloat {
+        max(0, min(CGFloat(px) + 0.5, xR) - max(CGFloat(px) - 0.5, xL))
+    }
+    
+    /// Scales a premultiplied pixel run by f (0 → memset, 1 → no-op).
+    @inline(__always)
+    private func scaleRunCPU(_ row: UnsafeMutableRawPointer, _ px0: Int, _ px1Ex: Int, _ f: CGFloat) {
+        guard px1Ex > px0 else { return }
+        if f <= 0 {
+            memset(row.advanced(by: px0 * 4), 0, (px1Ex - px0) * 4)
+            return
+        }
+        let k = UInt8(max(0, min(255, (f * 255).rounded())))
+        guard k < 255 else { return }
+        let p = row.advanced(by: px0 * 4).assumingMemoryBound(to: UInt8.self)
+        for i in 0..<(px1Ex - px0) * 4 {
+            p[i] = UInt8((UInt16(p[i]) * UInt16(k) + 127) / 255)
         }
     }
     
@@ -2019,26 +2099,6 @@ public final class Renderer {
         context.addLines(between: corners)
         context.closePath()
         context.fillPath()
-        context.restoreGState()
-    }
-    
-    private func applyPasteMaskCPU(context: CGContext, maskInv: CGAffineTransform, rect: [Float],
-                                   erase: Bool, destMap: CGAffineTransform) {
-        guard let corners = maskRectDeviceCorners(maskInv: maskInv, rect: rect, destMap: destMap) else { return }
-        context.saveGState()
-        context.setBlendMode(.clear)
-        context.beginPath()
-        if erase {
-            context.addLines(between: corners)
-            context.closePath()
-            context.fillPath()
-        } else {
-            context.addRect(CGRect(x: 0, y: 0, width: context.width, height: context.height))
-            context.addLines(between: corners)
-            context.closePath()
-            context.fillPath(using: .evenOdd)
-//            context.drawPath(using: .eoFill) // alternative
-        }
         context.restoreGState()
     }
     
@@ -3566,7 +3626,6 @@ public final class Renderer {
         actionIndex: Int,
         dstPenAffine: CGAffineTransform,
         baseTransform: CGAffineTransform,
-        yDownBaseTransform: CGAffineTransform,
         flipTransform: CGAffineTransform?
     ) -> [LayerOperation] {
         
@@ -4041,57 +4100,6 @@ public final class Renderer {
         return groups
     }
 
-    
-    
-    // MARK: - Shape Rendering
-    private func renderRect(x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat, angle: CGFloat, pen: PenInfo, in context: CGContext) {
-        context.saveGState()
-        
-        // Move to center of rect
-        context.translateBy(x: x + width/2, y: y + height/2)
-        // Rotate
-        context.rotate(by: angle)
-        
-        
-        if pen.isEraser {
-            context.setBlendMode(.destinationOut)
-        }
-        
-        // Set stroke properties
-        context.setStrokeColor(CGColor(red: CGFloat(pen.color.r), green: CGFloat(pen.color.g), blue: CGFloat(pen.color.b), alpha: CGFloat(pen.opacity)))
-        context.setLineWidth(CGFloat(pen.size))
-        
-        // Draw rect outline (centered at origin)
-        let rect = CGRect(x: -width/2, y: -height/2, width: width, height: height)
-        context.stroke(rect)
-        
-        context.restoreGState()
-    }
-    
-    private func renderEllipse(cx: CGFloat, cy: CGFloat, rx: CGFloat, ry: CGFloat, angle: CGFloat, pen: PenInfo, in context: CGContext) {
-        context.saveGState()
-        
-        // Move to center of ellipse
-        context.translateBy(x: cx, y: cy)
-        // Rotate
-        context.rotate(by: angle)
-        // Scale to create ellipse from circle
-        context.scaleBy(x: rx, y: ry)
-        
-        if pen.isEraser {
-            context.setBlendMode(.destinationOut)
-        }
-        
-        // Set stroke properties
-        context.setStrokeColor(CGColor(red: CGFloat(pen.color.r), green: CGFloat(pen.color.g), blue: CGFloat(pen.color.b), alpha: CGFloat(pen.opacity)))
-        context.setLineWidth(CGFloat(pen.size) / min(rx, ry))  // Adjust line width based on scale
-        
-        // Draw ellipse outline
-        context.strokeEllipse(in: CGRect(x: -1, y: -1, width: 2, height: 2))
-        
-        context.restoreGState()
-    }
-    
     // MARK: - Embedded Image Rendering
         private func renderEmbeddedImages(art: ArtParser, in context: CGContext) {
         for imageInfo in art.images {
@@ -4289,17 +4297,17 @@ public final class Renderer {
     
     // Detect a "dot" stroke: few points and small bounding box.
     // Returns true if stroke should be treated as a dot.
-    private func isDotStroke(_ pts: [Point], maxPoints: Int = 4, maxDiameterPx: CGFloat = 6.0) -> Bool {
-        if pts.count > maxPoints { return false }
-        var minX = CGFloat.greatestFiniteMagnitude, minY = CGFloat.greatestFiniteMagnitude
-        var maxX: CGFloat = -CGFloat.greatestFiniteMagnitude, maxY: CGFloat = -CGFloat.greatestFiniteMagnitude
-        for p in pts {
-            minX = min(minX, CGFloat(p.x)); maxX = max(maxX, CGFloat(p.x))
-            minY = min(minY, CGFloat(p.y)); maxY = max(maxY, CGFloat(p.y))
-        }
-        let dia = max(maxX - minX, maxY - minY)
-        return dia <= maxDiameterPx
-    }
+//    private func isDotStroke(_ pts: [Point], maxPoints: Int = 4, maxDiameterPx: CGFloat = 6.0) -> Bool {
+//        if pts.count > maxPoints { return false }
+//        var minX = CGFloat.greatestFiniteMagnitude, minY = CGFloat.greatestFiniteMagnitude
+//        var maxX: CGFloat = -CGFloat.greatestFiniteMagnitude, maxY: CGFloat = -CGFloat.greatestFiniteMagnitude
+//        for p in pts {
+//            minX = min(minX, CGFloat(p.x)); maxX = max(maxX, CGFloat(p.x))
+//            minY = min(minY, CGFloat(p.y)); maxY = max(maxY, CGFloat(p.y))
+//        }
+//        let dia = max(maxX - minX, maxY - minY)
+//        return dia <= maxDiameterPx
+//    }
     
     // Apply short linear taper on last `tailSamples` samples (multiplies pressure values).
     func applyEndTaperToResampled(_ resampled: inout [ResampledPoint], tailSamples: Int = 6, ease: Float = 2.0) {
@@ -4320,38 +4328,38 @@ public final class Renderer {
     
     // MARK: - Radius smoothing
     
-    func exponentialSmooth(_ arr: [Float], alpha: Float = 0.18) -> [Float] {
-        guard !arr.isEmpty else { return [] }
-        var out = [Float](repeating: 0.0, count: arr.count)
-        out[0] = arr[0]
-        for i in 1..<arr.count {
-            out[i] = alpha * arr[i] + (1.0 - alpha) * out[i-1]
-        }
-        return out
-    }
+//    func exponentialSmooth(_ arr: [Float], alpha: Float = 0.18) -> [Float] {
+//        guard !arr.isEmpty else { return [] }
+//        var out = [Float](repeating: 0.0, count: arr.count)
+//        out[0] = arr[0]
+//        for i in 1..<arr.count {
+//            out[i] = alpha * arr[i] + (1.0 - alpha) * out[i-1]
+//        }
+//        return out
+//    }
     
-    func movingAverage(_ arr: [Int], window: Int = 5) -> [Int] {
-        guard !arr.isEmpty else { return [] }
-        let w = max(1, (window % 2 == 1) ? window : window + 1)
-        var out = [Int](repeating: 0, count: arr.count)
-        let half = w / 2
-        for i in 0..<arr.count {
-            var sum: Int = 0
-            var cnt: Int = 0
-            let start = max(0, i - half)
-            let end = min(arr.count - 1, i + half)
-            for j in start...end { sum += arr[j]; cnt += 1 }
-            out[i] = sum / cnt
-        }
-        return out
-    }
+//    func movingAverage(_ arr: [Int], window: Int = 5) -> [Int] {
+//        guard !arr.isEmpty else { return [] }
+//        let w = max(1, (window % 2 == 1) ? window : window + 1)
+//        var out = [Int](repeating: 0, count: arr.count)
+//        let half = w / 2
+//        for i in 0..<arr.count {
+//            var sum: Int = 0
+//            var cnt: Int = 0
+//            let start = max(0, i - half)
+//            let end = min(arr.count - 1, i + half)
+//            for j in start...end { sum += arr[j]; cnt += 1 }
+//            out[i] = sum / cnt
+//        }
+//        return out
+//    }
     
     
     // MARK: - Arc-length resampling & pressure mapping helpers
     
     // Linear interpolation helpers
     @inline(__always) func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat { return a + (b - a) * t }
-    @inline(__always) func lerpF(_ a: Int, _ b: Int, _ t: Float) -> Int { return a + Int((Float(b - a) * t)) }
+//    @inline(__always) func lerpF(_ a: Int, _ b: Int, _ t: Float) -> Int { return a + Int((Float(b - a) * t)) }
     
     // Compute Euclidean distance between two points
     func dist(_ ax: CGFloat, _ ay: CGFloat, _ bx: CGFloat, _ by: CGFloat) -> CGFloat {
@@ -4424,16 +4432,16 @@ public final class Renderer {
 //    }
     
     // 2) Simple smoothing (3-sample moving average)
-    func smoothPressures(_ points: [Point]) -> [Point] { 
-        guard points.count > 2 else { return points }
-        var out = points
-        for i in 0..<points.count {
-            if i == 0 || i == points.count - 1 { continue }
-            let p = (points[i-1].p + points[i].p + points[i+1].p) / 3
-            out[i].p = p
-        }
-        return out
-    }
+//    func smoothPressures(_ points: [Point]) -> [Point] {
+//        guard points.count > 2 else { return points }
+//        var out = points
+//        for i in 0..<points.count {
+//            if i == 0 || i == points.count - 1 { continue }
+//            let p = (points[i-1].p + points[i].p + points[i+1].p) / 3
+//            out[i].p = p
+//        }
+//        return out
+//    }
     
     
 
@@ -4733,45 +4741,6 @@ public final class Renderer {
         return out
     }
     
-    func interpolatePressuresOntoResampled(rawPoints: [Point], rawPressures: [Double], resampled: [ResampledPoint]) -> [Float] {
-        let n = rawPoints.count
-        guard n > 0 else { return resampled.map { _ in 0.0 } }
-        // build raw cumulative distances
-        var rawCum = [Double](repeating: 0.0, count: n)
-        for i in 1..<n {
-            let dx = Double(rawPoints[i].x - rawPoints[i-1].x)
-            let dy = Double(rawPoints[i].y - rawPoints[i-1].y)
-            rawCum[i] = rawCum[i-1] + sqrt(dx*dx + dy*dy)
-        }
-        let totalRaw = rawCum.last ?? 1.0
-        // sample helper
-        func samplePressureAt(length L: Double) -> Double {
-            if L <= 0 { return rawPressures.first ?? 0.0 }
-            if L >= totalRaw { return rawPressures.last ?? 0.0 }
-            var idx = 0
-            while idx + 1 < n && rawCum[idx+1] < L { idx += 1 }
-            let den = rawCum[idx+1] - rawCum[idx]
-            if den == 0 { return rawPressures[idx] }
-            let t = (L - rawCum[idx]) / den
-            return rawPressures[idx] * (1.0 - t) + rawPressures[idx+1] * t
-        }
-        // build resampled cumulative distances
-        var resCum = [Double](repeating: 0.0, count: resampled.count)
-        for i in 1..<resampled.count {
-            let dx = Double(resampled[i].x - resampled[i-1].x)
-            let dy = Double(resampled[i].y - resampled[i-1].y)
-            resCum[i] = resCum[i-1] + sqrt(dx*dx + dy*dy)
-        }
-        let totalRes = resCum.last ?? 1.0
-        var out: [Float] = []
-        for i in 0..<resampled.count {
-            let frac = (totalRes > 0) ? (resCum[i] / totalRes) : 0.0
-            let Lraw = frac * totalRaw
-            let p = samplePressureAt(length: Lraw)
-            out.append(Float(p))
-        }
-        return out
-    }
     
     // MARK: - Background/Paper
     
@@ -4886,17 +4855,6 @@ public final class Renderer {
         context.restoreGState()
     }
     
-    private func multiplyColors(
-        color1: (r: Float, g: Float, b: Float),
-        color2: (r: Float, g: Float, b: Float)
-    ) -> (r: Float, g: Float, b: Float) {
-        return (
-            r: color1.r * color2.r,
-            g: color1.g * color2.g,
-            b: color1.b * color2.b
-        )
-    }
-    
     
     // MARK: - DEBUG TESTS
     
@@ -4966,52 +4924,52 @@ public final class Renderer {
     
     
     // Build a variable-width polygon (no stamps). Good debug to check geometry vs stamping.
-    func buildStrokeOutlinePath(points: [Point], radii: [CGFloat]) -> CGPath {
-        let path = CGMutablePath()
-        guard points.count >= 2, points.count == radii.count else { return path }
-        let pts = points.map { CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)) }
-        var left: [CGPoint] = []
-        var right: [CGPoint] = []
-        left.reserveCapacity(pts.count); right.reserveCapacity(pts.count)
-        
-        for i in 0..<pts.count {
-            let p = pts[i]
-            let prev = (i == 0) ? pts[i] : pts[i-1]
-            let next = (i == pts.count - 1) ? pts[i] : pts[i+1]
-            var tx = next.x - prev.x, ty = next.y - prev.y
-            let mag = sqrt(tx*tx + ty*ty)
-            if mag > 1e-6 { tx /= mag; ty /= mag } else { tx = 1.0; ty = 0.0 }
-            let nx = -ty, ny = tx
-            let r = radii[i]
-            left.append(CGPoint(x: p.x + nx*r, y: p.y + ny*r))
-            right.append(CGPoint(x: p.x - nx*r, y: p.y - ny*r))
-        }
-        
-        // forward left side
-        path.move(to: left[0])
-        for p in left { path.addLine(to: p) }
-        
-        // end cap: arc from left[last] to right[last]
-        let lastIdx = pts.count - 1
-        let lastCenter = pts[lastIdx]
-        let lastR = radii[lastIdx]
-        let startAngleEndCap = atan2(left[lastIdx].y - lastCenter.y, left[lastIdx].x - lastCenter.x)
-        let endAngleEndCap = atan2(right[lastIdx].y - lastCenter.y, right[lastIdx].x - lastCenter.x)
-        path.addArc(center: lastCenter, radius: lastR, startAngle: startAngleEndCap, endAngle: endAngleEndCap, clockwise: false)
-        
-        // right side back
-        for i in stride(from: lastIdx, through: 0, by: -1) { path.addLine(to: right[i]) }
-        
-        // start cap
-        let startCenter = pts[0]
-        let startR = radii[0]
-        let startAngleStartCap = atan2(right[0].y - startCenter.y, right[0].x - startCenter.x)
-        let endAngleStartCap = atan2(left[0].y - startCenter.y, left[0].x - startCenter.x)
-        path.addArc(center: startCenter, radius: startR, startAngle: startAngleStartCap, endAngle: endAngleStartCap, clockwise: false)
-        
-        path.closeSubpath()
-        return path
-    }
+//    func buildStrokeOutlinePath(points: [Point], radii: [CGFloat]) -> CGPath {
+//        let path = CGMutablePath()
+//        guard points.count >= 2, points.count == radii.count else { return path }
+//        let pts = points.map { CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)) }
+//        var left: [CGPoint] = []
+//        var right: [CGPoint] = []
+//        left.reserveCapacity(pts.count); right.reserveCapacity(pts.count)
+//
+//        for i in 0..<pts.count {
+//            let p = pts[i]
+//            let prev = (i == 0) ? pts[i] : pts[i-1]
+//            let next = (i == pts.count - 1) ? pts[i] : pts[i+1]
+//            var tx = next.x - prev.x, ty = next.y - prev.y
+//            let mag = sqrt(tx*tx + ty*ty)
+//            if mag > 1e-6 { tx /= mag; ty /= mag } else { tx = 1.0; ty = 0.0 }
+//            let nx = -ty, ny = tx
+//            let r = radii[i]
+//            left.append(CGPoint(x: p.x + nx*r, y: p.y + ny*r))
+//            right.append(CGPoint(x: p.x - nx*r, y: p.y - ny*r))
+//        }
+//
+//        // forward left side
+//        path.move(to: left[0])
+//        for p in left { path.addLine(to: p) }
+//
+//        // end cap: arc from left[last] to right[last]
+//        let lastIdx = pts.count - 1
+//        let lastCenter = pts[lastIdx]
+//        let lastR = radii[lastIdx]
+//        let startAngleEndCap = atan2(left[lastIdx].y - lastCenter.y, left[lastIdx].x - lastCenter.x)
+//        let endAngleEndCap = atan2(right[lastIdx].y - lastCenter.y, right[lastIdx].x - lastCenter.x)
+//        path.addArc(center: lastCenter, radius: lastR, startAngle: startAngleEndCap, endAngle: endAngleEndCap, clockwise: false)
+//
+//        // right side back
+//        for i in stride(from: lastIdx, through: 0, by: -1) { path.addLine(to: right[i]) }
+//
+//        // start cap
+//        let startCenter = pts[0]
+//        let startR = radii[0]
+//        let startAngleStartCap = atan2(right[0].y - startCenter.y, right[0].x - startCenter.x)
+//        let endAngleStartCap = atan2(left[0].y - startCenter.y, left[0].x - startCenter.x)
+//        path.addArc(center: startCenter, radius: startR, startAngle: startAngleStartCap, endAngle: endAngleStartCap, clockwise: false)
+//
+//        path.closeSubpath()
+//        return path
+//    }
     
     
     private func renderStroke_drawDeviceResampled(
@@ -5151,35 +5109,6 @@ public final class Renderer {
         context.clip(to: rect, mask: mask)
         context.fill(rect)
         context.restoreGState()
-    }
-
-    
-    // Helper method to render a group of circles with the same opacity
-    private func renderCircleGroup(
-        _ circles: [(center: CGPoint, radius: CGFloat)],
-        opacity: Float,
-        in context: CGContext
-    ) {
-        guard !circles.isEmpty else { return }
-        
-        // Set alpha for this group
-        context.setAlpha(CGFloat(opacity))
-        
-        // --- SIMPLER APPROACH ---
-        // Add ellipses directly to the context's path
-        for circle in circles {
-            context.addEllipse(
-                in: CGRect(
-                    x: circle.center.x - circle.radius,
-                    y: circle.center.y - circle.radius,
-                    width: circle.radius * 2,
-                    height: circle.radius * 2
-                )
-            )
-        }
-        
-        // Fill the path that was built directly on the context
-        context.fillPath(using: .winding)
     }
     
     // Fallback method for tile-based rendering (texture brushes)
@@ -5360,29 +5289,6 @@ public final class Renderer {
                        shouldInterpolate: true,
                        intent: .defaultIntent)
 #endif
-    }
-    
-    /// Full-plane convenience wrapper. Delete this if nothing else calls it.
-    private func makeMaskFromAlphaPlane(plane: AlphaPlane) -> CGImage? {
-        makeMaskFromAlphaPlane(plane: plane,
-                               dirty: DirtyRect(x0: 0, y0: 0, x1: plane.width, y1: plane.height))
-    }
-    
-    func calculateOpacityFromPressure(pen: PenInfo, pressure: Float) -> Float {
-        // Handle negative pressure values by clamping to 0
-        let clampedPressure = max(0.0, pressure)
-        
-        // Pressure is already normalized to 0-1 range
-        let p = max(0.0, min(1.0, clampedPressure))
-        let pressureRange = pen.opacity - pen.opacityMin
-        var opacity = pen.opacityMin + p * pressureRange
-        
-        // Minimum visible threshold to avoid invisible dabs
-        let minVisibleOpacity: Float = 0.03
-        opacity = max(opacity, minVisibleOpacity)
-        
-        // Clamp final
-        return max(0.0, min(1.0, opacity))
     }
     
     // Reusable tile buffer to avoid per-dab allocations
@@ -5831,82 +5737,82 @@ public final class Renderer {
     
     
     // Keep only segments whose bounding box intersects the canvas (with margin).
-    private func cullDevicePolyline(
-        points: [CGPoint],
-        pressures: [Int],
-        canvasW: Int,
-        canvasH: Int,
-        margin: CGFloat = 64
-    ) -> ([CGPoint], [Int]) {
-        guard points.count == pressures.count, points.count >= 2 else { return ([], []) }
-        let canvasRect = CGRect(x: -margin, y: -margin, width: CGFloat(canvasW) + 2*margin, height: CGFloat(canvasH) + 2*margin)
-        var keptPts: [CGPoint] = []
-        var keptPrs: [Int] = []
-        func push(_ p: CGPoint, _ pr: Int) {
-            if keptPts.isEmpty || keptPts.last! != p {
-                keptPts.append(p)
-                keptPrs.append(pr)
-            }
-        }
-        // Always start with the first point if it's even remotely near
-        if canvasRect.contains(points[0]) {
-            push(points[0], pressures[0])
-        }
-        for i in 0..<(points.count - 1) {
-            let p0 = points[i], p1 = points[i + 1]
-            let pr0 = pressures[i], pr1 = pressures[i + 1]
-            let segMinX = min(p0.x, p1.x), segMaxX = max(p0.x, p1.x)
-            let segMinY = min(p0.y, p1.y), segMaxY = max(p0.y, p1.y)
-            let segRect = CGRect(x: segMinX, y: segMinY, width: segMaxX - segMinX, height: segMaxY - segMinY)
-            if segRect.intersects(canvasRect) {
-                // Keep both ends of the segment
-                push(p0, pr0)
-                push(p1, pr1)
-            }
-        }
-        // If nothing intersects, return empty
-        if keptPts.count < 2 { return ([], []) }
-        return (keptPts, keptPrs)
-    }
+//    private func cullDevicePolyline(
+//        points: [CGPoint],
+//        pressures: [Int],
+//        canvasW: Int,
+//        canvasH: Int,
+//        margin: CGFloat = 64
+//    ) -> ([CGPoint], [Int]) {
+//        guard points.count == pressures.count, points.count >= 2 else { return ([], []) }
+//        let canvasRect = CGRect(x: -margin, y: -margin, width: CGFloat(canvasW) + 2*margin, height: CGFloat(canvasH) + 2*margin)
+//        var keptPts: [CGPoint] = []
+//        var keptPrs: [Int] = []
+//        func push(_ p: CGPoint, _ pr: Int) {
+//            if keptPts.isEmpty || keptPts.last! != p {
+//                keptPts.append(p)
+//                keptPrs.append(pr)
+//            }
+//        }
+//        // Always start with the first point if it's even remotely near
+//        if canvasRect.contains(points[0]) {
+//            push(points[0], pressures[0])
+//        }
+//        for i in 0..<(points.count - 1) {
+//            let p0 = points[i], p1 = points[i + 1]
+//            let pr0 = pressures[i], pr1 = pressures[i + 1]
+//            let segMinX = min(p0.x, p1.x), segMaxX = max(p0.x, p1.x)
+//            let segMinY = min(p0.y, p1.y), segMaxY = max(p0.y, p1.y)
+//            let segRect = CGRect(x: segMinX, y: segMinY, width: segMaxX - segMinX, height: segMaxY - segMinY)
+//            if segRect.intersects(canvasRect) {
+//                // Keep both ends of the segment
+//                push(p0, pr0)
+//                push(p1, pr1)
+//            }
+//        }
+//        // If nothing intersects, return empty
+//        if keptPts.count < 2 { return ([], []) }
+//        return (keptPts, keptPrs)
+//    }
     
-    func linearResampleAlongSegments(_ raw: [Point], stepPx: CGFloat) -> [ResampledPoint] {
-        guard raw.count > 0 else { return [] }
-        var out: [ResampledPoint] = []
-        for i in 0..<(raw.count - 1) {
-            let a = raw[i], b = raw[i+1]
-            let ax = CGFloat(a.x), ay = CGFloat(a.y)
-            let bx = CGFloat(b.x), by = CGFloat(b.y)
-            let dx = bx - ax, dy = by - ay
-            let segLen = hypot(dx, dy)
-            if segLen <= 0.0001 {
-                out.append(ResampledPoint(x: ax, y: ay, p: a.p))
-                continue
-            }
-            let steps = max(1, Int(ceil(segLen / stepPx)))
-            for s in 0...steps {
-                let t = CGFloat(s) / CGFloat(steps)
-                let x = ax + dx * t
-                let y = ay + dy * t
-                let interpP = a.p + Float(b.p - a.p) * Float(t)  // Interpolate float pressure
-                out.append(ResampledPoint(x: x, y: y, p: interpP))
-            }
-        }
-        if let last = raw.last {
-            out.append(ResampledPoint(x: CGFloat(last.x), y: CGFloat(last.y), p: last.p))
-        }
-        return out
-    }
+//    func linearResampleAlongSegments(_ raw: [Point], stepPx: CGFloat) -> [ResampledPoint] {
+//        guard raw.count > 0 else { return [] }
+//        var out: [ResampledPoint] = []
+//        for i in 0..<(raw.count - 1) {
+//            let a = raw[i], b = raw[i+1]
+//            let ax = CGFloat(a.x), ay = CGFloat(a.y)
+//            let bx = CGFloat(b.x), by = CGFloat(b.y)
+//            let dx = bx - ax, dy = by - ay
+//            let segLen = hypot(dx, dy)
+//            if segLen <= 0.0001 {
+//                out.append(ResampledPoint(x: ax, y: ay, p: a.p))
+//                continue
+//            }
+//            let steps = max(1, Int(ceil(segLen / stepPx)))
+//            for s in 0...steps {
+//                let t = CGFloat(s) / CGFloat(steps)
+//                let x = ax + dx * t
+//                let y = ay + dy * t
+//                let interpP = a.p + Float(b.p - a.p) * Float(t)  // Interpolate float pressure
+//                out.append(ResampledPoint(x: x, y: y, p: interpP))
+//            }
+//        }
+//        if let last = raw.last {
+//            out.append(ResampledPoint(x: CGFloat(last.x), y: CGFloat(last.y), p: last.p))
+//        }
+//        return out
+//    }
     
-    func penAffineScale(_ affine: CGAffineTransform) -> CGFloat {
-        let a = affine.a, b = affine.b, c = affine.c, d = affine.d
-        let sx = sqrt(Double(a*a + c*c))
-        let sy = sqrt(Double(b*b + d*d))
-        if sx.isFinite && sy.isFinite {
-            return CGFloat((sx + sy) / 2.0)
-        } else {
-            return 1.0
-        }
-    }
+//    func penAffineScale(_ affine: CGAffineTransform) -> CGFloat {
+//        let a = affine.a, b = affine.b, c = affine.c, d = affine.d
+//        let sx = sqrt(Double(a*a + c*c))
+//        let sy = sqrt(Double(b*b + d*d))
+//        if sx.isFinite && sy.isFinite {
+//            return CGFloat((sx + sy) / 2.0)
+//        } else {
+//            return 1.0
+//        }
+//    }
     
     func verticalFlipTransform(canvasHeight: CGFloat) -> CGAffineTransform {
         // Translate down by canvasHeight, then scale Y by -1 to flip vertically.
@@ -5918,34 +5824,34 @@ public final class Renderer {
         #endif
     }
     
-    private func verticallyFlipRenderedImage(_ image: CGImage) -> CGImage? {
-        let context = createBitmapContext(
-            size: canvasSize,
-            scale: scale
-        )
-        
-        let rect = CGRect(
-            x: 0,
-            y: 0,
-            width: context.width,
-            height: context.height
-        )
-        
-        context.saveGState()
-        
-        // Same convention used by the old GPU compositing path.
-        context.scaleBy(x: 1, y: -1)
-        context.translateBy(
-            x: 0,
-            y: -CGFloat(context.height)
-        )
-        
-        context.draw(image, in: rect)
-        
-        context.restoreGState()
-        
-        return context.makeImage()
-    }
+//    private func verticallyFlipRenderedImage(_ image: CGImage) -> CGImage? {
+//        let context = createBitmapContext(
+//            size: canvasSize,
+//            scale: scale
+//        )
+//
+//        let rect = CGRect(
+//            x: 0,
+//            y: 0,
+//            width: context.width,
+//            height: context.height
+//        )
+//
+//        context.saveGState()
+//
+//        // Same convention used by the old GPU compositing path.
+//        context.scaleBy(x: 1, y: -1)
+//        context.translateBy(
+//            x: 0,
+//            y: -CGFloat(context.height)
+//        )
+//
+//        context.draw(image, in: rect)
+//
+//        context.restoreGState()
+//
+//        return context.makeImage()
+//    }
     
 }
 

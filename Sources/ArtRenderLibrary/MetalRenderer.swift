@@ -141,7 +141,7 @@ class MetalRenderer {
     
     // MARK: - Initialization
     
-    init(device: MTLDevice? = nil, library: MTLLibrary? = nil) throws {
+    init(device: MTLDevice? = nil, library: MTLLibrary? = nil) throws { // library param unused?
         self.device = device ?? MTLCreateSystemDefaultDevice()
         
         guard let device = self.device else {
