@@ -664,6 +664,11 @@ extension Renderer {
             }
             let runLo = max(colLo, Int((iLo - 0.5).rounded(.up)))
             let runHi = min(colHiEx - 1, Int((iHi + 0.5).rounded(.down)))
+            guard runLo <= runHi else {
+                // kept span misses this row's column range entirely -> keep == 0
+                memset(row.advanced(by: colLo * 4), 0, (colHiEx - colLo) * 4)
+                continue
+            }
             let fullLo = max(runLo, Int((iLo + 0.5).rounded(.up)))   // first fully-kept px
             let fullHi = min(runHi, Int((iHi - 0.5).rounded(.down))) // last fully-kept px
             if runLo > colLo { memset(row.advanced(by: colLo * 4), 0, (runLo - colLo) * 4) }
