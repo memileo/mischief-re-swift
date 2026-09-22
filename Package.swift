@@ -41,7 +41,24 @@ let package = Package(
             name: "ArtRenderLibrary",
             dependencies: ["ArtParser"],
             path: "Sources/ArtRenderLibrary",
-            sources: ["MetalRenderer.swift", /*"NoiseAtlas.swift", skip procedural noise for now */ "render.swift", "GPExport.swift"],
+            sources: [
+                "MetalRenderer.swift",
+                "MetalRenderer_Dispatch.swift",
+                "MetalRenderer_TextureIO.swift",
+
+                "Renderer.swift",
+                "Renderer_Actions.swift",
+                "Renderer_CPURaster.swift",
+                "Renderer_PasteMerge.swift",
+                "Renderer_Replay.swift",
+                "Renderer_Resources.swift",
+                "Renderer_StrokeGeometry.swift",
+                "RendererTypes.swift",
+                "PixelBuffers.swift",
+                "CGCompat.swift",
+                
+                "GPExport.swift"
+            ],
             resources: [.process("noise.png"),
                         .copy("ArtRenderShaders.metallib"),
             /* ,
