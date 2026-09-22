@@ -1,7 +1,8 @@
 import Foundation
-//#if os(Linux)
-//import CoreFoundation
-//#endif
+#if os(Linux)
+import CoreFoundation
+import Silica
+#endif
 
 
 // MARK: - Stroke and Pen Types

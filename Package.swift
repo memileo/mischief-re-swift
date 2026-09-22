@@ -84,7 +84,7 @@ package.dependencies.append(contentsOf: [
 ])
 
 package.targets = package.targets.map { target in
-    var target = target
+    let target = target
     if target.name == "ArtRenderLibrary" {
         target.dependencies.append(contentsOf: [
             .product(name: "Silica", package: "silica"),

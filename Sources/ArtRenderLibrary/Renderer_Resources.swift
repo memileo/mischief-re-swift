@@ -2,7 +2,7 @@ import Foundation
 #if os(Linux)
 import Silica
 import CoreFoundation
-//import Cairo
+import Cairo
 import JPEG
 #elseif os(macOS)
 import CoreGraphics
@@ -26,11 +26,12 @@ extension Renderer {
             print("DEBUG: Noise image already loaded")
             return
         }
-        
-#if os(macOS)
+
         // Get the plugin's bundle
         let pluginBundle = Bundle(for: type(of: self))
         print("DEBUG: Plugin bundle path: \(pluginBundle.bundlePath)")
+        
+#if os(macOS)
         
         // Find the ArtRenderLibrary bundle inside the plugin's resources
         guard let bundleURL = pluginBundle.url(forResource: "art2png_ArtRenderLibrary", withExtension: "bundle"),
@@ -74,12 +75,15 @@ extension Renderer {
         normalizeNoiseImage()
         
 #elseif os(Linux)
-        // On Linux, try loading from common filesystem paths
+        let pluginBundleString:String = pluginBundle.bundlePath
+//         print("pluginBundleString: ", pluginBundleString)
+
         let searchPaths = [
-            "./\(name)",
-            "./resources/\(name)",
-            "./Textures/\(name)",
-            "/usr/share/art2png/\(name)"
+//             "\(pluginBundleString)/\(name)",
+//             "\(pluginBundleString)/resources/\(name)",
+//             "\(pluginBundleString)/Textures/\(name)",
+//             "/usr/share/art2png/\(name)",
+            "\(pluginBundleString)/art2png_ArtRenderLibrary.resources/\(name)"
         ]
         
         for path in searchPaths {

@@ -1,6 +1,6 @@
 import Foundation
 #if os(Linux)
-//import Silica
+import Silica
 import CoreFoundation
 //import Cairo
 //import JPEG

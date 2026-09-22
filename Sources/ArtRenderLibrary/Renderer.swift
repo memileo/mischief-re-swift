@@ -1,7 +1,7 @@
 import Foundation
 #if os(Linux)
 import Silica
-//import CoreFoundation
+import CoreFoundation
 //import Cairo
 //import JPEG
 #elseif os(macOS)
@@ -115,54 +115,6 @@ public final class Renderer {
         
 #endif
     }
-        
-    
-#if os(Linux)
-    /// Load a CGImage from image data on Linux using Cairo and swift-jpeg.
-    static func loadImageFromData(_ data: Data) -> CGImage? {
-        // Try PNG
-        if let surface = try? Cairo.Surface.Image(png: data) {
-            return CGImage(surface: surface)
-        }
-        
-        // Try JPEG
-        // Convert data to a byte array to be used as the stream source
-        var bytes = [UInt8](data)
-        
-        // Pass the array directly as the stream source
-        if let image: JPEG.Data.Rectangular<JPEG.Common> = try? .decompress(stream: &bytes) {
-            let rgb = image.unpack(as: JPEG.RGB.self)
-            let width = image.size.x
-            let height = image.size.y
-            
-            // Convert RGB to ARGB (add alpha channel)
-            var argbPixels: [UInt8] = []
-            argbPixels.reserveCapacity(width * height * 4)
-            for pixel in rgb {
-                argbPixels.append(contentsOf: [pixel.r, pixel.g, pixel.b, 0xFF])
-            }
-            
-            // Use bufferPointer to match Cairo's UnsafeMutablePointer<UInt8>
-            let surface = argbPixels.withUnsafeMutableBufferPointer { bufferPointer -> Cairo.Surface.Image? in
-                guard let baseAddress = bufferPointer.baseAddress else { return nil }
-                return try? Cairo.Surface.Image(
-                    mutableBytes: baseAddress,
-                    format: .argb32,
-                    width: width,
-                    height: height,
-                    stride: width * 4
-                )
-            }
-            
-            if let surface = surface {
-                return CGImage(surface: surface)
-            }
-        }
-        
-        return nil
-    }
-#endif
-    
     
     // MARK: - Main Render Function
     public func render(art: ArtParser) -> CGImage? {
@@ -806,7 +758,8 @@ public final class Renderer {
         
         return context.makeImage()
     }
-    
+
+#if canImport(Metal)
     // Resampled-stamp GPU rendering via renderStrokesInOrderSync. Action order is
     // preserved by flushing GPU runs at every cut/paste boundary:
     //   - strokes     -> stamp batches in the current run (draw or erase kind)
@@ -960,8 +913,9 @@ public final class Renderer {
         
         return context.makeImage()
     }
-    
+#endif
 }
+
 // MARK: - Performance Monitoring
 internal class PerformanceMonitor {
     static let shared = PerformanceMonitor()
