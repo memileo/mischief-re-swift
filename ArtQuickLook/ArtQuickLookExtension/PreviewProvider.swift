@@ -12,7 +12,7 @@ class PreviewProvider: NSViewController, QLPreviewingController {
         v.translatesAutoresizingMaskIntoConstraints = false
         self.view = v
     }
-    
+        
     // macOS 12+ data-based API — implement the Swift signature exactly (do NOT add a custom @objc name)
     @objc
     func providePreview(for request: QLFilePreviewRequest,
@@ -32,6 +32,23 @@ class PreviewProvider: NSViewController, QLPreviewingController {
             return
         }
         
+        // Read group plist settings
+        let settings = Settings()
+        let plistScale = CGFloat(settings.previewScale)
+        let forceCPU:Bool
+        let useSegmentRendering:Bool
+        switch settings.renderPath {
+            case .gpuSegments:
+                forceCPU = false
+                useSegmentRendering = true
+            case .gpuStamps:
+                forceCPU = false
+                useSegmentRendering = false
+            case .cpuStamps:
+                forceCPU = true
+                useSegmentRendering = false
+        }
+        
         // 1. Get the screen's visible dimensions in POINTS (excluding dock/menu bar)
         let screenFrame = NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: 1920, height: 1080)
         let screenWidthPts = screenFrame.width
@@ -44,11 +61,11 @@ class PreviewProvider: NSViewController, QLPreviewingController {
         let screenHeightPx = screenHeightPts * backingScaleFactor
         
         // 3. Original Renderer math (now safely using native pixels)
-        let scale: CGFloat = (screenWidthPx / 1920.0 * 10).rounded() / 10
+        let scale: CGFloat = (screenWidthPx / 1920.0 * 10 * plistScale).rounded() / 10
         let height: CGFloat = (1920.0 / screenWidthPx) * screenHeightPx
-        
+
         let canvasSize = CGSize(width: 1920, height: height)
-        let renderer = Renderer(canvasSize: canvasSize, scale: scale, forceCPU: false)
+        let renderer = Renderer(canvasSize: canvasSize, scale: scale, forceCPU: forceCPU, useSegmentRendering: useSegmentRendering)
         let resultImage = renderer.render(art: art)
         
         let cgImageToShow: CGImage
@@ -96,7 +113,7 @@ class PreviewProvider: NSViewController, QLPreviewingController {
             ])
             
             // Tell QuickLook the natural size is 1920x...
-            self.preferredContentSize = canvasSize
+            self.preferredContentSize = CGSize(width: canvasSize.width * plistScale, height: canvasSize.height * plistScale)
             
             handler(nil)
         }
