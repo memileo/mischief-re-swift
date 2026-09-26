@@ -562,12 +562,17 @@ internal func createBitmapContext(size: CGSize, scale: CGFloat) -> CGContext {
 #else
     let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
     let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+    
+    let width = Int(size.width * scale)
+    let height = Int(size.height * scale)
+    let bytesPerRow = width * 4   // always consistent with width
+
     return CGContext(
         data: nil,
-        width: Int(size.width * scale),
-        height: Int(size.height * scale),
+        width: width,
+        height: height,
         bitsPerComponent: 8,
-        bytesPerRow: Int(size.width * scale * 4),
+        bytesPerRow: bytesPerRow,
         space: colorSpace,
         bitmapInfo: bitmapInfo.rawValue
     )!

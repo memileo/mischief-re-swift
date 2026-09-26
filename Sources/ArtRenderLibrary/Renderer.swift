@@ -130,15 +130,21 @@ public final class Renderer {
 #else
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
         let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        
+        let width = Int(canvasSize.width * scale)
+        let height = Int(canvasSize.height * scale)
+        let bytesPerRow = width * 4   // always consistent with width
+        
         guard let context = CGContext(
             data: nil,
-            width: Int(canvasSize.width * scale),
-            height: Int(canvasSize.height * scale),
+            width: width,
+            height: height,
             bitsPerComponent: 8,
-            bytesPerRow: Int(canvasSize.width * scale * 4),
+            bytesPerRow: bytesPerRow,
             space: colorSpace,
             bitmapInfo: bitmapInfo.rawValue
         ) else {
+            print("Creating context failed.")
             return nil
         }
 #endif

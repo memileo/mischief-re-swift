@@ -61,7 +61,7 @@ class PreviewProvider: NSViewController, QLPreviewingController {
         let screenHeightPx = screenHeightPts * backingScaleFactor
         
         // 3. Original Renderer math (now safely using native pixels)
-        let scale: CGFloat = (screenWidthPx / 1920.0 * 10 * plistScale).rounded() / 10
+        let scale: CGFloat = screenWidthPx / 1920.0 * plistScale
         let height: CGFloat = (1920.0 / screenWidthPx) * screenHeightPx
 
         let canvasSize = CGSize(width: 1920, height: height)
