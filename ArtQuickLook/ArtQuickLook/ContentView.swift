@@ -52,15 +52,17 @@ struct ScaleRow: View {
     
     static let sliderRange: ClosedRange<Double> = 0.05...2.0
     static let textRange: ClosedRange<Double> = 0.25...4.0
-    static let snapPoints: [Double] = [0.25, 0.5, 0.667, 1.0, 1.333, 2.0]
-    static let snapTolerance = 0.06
+    static let snapPoints: [Double] = [0.25, 0.5, 0.6667, 1.0, 1.333, 2.0]
+    static let snapTolerance = 0.04
     static let knobHalfWidth: CGFloat = 10
     
     @State private var text = ""
     @FocusState private var textFocused: Bool
     
     var body: some View {
-        HStack {
+        HStack (
+            alignment: .firstTextBaseline
+        ) {
             Text("Preview image scale:")
             
             VStack(spacing: 1) {
@@ -73,19 +75,22 @@ struct ScaleRow: View {
             }
             
             TextField("", text: $text)
-                .textFieldStyle(.squareBorder)
-                .frame(width: 64)
-                .multilineTextAlignment(.trailing)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 68)
+                .multilineTextAlignment(.leading)
                 .font(.body.monospacedDigit())
                 .focused($textFocused)
                 .onSubmit(commit)
+                .overlay(Text("×")
+                    .padding(.leading, 42)
+                    .multilineTextAlignment(.trailing))
                 .onChange(of: textFocused) { focused in
                     if !focused { commit() }
                 }
-            Text("×")
+//            Text("✕")
         }
         .onChange(of: store.previewScale) { _ in
-            text = Self.display(store.previewScale)   // unconditional now
+            text = Self.display(store.previewScale) // + " ×"   // unconditional now
         }
         .onAppear {
             text = Self.display(store.previewScale)
