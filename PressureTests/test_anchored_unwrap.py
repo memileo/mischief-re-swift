@@ -30,7 +30,7 @@ def calculate_rmse(predicted, actual):
 
 def main():
     # Load the test dataset
-    input_file = 'estimated-pressure-points3.json'
+    input_file = 'estimated-pressure-points4.json'
     strokes_data = load_json_data(input_file)
     
     if not strokes_data:
@@ -109,7 +109,7 @@ def main():
             plt.legend()
             plt.grid(True, alpha=0.3)
             
-            plot_path = f'debug_plots/stroke_{idx}_rmse_{(rmse / 4095):.0f}.png'
+            plot_path = f'debug_plots/stroke_{idx}_rmse_{(rmse / 4095):.2f}.png'
             plt.savefig(plot_path)
             plt.close()
 
