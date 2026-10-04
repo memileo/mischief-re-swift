@@ -1,4 +1,4 @@
-#### AI Disclaimer: In large part copy-paste coded with various LLMs.
+#### AI Disclaimer: In large part coded with various LLMs.
 <picture>
 <img width="256" height="256" alt="ArtQuickLook icon" src="https://github.com/user-attachments/assets/c6a6d8d0-b173-4a05-a013-69ba5b35be25" />
 </picture>
@@ -9,7 +9,7 @@ Swift port of [**mischief-re** by m1el](https://github.com/m1el/mischief-re) (fo
 
 [Blender GP import plugin.](https://github.com/memileo/mischief_gp_importer)
 ## **artparser:**  *macOS 12+ and Linux*
-Command line tool that outputs json print of an .art-file. An addition in this port is phase unwrapping for pen pressure: It reconstructs the compressed 4‑band sequence into full pressure range, producing mostly correct, continuous stroke width. <small>(Still some issue cases. Mostly seen in short/dot-type strokes and art files saved with the lossy compress option and then resaved without it.)</small>
+Command line tool that outputs json print of an .art-file. An addition to this port is a fix to how the pen pressure is being read.
 
 ```
 Usage: ./artparser <input_file>
