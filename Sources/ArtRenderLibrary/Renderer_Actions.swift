@@ -408,29 +408,29 @@ extension Renderer {
         return true  // Default to visible
     }
     
-    internal func isStrokeVisible(_ strokePoints: [ResampledPoint], pen: PenInfo, minRadius: CGFloat = 0.5) -> Bool {
-        guard !strokePoints.isEmpty else { return false }
-        
-        // Check if any point in the stroke has a radius large enough to be visible
-        for point in strokePoints {
-            let pressure = max(0.0, point.pressure) // Handle negative pressure
-            let p = max(0.0, min(1.0, pressure)) // Pressure is already normalized
-            
-            // Calculate minimum possible radius for this point using the ACTUAL pen info
-            let sizeMin = pen.sizeMin
-            let sizeMax = pen.size
-            let sizeRange = sizeMax - sizeMin
-            let gamma: Float = 1.0
-            let pg = powf(p, gamma)
-            let minPossibleRadius = CGFloat(sizeMin + sizeRange * pg) * 0.5 // Apply a conservative radius scale
-            
-            if minPossibleRadius >= minRadius {
-                return true
-            }
-        }
-        
-        return false
-    }
+//    internal func isStrokeVisible(_ strokePoints: [ResampledPoint], pen: PenInfo, minRadius: CGFloat = 0.5) -> Bool {
+//        guard !strokePoints.isEmpty else { return false }
+//
+//        // Check if any point in the stroke has a radius large enough to be visible
+//        for point in strokePoints {
+//            let pressure = max(0.0, point.pressure) // Handle negative pressure
+//            let p = max(0.0, min(1.0, pressure)) // Pressure is already normalized
+//
+//            // Calculate minimum possible radius for this point using the ACTUAL pen info
+//            let sizeMin = pen.sizeMin * pen.size
+//            let sizeMax = pen.size
+//            let sizeRange = sizeMax - sizeMin
+//            let gamma: Float = 1.0
+//            let pg = powf(p, gamma)
+//            let minPossibleRadius = CGFloat(sizeMin + sizeRange * pg) * 0.5 // Apply a conservative radius scale
+//
+//            if minPossibleRadius >= minRadius {
+//                return true
+//            }
+//        }
+//
+//        return false
+//    }
     
     // MARK: - Value Parsing
     internal func parseMatrixRobust(_ v: Any?) -> [[Double]]? {

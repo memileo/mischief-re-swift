@@ -1596,7 +1596,7 @@ public struct ArtParser {
                 action["type"] = Int(readUInt32LE())
                 action["noise"] = readFloat()
                 action["size"] = readFloat()
-                action["size_min"] = readFloat()
+                action["size_min"] = Float(1.0) - readFloat() // invert. 0 = full pressure range, 1 = no pressure range
                 action["opacity"] = readFloat()
                 action["opacity_min"] = readFloat()
             case 0x35:

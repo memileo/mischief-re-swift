@@ -568,17 +568,12 @@ internal func pressureToRadiusOpacity(pressure: Float, pen: PenInfo, radiusScale
     let pg = powf(p, gamma)
     
     // Optimized radius calculation
-    let sizeMin = pen.sizeMin
+    let sizeMin = pen.sizeMin * pen.size
     let sizeMax = pen.size
     let sizeRange = sizeMax - sizeMin
     
     
-    var radius = CGFloat(sizeMin + sizeRange * pg) * radiusScale
-    
-    
-    // Ensure minimum visible radius with optimized threshold
-    let minVisibleRadius: CGFloat = max(0.5, CGFloat(sizeMin) * 0.5)
-    radius = max(radius, minVisibleRadius)
+    let radius = CGFloat(sizeMin + sizeRange * pg) * radiusScale
     
     // Optimized opacity calculation
     let opMin = pen.opacityMin

@@ -147,7 +147,7 @@ extension Renderer {
             let (radius, opacity) = pressureToRadiusOpacity(
                 pressure: point.pressure, pen: pen,
                 radiusScale: radiusScale, gamma: 1.1)
-            if radius < 0.5 || opacity < 0.01 { continue }
+            if radius < 0.2 || opacity < 0.01 { continue }
             visiblePoints.append((point.location, radius, opacity))
         }
         if visiblePoints.isEmpty { return }
@@ -189,9 +189,9 @@ extension Renderer {
         in context: CGContext,
         radiusScale: CGFloat
     ) {
-        if !isStrokeVisible(resampledPoints, pen: pen) {
-            return
-        }
+//        if !isStrokeVisible(resampledPoints, pen: pen) {
+//            return
+//        }
         
         let canvasW = context.width
         let canvasH = context.height
@@ -215,7 +215,7 @@ extension Renderer {
         for i in 0..<resampledPoints.count {
             let pressure = max(0, resampledPoints[i].pressure)
             let (r, a) = pressureToRadiusOpacity(pressure: pressure, pen: pen, radiusScale: radiusScale, gamma: 1.0)
-            if r < 0.5 || a < 0.01 { continue }
+            if r < 0.2 || a < 0.01 { continue }
             visiblePoints.append((i, r, a))
         }
         if visiblePoints.isEmpty { return }
