@@ -53,8 +53,9 @@ App that contains a quick look extension to preview .art files. Select a file in
 
 **artparser:**
 1. ```git clone https://github.com/memileo/mischief-re-swift.git```
-2. ```cd mischief-re-swift/Sources/ArtParser```
-3. ```swiftc -whole-module-optimization -O artparser.swift lzunpack.swift EmptyArtData.swift PressureEval.swift -o artparser```
+2. ```cd mischief-re-swift```
+3. ```mkdir build && cd Sources/ArtParser```
+4. ```swiftc -whole-module-optimization -O artparser.swift lzunpack.swift EmptyArtData.swift PressureEval.swift -o ../../build/artparser```
 
 **art2png:**
 1. ```git clone https://github.com/memileo/mischief-re-swift.git```
@@ -69,5 +70,5 @@ App that contains a quick look extension to preview .art files. Select a file in
 4. Second build **ArtQuickLook** scheme
 
 # State:
-There are several known bugs.
+There are some known bugs.
 Most files saved with the latest Mischief version should render mostly fine.
