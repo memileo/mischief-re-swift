@@ -111,6 +111,27 @@ class MetalRenderer {
     // GPU target (private storage) used by compute shaders
     private(set) var gpuRenderTarget: MTLTexture?
     
+    // ── Live view (interactive pan / zoom / rotate preview) ──
+    // See MetalRenderer_LiveCompositing.swift / MetalRenderer_LivePresent.swift.
+    internal var liveCompositeLayerPipeline: MTLComputePipelineState?
+    internal var livePaperBackgroundPipeline: MTLComputePipelineState?
+    internal var livePresentPipeline: MTLRenderPipelineState?
+    internal var livePresentPipelineRGBA: MTLRenderPipelineState?
+    internal var liveCanvasTexture: MTLTexture?          // premultiplied, mipmapped
+    internal var liveBackgroundTexture: MTLTexture?      // opaque, mipmapped
+    internal var livePaperTexture: MTLTexture?           // art's paper JPEG
+    /// 1×1 stand-in bound when a document has no paper texture.
+    internal static var placeholderTexture: MTLTexture?
+    /// One buffer per in-flight frame: MTKView can have several drawables in flight, and
+    /// they must not share the transform uniform.
+    internal var livePresentUniformsBuffers: [MTLBuffer] = []
+    internal var livePresentUniformsIndex = 0
+    /// Linear sampling **with mips**, so zooming out below 1:1 does not alias.
+    internal var livePresentSampler: MTLSamplerState?
+    /// Set once the live pipelines exist. A stale metallib (missing the live
+    /// kernels) leaves this false and callers fall back to the static path.
+    internal var liveCompositingPrepared = false
+    
     // CPU-readable staging texture (shared storage) used for readback after blit
     private(set) var stagingTexture: MTLTexture?
     
@@ -478,6 +499,28 @@ extension MetalRenderer {
         flipTransform: CGAffineTransform? = nil
     ) throws -> CGImage? {
         
+        try renderSegmentGroups(
+            layerOps: layerOps,
+            width: width, height: height,
+            artToDevice: artToDevice,
+            flipTransform: flipTransform)
+        
+        let staging8bit = try convertFloatTextureTo8bitSync(gpuRenderTarget!)
+        return try readbackToCGImageSync(staging8bit)
+    }
+    
+    /// Rasterises the layer operations into `gpuRenderTarget` and stops there.
+    ///
+    /// This is `renderSegmentGroupsInOrderSync` without the 8-bit conversion and the
+    /// CPU readback: the live view composites the result on the GPU instead. Callers
+    /// must consume/replace `gpuRenderTarget` before issuing the next layer.
+    func renderSegmentGroups(
+        layerOps: [LayerOperation],
+        width: Int, height: Int,
+        artToDevice: CGAffineTransform,
+        flipTransform: CGAffineTransform? = nil
+    ) throws {
+        
         try ensureRenderTargets(width: width, height: height)
         guard gpuRenderTarget != nil else {
             throw MetalRendererError.textureCreationFailed
@@ -541,10 +584,7 @@ extension MetalRenderer {
             }
         }
         
-        try flushMergeFragment()                           // before readback
-        
-        let staging8bit = try convertFloatTextureTo8bitSync(gpuRenderTarget!)
-        return try readbackToCGImageSync(staging8bit)
+        try flushMergeFragment()                           // before the caller consumes it
     }
     
     // MARK: - Render Target Lifecycle
@@ -813,6 +853,7 @@ enum MetalRendererError: Error, LocalizedError {
     case invalidTextureRegion
     case bufferAccessFailed
     case shaderFileNotFound(String)
+    case unsupportedDrawable
     
     var errorDescription: String? {
         switch self {
@@ -862,6 +903,8 @@ enum MetalRendererError: Error, LocalizedError {
                 return "bufferAccessFailed"
             case .shaderFileNotFound(let name):
                 return "⚠︎ \(name) not found."
+            case .unsupportedDrawable:
+                return "unsupportedDrawable"
         }
     }
 }

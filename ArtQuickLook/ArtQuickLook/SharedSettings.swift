@@ -11,7 +11,7 @@ enum AppGroup {
 }
 
 enum RenderPath: String, CaseIterable, Identifiable {
-    case gpuSegments, gpuStamps, cpuStamps
+    case gpuSegments, gpuStamps, cpuStamps, liveMetal
     
     var id: Self { self }
     
@@ -20,8 +20,13 @@ enum RenderPath: String, CaseIterable, Identifiable {
             case .gpuSegments: return "GPU SDF segments (Default)"
             case .gpuStamps:   return "GPU stamps"
             case .cpuStamps:   return "CPU stamps"
+            case .liveMetal:   return "Live Metal view (pan / zoom / rotate)"
         }
     }
+    
+    /// The live view is a Metal view mode, not a static render path: it is
+    /// composited on the GPU and presented through an MTKView.
+    var isLiveView: Bool { self == .liveMetal }
 }
 
 private enum Keys {

@@ -34,10 +34,81 @@ class PreviewProvider: NSViewController, QLPreviewingController {
         
         // Read group plist settings
         let settings = Settings()
-        let plistScale = CGFloat(settings.previewScale)
-        let forceCPU:Bool
-        let useSegmentRendering:Bool
-        switch settings.renderPath {
+        let geometry = PreviewGeometry(settings: settings)
+        
+        // The live Metal view is a different kind of preview: it keeps an MTKView
+        // around instead of producing one image, and falls back to the static path
+        // whenever Metal/the live kernels are unavailable.
+        if settings.renderPath.isLiveView {
+            presentLivePreview(art: art, geometry: geometry, handler: handler)
+            return
+        }
+        
+        // Static path: render synchronously (as before), then install on the main thread.
+        let cgImageToShow = renderStaticImage(art: art, geometry: geometry)
+        DispatchQueue.main.async {
+            guard let image = cgImageToShow else {
+                handler(NSError(domain: "ArtRenderer", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to create test image"]))
+                return
+            }
+            self.installStaticPreview(image, geometry: geometry)
+            handler(nil)
+        }
+    }
+    
+    // MARK: - Live Metal view
+    
+    private var liveSession: LivePreviewSession?
+    
+    private func presentLivePreview(art: ArtParser,
+                                    geometry: PreviewGeometry,
+                                    handler: @escaping (Error?) -> Void) {
+        DispatchQueue.main.async {
+            let session: LivePreviewSession
+            do {
+                // The live view shows a document raster, so a scale below 1x would only
+                // make it blurry — floor it at 1x.
+                session = try LivePreviewSession(art: art,
+                                                 canvasSize: geometry.canvasSize,
+                                                 scale: max(1.0, geometry.scale))
+            } catch {
+                NSLog("ArtQuickLook live view unavailable: \(error.localizedDescription) — using static preview")
+                self.renderStaticPreviewInBackground(art: art, geometry: geometry, handler: handler)
+                return
+            }
+            
+            self.liveSession = session
+            self.replaceContent(with: session.view)
+            self.preferredContentSize = geometry.preferredContentSize
+            
+            // Tell Quick Look we are ready right away: the GPU render happens on a
+            // background queue and lands in the view when it is done.
+            handler(nil)
+            
+            session.render(onReady: { [weak self] view in
+                // The view may only have its real size now; force one frame at it.
+                view.needsLayout = true
+                view.layoutSubtreeIfNeeded()
+                view.needsDisplay = true
+                self?.preferredContentSize = geometry.preferredContentSize
+            }, onFailure: { [weak self] error in
+                NSLog("ArtQuickLook live render failed: \(error.localizedDescription) — using static preview")
+                guard let self = self else { return }
+                self.liveSession = nil
+                // The preview was already announced to Quick Look, so just swap the
+                // content instead of calling the completion handler a second time.
+                self.renderStaticPreviewInBackground(art: art, geometry: geometry, handler: nil)
+            })
+        }
+    }
+    
+    // MARK: - Static (single image) preview
+    
+    /// Renders the document the "old" way: one image, CPU/CoreGraphics compositing.
+    private func renderStaticImage(art: ArtParser, geometry: PreviewGeometry) -> CGImage? {
+        let forceCPU: Bool
+        let useSegmentRendering: Bool
+        switch geometry.renderPath {
             case .gpuSegments:
                 forceCPU = false
                 useSegmentRendering = true
@@ -47,78 +118,83 @@ class PreviewProvider: NSViewController, QLPreviewingController {
             case .cpuStamps:
                 forceCPU = true
                 useSegmentRendering = false
+            case .liveMetal:
+                forceCPU = false
+                useSegmentRendering = true
         }
         
-        // 1. Get the screen's visible dimensions in POINTS (excluding dock/menu bar)
-        let screenFrame = NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: 1920, height: 1080)
-        let screenWidthPts = screenFrame.width
-        let screenHeightPts = screenFrame.height
-        
-    
-        // 2. Calculate native PIXELS for the renderer so it draws at full Retina density
-        let backingScaleFactor = NSScreen.main?.backingScaleFactor ?? 1.0
-        let screenWidthPx = screenWidthPts * backingScaleFactor
-        let screenHeightPx = screenHeightPts * backingScaleFactor
-        
-        // 3. Original Renderer math (now safely using native pixels)
-        let scale: CGFloat = screenWidthPx / 1920.0 * plistScale
-        let height: CGFloat = (1920.0 / screenWidthPx) * screenHeightPx
-
-        let canvasSize = CGSize(width: 1920, height: height)
-        let renderer = Renderer(canvasSize: canvasSize, scale: scale, forceCPU: forceCPU, useSegmentRendering: useSegmentRendering)
+        let renderer = Renderer(canvasSize: geometry.canvasSize,
+                                scale: geometry.scale,
+                                forceCPU: forceCPU,
+                                useSegmentRendering: useSegmentRendering)
         let resultImage = renderer.render(art: art)
         
-        let cgImageToShow: CGImage
-        if let r = resultImage {
-            cgImageToShow = r
-        } else {
-            // Ensure the test image matches the intended render resolution
-            let pixelWidth = Int(canvasSize.width * scale)
-            let pixelHeight = Int(canvasSize.height * scale)
-            guard let test = makeTestImage(w: pixelWidth, h: pixelHeight, color: .systemPink) else {
-                handler(NSError(domain: "ArtRenderer", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to create test image"]))
-                return
-            }
-            cgImageToShow = test
-        }
+        if let image = resultImage { return image }
         
-        DispatchQueue.main.async {
-            self.view.subviews.forEach { $0.removeFromSuperview() }
-            
-            // 1. Replace NSImageView with a basic NSView
-            let imageView = NSView()
-            imageView.translatesAutoresizingMaskIntoConstraints = false
-            imageView.wantsLayer = true
-            
-            // 2. Assign the CGImage directly to the layer
-            imageView.layer?.contents = cgImageToShow
-            
-            // 3. .resizeAspect scales the image proportionally to fit the view bounds.
-            // It acts exactly like .scaleProportionallyUpOrDown, but at the GPU level.
-            imageView.layer?.contentsGravity = .resizeAspect
-            imageView.layer?.masksToBounds = true
-            
-            // 4. Crucial for Retina: Tell the layer how many pixels per point to use
-            // so it maps the 2x backing pixels to the 1x logical points perfectly.
-            let backingScaleFactor = NSScreen.main?.backingScaleFactor ?? 1.0
-            imageView.layer?.contentsScale = backingScaleFactor
-            
-            self.view.addSubview(imageView)
-            
-            NSLayoutConstraint.activate([
-                imageView.leadingAnchor.constraint(equalTo: self.view.leadingAnchor),
-                imageView.trailingAnchor.constraint(equalTo: self.view.trailingAnchor),
-                imageView.topAnchor.constraint(equalTo: self.view.topAnchor),
-                imageView.bottomAnchor.constraint(equalTo: self.view.bottomAnchor)
-            ])
-            
-            // Tell QuickLook the natural size is 1920x...
-            self.preferredContentSize = CGSize(width: canvasSize.width * plistScale, height: canvasSize.height * plistScale)
-            
-            handler(nil)
+        // Ensure the test image matches the intended render resolution
+        let pixelWidth = Int(geometry.canvasSize.width * geometry.scale)
+        let pixelHeight = Int(geometry.canvasSize.height * geometry.scale)
+        return makeTestImage(w: pixelWidth, h: pixelHeight, color: .systemPink)
+    }
+    
+    /// Static fallback after the live view was already handed to Quick Look: render off
+    /// the main thread, then swap the content in.
+    private func renderStaticPreviewInBackground(art: ArtParser,
+                                                 geometry: PreviewGeometry,
+                                                 handler: ((Error?) -> Void)?) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let image = self.renderStaticImage(art: art, geometry: geometry)
+            DispatchQueue.main.async {
+                guard let image = image else {
+                    NSLog("ArtQuickLook static preview fallback failed")
+                    handler?(NSError(domain: "ArtRenderer", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to create test image"]))
+                    return
+                }
+                self.installStaticPreview(image, geometry: geometry)
+                handler?(nil)
+            }
         }
     }
-
+    
+    private func installStaticPreview(_ cgImageToShow: CGImage, geometry: PreviewGeometry) {
+        // 1. Replace NSImageView with a basic NSView
+        let imageView = NSView()
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.wantsLayer = true
+        
+        // 2. Assign the CGImage directly to the layer
+        imageView.layer?.contents = cgImageToShow
+        
+        // 3. .resizeAspect scales the image proportionally to fit the view bounds.
+        // It acts exactly like .scaleProportionallyUpOrDown, but at the GPU level.
+        imageView.layer?.contentsGravity = .resizeAspect
+        imageView.layer?.masksToBounds = true
+        
+        // 4. Crucial for Retina: Tell the layer how many pixels per point to use
+        // so it maps the 2x backing pixels to the 1x logical points perfectly.
+        let backingScaleFactor = NSScreen.main?.backingScaleFactor ?? 1.0
+        imageView.layer?.contentsScale = backingScaleFactor
+        
+        replaceContent(with: imageView)
+        
+        // Tell QuickLook the natural size is 1920x...
+        preferredContentSize = geometry.preferredContentSize
+    }
+    
+    /// Replaces the preview content with `content`, filling the whole view.
+    private func replaceContent(with content: NSView) {
+        self.view.subviews.forEach { $0.removeFromSuperview() }
+        // Programmatic views autoresize by default; we drive the frame with constraints.
+        content.translatesAutoresizingMaskIntoConstraints = false
+        self.view.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: self.view.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: self.view.trailingAnchor),
+            content.topAnchor.constraint(equalTo: self.view.topAnchor),
+            content.bottomAnchor.constraint(equalTo: self.view.bottomAnchor)
+        ])
+    }
+    
     func makeTestImage(w: Int, h: Int, color: NSColor = .systemBlue) -> CGImage? {
         let cs = CGColorSpaceCreateDeviceRGB()
         guard let ctx = CGContext(data: nil,
@@ -130,12 +206,43 @@ class PreviewProvider: NSViewController, QLPreviewingController {
                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
         ctx.setFillColor(color.cgColor)
         ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
-        // example additional content so it’s obvious
+        // example additional content so it's obvious
         ctx.setFillColor(NSColor.red.cgColor)
         ctx.fillEllipse(in: CGRect(x: 20, y: 20, width: 80, height: 80))
         return ctx.makeImage()
     }
-
 }
 
+/// Everything derived from the shared settings that both preview modes need.
+struct PreviewGeometry {
+    let renderPath: RenderPath
+    /// Art canvas in points (1920 wide, aspect from the main screen).
+    let canvasSize: CGSize
+    /// Device scale for the static render path.
+    let scale: CGFloat
+    /// Size Quick Look should give the preview window.
+    let preferredContentSize: CGSize
 
+    init(settings: Settings) {
+        let plistScale = CGFloat(settings.previewScale)
+        self.renderPath = settings.renderPath
+        
+        // 1. Get the screen's visible dimensions in POINTS (excluding dock/menu bar)
+        let screenFrame = NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        let screenWidthPts = screenFrame.width
+        let screenHeightPts = screenFrame.height
+        
+        // 2. Calculate native PIXELS for the renderer so it draws at full Retina density
+        let backingScaleFactor = NSScreen.main?.backingScaleFactor ?? 1.0
+        let screenWidthPx = screenWidthPts * backingScaleFactor
+        let screenHeightPx = screenHeightPts * backingScaleFactor
+        
+        // 3. Original Renderer math (now safely using native pixels)
+        self.scale = screenWidthPx / 1920.0 * plistScale
+        let height: CGFloat = (1920.0 / screenWidthPx) * screenHeightPx
+        
+        self.canvasSize = CGSize(width: 1920, height: height)
+        self.preferredContentSize = CGSize(width: canvasSize.width * plistScale,
+                                           height: canvasSize.height * plistScale)
+    }
+}

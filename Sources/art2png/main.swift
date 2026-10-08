@@ -24,6 +24,9 @@ func main() {
         print("  --catmull-rom          GP: Export raw control points for Catmull-Rom strokes (skip resampling)")
         print("  --cpu                  macOS only: Render strokes on CPU instead of GPU/Metal.")
         print("  --stamp                macOS only: Use circle stamps instead of segments for Metal/GPU")
+        print("  --live                 macOS only: Also render through the live Metal canvas path")
+        print("                          (writes <input>-live.png next to the normal output)")
+        print("  --live-only            macOS only: Only render the live canvas path")
     }
     
     guard args.count > 1 else {
@@ -40,6 +43,8 @@ func main() {
     var catmullRom: Bool = false
     var forceCPU: Bool = false
     var useSegmentRendering = true
+    var useLiveCanvas = false
+    var liveOnly = false
     
     var i = 1
     while i < args.count {
@@ -84,6 +89,13 @@ func main() {
         } else if args[i] == "--stamp" {
             useSegmentRendering = false
             i += 1
+        } else if args[i] == "--live" {
+            useLiveCanvas = true
+            i += 1
+        } else if args[i] == "--live-only" {
+            useLiveCanvas = true
+            liveOnly = true
+            i += 1
         } else if args[i] == "--help" || args[i] == "-h" {
             info()
             exit(1)
@@ -113,6 +125,9 @@ func main() {
         exit(1)
     }
     
+    let inputURL = URL(fileURLWithPath: inputPath)
+    let outputPath = inputURL.deletingPathExtension().appendingPathExtension("png").path
+    
     let canvasSize = CGSize(width: 1920, height: 1080)
     let renderer = Renderer(canvasSize: canvasSize, scale: scale, forceCPU: forceCPU, useSegmentRendering: useSegmentRendering)
     
@@ -133,14 +148,40 @@ func main() {
         }
     }
     
+    // ── Live Metal canvas path (what the interactive preview shows) ──
+#if canImport(Metal)
+    if useLiveCanvas {
+        guard let live = renderer.renderLive(art: art) else {
+            print("Error: Live Metal canvas render failed")
+            exit(1)
+        }
+        guard let liveImage = renderer.livePreviewImage(
+            live,
+            transform: LiveViewTransform(),
+            size: CGSize(width: Int(live.pixelSize.width), height: Int(live.pixelSize.height)))
+        else {
+            print("Error: Failed to render/read back the live preview")
+            exit(1)
+        }
+        let livePath = inputURL.deletingPathExtension().appendingPathExtension("live.png").path
+        saveCGImageAsPNG(liveImage, to: livePath)
+        print("Live canvas (\(Int(live.pixelSize.width))×\(Int(live.pixelSize.height))): \(livePath)")
+        
+        if liveOnly { exit(0) }
+    }
+#else
+    if useLiveCanvas {
+        print("Error: --live / --live-only require macOS (Metal)")
+        exit(1)
+    }
+#endif
+    
     // ── Normal PNG render path ──
     guard let image = renderer.render(art: art) else {
         print("Error: Failed to render art")
         exit(1)
     }
     
-    let inputURL = URL(fileURLWithPath: inputPath)
-    let outputPath = inputURL.deletingPathExtension().appendingPathExtension("png").path
     saveCGImageAsPNG(image, to: outputPath)
     print("Successfully rendered \(inputPath) to \(outputPath)")
 }

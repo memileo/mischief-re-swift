@@ -36,7 +36,6 @@ let package = Package(
                 .unsafeFlags(["-O", "-whole-module-optimization"], .when(configuration: .release))
             ]
         ),
-        // Library target
         .target(
             name: "ArtRenderLibrary",
             dependencies: ["ArtParser"],
@@ -57,6 +56,13 @@ let package = Package(
                 "PixelBuffers.swift",
                 "CGCompat.swift",
                 
+                // Live Metal view (interactive pan/zoom/rotate preview)
+                "LiveViewTransform.swift",
+                "LiveRenderedCanvas.swift",
+                "MetalRenderer_LiveCompositing.swift",
+                "MetalRenderer_LivePresent.swift",
+                "Renderer_Live.swift",
+                
                 "GPExport.swift"
             ],
             resources: [.process("noise.png"),
@@ -69,6 +75,13 @@ let package = Package(
                 .unsafeFlags(["-framework", "CoreImage"], .when(platforms: [.macOS])),
                 .unsafeFlags(["-framework", "AppKit"], .when(platforms: [.macOS]))
             ]
+        ),
+        // Tests for the platform-independent parts (live view transform maths).
+        // These run on Linux as well as macOS.
+        .testTarget(
+            name: "ArtRenderLibraryTests",
+            dependencies: ["ArtRenderLibrary"],
+            path: "Tests/ArtRenderLibraryTests"
         ),
     ]
 )
@@ -90,6 +103,11 @@ package.targets = package.targets.map { target in
             .product(name: "Silica", package: "silica"),
             .product(name: "Cairo", package: "cairo"),
             .product(name: "JPEG", package: "swift-jpeg"),
+        ])
+    }
+    if target.name == "ArtRenderLibraryTests" {
+        target.dependencies.append(contentsOf: [
+            .product(name: "Silica", package: "silica"),
         ])
     }
     return target

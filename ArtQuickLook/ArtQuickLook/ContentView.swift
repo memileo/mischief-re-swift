@@ -2,12 +2,16 @@ import SwiftUI
 
 final class SettingsStore: ObservableObject {
     private var settings: Settings
+    /// Last selected static render path, so un-toggling the live view restores it.
+    private var lastStaticPath: RenderPath = .gpuSegments
     
     @Published var previewScale: Double     { didSet { settings.previewScale = previewScale } }
-    @Published var renderPath: RenderPath   { didSet { settings.renderPath = renderPath } }
+    @Published var renderPath: RenderPath   { didSet { settings.renderPath = renderPath; liveViewEnabled = renderPath.isLiveView } }
     @Published var useCache: Bool           { didSet { settings.useCache = useCache } }
     @Published var cacheSizeMB: Int         { didSet { settings.cacheSizeMB = cacheSizeMB } }
     @Published var generateThumbnails: Bool { didSet { settings.generateThumbnails = generateThumbnails } }
+    /// Mirror of `renderPath.isLiveView`, published so the toggle repaints on its own.
+    @Published private(set) var liveViewEnabled = false
     
     init(settings: Settings = Settings()) {
         self.settings = settings
@@ -17,6 +21,26 @@ final class SettingsStore: ObservableObject {
         useCache = settings.useCache
         cacheSizeMB = settings.cacheSizeMB
         generateThumbnails = settings.generateThumbnails
+        liveViewEnabled = renderPath.isLiveView
+        lastStaticPath = Self.staticRenderPaths.first(where: { $0 == renderPath }) ?? .gpuSegments
+    }
+    
+    /// The static (single image) render paths. The live view is not one of them.
+    static let staticRenderPaths: [RenderPath] = RenderPath.allCases.filter { !$0.isLiveView }
+    
+    /// Binding target for the "Live Metal view" toggle: turning it on switches to
+    /// `.liveMetal`, turning it off restores the previously selected static path.
+    var liveViewToggle: Binding<Bool> {
+        Binding(
+            get: { self.liveViewEnabled },
+            set: { enabled in
+                if enabled {
+                    if !self.renderPath.isLiveView { self.lastStaticPath = self.renderPath }
+                    self.renderPath = .liveMetal
+                } else if self.renderPath.isLiveView {
+                    self.renderPath = self.lastStaticPath
+                }
+            })
     }
 }
 
@@ -28,9 +52,16 @@ struct ContentView: View {
             ScaleRow(store: store)
             
             Picker("Render using:", selection: $store.renderPath) {
-                ForEach(RenderPath.allCases) { Text($0.label).tag($0) }
+                ForEach(SettingsStore.staticRenderPaths) { Text($0.label).tag($0) }
             }
             .pickerStyle(.radioGroup)
+            
+            Toggle("Live Metal view", isOn: store.liveViewToggle)
+                .help("Interactive GPU view: pan / zoom / rotate without re-rendering.")
+            
+            if store.liveViewEnabled {
+                LiveViewHelp()
+            }
             
 //            CacheRow(store: store)
             
@@ -44,6 +75,35 @@ struct ContentView: View {
         }
         .padding(20)
         .frame(minWidth: 600, idealWidth: 650, maxWidth: 850) // min/default window size
+    }
+}
+
+/// Shortcut reference for the live view, shown while the live view is enabled.
+struct LiveViewHelp: View {
+    private let rows: [(String, String)] = [
+        ("MMB drag", "Pan"),
+        ("MMB + ⌘ drag", "Zoom"),
+        ("MMB + ⇧ drag", "Rotate"),
+        ("0 / P / Z / R", "Reset view / pan / zoom / rotation")
+    ]
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(rows, id: \.0) { keys, action in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(keys)
+                        .font(.caption.monospaced())
+                        .frame(width: 130, alignment: .leading)
+                    Text(action)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Text("“Preview image scale” sets the document raster resolution (minimum 1×) in live view.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.top, 4)
+        }
     }
 }
 

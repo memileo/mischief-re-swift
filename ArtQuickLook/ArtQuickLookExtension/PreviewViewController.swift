@@ -6,7 +6,7 @@ import Metal
 import os.log
 
 class PreviewViewController: NSViewController, QLPreviewingController {
-//    @IBOutlet var imageView: NSImageView!
+    @IBOutlet var imageView: NSImageView!
     
     private let logger = Logger(subsystem: "org.potato.ArtQuickLook", category: "Preview")
     

@@ -322,27 +322,20 @@ public final class Renderer {
     }
     
     // MARK: - Layer Rendering Drivers
-    internal func renderLayerIsolated(
-        layer: [String: Any],
-        layerIndex: Int,
+    
+    /// Walks `art.actions` in order and turns the actions belonging to `layerIndex`
+    /// into the GPU operation list (strokes, cuts, pastes/merges).
+    ///
+    /// Shared by every render path: the static CGContext paths and the live Metal
+    /// canvas path differ only in how the resulting ops are rasterised/composited.
+    internal func buildLayerOperations(
         art: ArtParser,
+        layerIndex: Int,
         baseTransform: CGAffineTransform,
-        layerOpacity: Float
-    ) -> CGImage? {
-        
-        guard let matrix = layer["matrix"] as? [[Float]] else { return nil }
-        
+        flipTransform: CGAffineTransform?
+    ) -> [LayerOperation] {
         // 1. Pure Y-DOWN: Use toDirectCGTransform for everything
-        let layerTransform = toDirectCGTransform(matrix)
-        let artToDevice = CGAffineTransformConcat(layerTransform, baseTransform)
-        
-        //        let viewMatrix = art.viewMatrix
-        
-        let layerContext = createBitmapContext(size: canvasSize, scale: scale)
-        Self.clearContext(layerContext, rect: CGRect(x: 0, y: 0, width: layerContext.width, height: layerContext.height))
-        
-        // 2. Pure Y-DOWN: flipTransform MUST be nil
-        let flipTransform: CGAffineTransform? = nil
+        let flipTransform = flipTransform      // nil in the "pure Y-DOWN" paths
         
         var layerOps: [LayerOperation] = []
         //        var pendingCutRect: [Float] = []
@@ -421,6 +414,37 @@ public final class Renderer {
                 default: break
             }
         }
+        
+        return layerOps
+    }
+    
+    internal func renderLayerIsolated(
+        layer: [String: Any],
+        layerIndex: Int,
+        art: ArtParser,
+        baseTransform: CGAffineTransform,
+        layerOpacity: Float
+    ) -> CGImage? {
+        
+        guard let matrix = layer["matrix"] as? [[Float]] else { return nil }
+        
+        // 1. Pure Y-DOWN: Use toDirectCGTransform for everything
+        let layerTransform = toDirectCGTransform(matrix)
+        let artToDevice = CGAffineTransformConcat(layerTransform, baseTransform)
+        
+        //        let viewMatrix = art.viewMatrix
+        
+        let layerContext = createBitmapContext(size: canvasSize, scale: scale)
+        Self.clearContext(layerContext, rect: CGRect(x: 0, y: 0, width: layerContext.width, height: layerContext.height))
+        
+        // 2. Pure Y-DOWN: flipTransform MUST be nil
+        let layerOps = buildLayerOperations(
+            art: art,
+            layerIndex: layerIndex,
+            baseTransform: baseTransform,
+            flipTransform: nil)
+        
+        let flipTransform: CGAffineTransform? = nil
         
         // ── GP Export: accumulate layer data, skip rasterization ──
         if gpExportMode {
