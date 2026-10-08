@@ -298,6 +298,12 @@ See §9. Work in this order so each step is independently testable:
 - **7e** Fallback wiring: budget exceeded → single-raster mode; a setting to force it for
   A/B comparison.
 
+### Stage 8 — Take 4: make it correct, then fast
+See §9.3. Composition order, canvas orientation, the arena growth bug, off-screen
+culling, 32×32 live threadgroups, extra input bindings, per-stage frame timing, and the
+cache build moved to a Metal-free file so it can be tested on Linux.
+**Test:** the checklist at the end of this file, in order.
+
 ## 7b. Known limitations / deliberate choices
 
 - **Embedded images** (`art.images`) are not drawn by the live path, matching the
@@ -308,8 +314,13 @@ See §9. Work in this order so each step is independently testable:
 - **Paper texture** is baked once at canvas resolution, so it magnifies with the
   document (same as a raster preview).
 - **Drag released outside the view** ends the interaction via a `pressedMouseButtons`
-  check in the draw loop rather than delivering `otherMouseUp`.
+  check in the draw loop rather than delivering `…MouseUp`.
 - The middle button is reserved while the live view is up.
+- **Canvas row order is still unexplained.** The live canvas has to be mirrored to appear
+  upright, although the *same* texture is upright in the static path. `LiveCanvasRowOrder`
+  records the observed behaviour rather than the expected one — see §9.2(a).
+- **Per-stroke dispatches cover the whole canvas.** Correct but wasteful for large
+  documents; see §9.2(c) for why the fix is not in yet.
 
 ## 9. Take 3 — what the first working build taught us (2026-10-08)
 
@@ -394,8 +405,14 @@ The single-raster mode stays as the fallback and as the reference for `--live`.
   `LivePreviewView` (MTKView, mmb pan / mmb+cmd zoom / mmb+shift rotate, redraw gating,
   resets via keys + context menu), `LivePreviewSession`, and the `PreviewProvider`
   branch with fallback to the static path.
+- **2026-10-08** — Stages 7a–7e done (take 3: cached re-render per view change). See §9.
+- **2026-10-08** — Stage 8 done (take 4: composition order + canvas orientation fixed,
+  arena growth bug fixed, culling + 32×32 live threadgroups, extra input bindings, frame
+  timing, Metal-free cache build with Linux tests). See §9.2/§9.3.
 
 ### Follow-ups (only if something misbehaves on macOS)
+- Dispatch only the tiles a stroke touches (needs a pixel origin in the shared `Params`
+  struct — a Swift/MSL layout mismatch there would silently corrupt every segment).
 - Higher-resolution document raster for zoomed-in views.
 - HUD text in Metal instead of a CoreGraphics overlay.
 - Embedded images on the GPU (currently matched to the GPU segment path).
@@ -512,25 +529,245 @@ up via `Package.swift`) and the shader change is inside the existing
 Ordered so the cheapest, most diagnostic runs come first.
 
 1. **Orientation.** `art2png --live art/mischief-document.art` → compare
-   `<file>-live.png` with `<file>.png`. If the live one is mirrored, the present pass
-   needs `flipVertically: true` (the app exposes it as "Flip canvas vertically", and
-   `art2png --flip-y` tests it) — that settles the question in one command instead of by
-   eye in Quick Look.
+   `<file>-live.png` with `<file>.png`. The live canvas is now **mirrored by default**
+   (`LiveCanvasRowOrder.presentsMirrored`), which is the orientation macOS actually
+   showed; `art2png --no-flip-y` / the app's "Mirror canvas vertically" toggle turn it
+   back off. `--live`, `--live-only` and `--live-view` all honour it now.
 2. **Cache.** `art2png --live-cache art/*.art` (loop over the samples) → the report must
    show a sane segment count and budget, and "N rebuilt per frame" only for documents
    that really contain paste/merge actions.
 3. **Interactive path at 100%.** `art2png --live-view --viewport 1920x1080` →
    `<file>-live-view.png` should match `<file>.png` closely (same strokes, same paper;
    the AA may differ by a hair because the re-render flattens at the cache's reference
-   transform).
+   transform). Every render prints its stage breakdown now, e.g.
+   `Live view: 410 ms total (bin 95, encode 12, gpu 300, paper 3) — 2214 strokes / 321611 segments, 1 layers cached, 0 rebuilt, 0 culled`.
 4. **Interactive path zoomed in.** `--live-view --zoom 4` must show *more* detail than
    `--zoom 1`, not a magnified bitmap — that is the whole point of the re-render path.
-   Also try `--rotate 0.4` and `--pan 120,-80`.
-5. **In Quick Look:** one long middle-button drag must stay live for the whole gesture
-   (this was the "only a fraction of a second" bug); HUD shows mode + FPS (renders/sec);
-   zoom shows a percentage; the four resets work from the context menu and from
-   `0`/`P`/`Z`/`R`; nothing renders when idle (check with `sample`/`Instruments` or just
-   that the fan stays quiet).
-6. **Regression:** the three static render paths unchanged; `--live` (single raster)
+   Also try `--rotate 0.4` and `--pan 120,-80`. A zoomed-in view should cull most strokes
+   (`… N culled` in the breakdown) and get *faster* than the fit view.
+5. **Paste documents.** `art2png --live-view art/complex2.art` and a paste document in
+   Quick Look: pasted content must sit exactly where it sits in `<file>.png`, at 100% and
+   after a pan/zoom/rotate (this was the "different depth planes" bug — see §9.2).
+6. **In Quick Look:** one long drag must stay live for the whole gesture, with the left
+   button as well as the middle one, and the scroll wheel must zoom at the pointer; HUD
+   shows mode + FPS (renders/sec); zoom shows a percentage; the four resets work from the
+   context menu and from `0`/`P`/`Z`/`R`; nothing renders when idle. Slow frames
+   (>250 ms) log their breakdown to the unified log.
+7. **Regression:** the three static render paths unchanged; `--live` (single raster)
    still works; a document with pastes (`art/paste*`, `art/layers.art`) still looks
    right through the "rebuilt per frame" path.
+
+### Take 4 — what the first take-3 *interactive* build taught us (2026-10-08)
+
+Reported after building take 3 on macOS:
+
+1. **Orientation: the live image is y-flipped**, and `--flip-y` did nothing —
+   `art2png --live` simply never passed the flag through to the present pass (it only
+   did for `--live-view`). The present pass *did* have a flip, but it composed the mirror
+   **after** the clip matrix, i.e. mirrored in NDC space about the canvas height, which is
+   why the app's checkbox made the image *disappear* instead of flipping it.
+2. **Pasted content sat "on a different depth plane"** as soon as the camera changed,
+   and only in the interactive path — the static path was fine.
+3. **Very slow**: 25 s for one frame of a 321 611-segment document (the CG path takes
+   1.5 s for the same file), and it got worse with `--viewport`.
+4. **"No continuous action"**: with 25 s frames, dragging cannot feel continuous.
+5. Suggested extra bindings: lmb pan, scroll-wheel zoom, lmb+shift rotate.
+
+#### 9.2 Root causes found
+
+**(a) Reversed transform composition — the "planes" bug and the broken flip.** The live
+path composed transforms as `camera.concatenating(base)`, which applies the *camera*
+first. `a.concatenating(b)` applies **a first**, then b (identical in CoreGraphics and
+Silica), so the intended order — layer, then base, then camera — was inverted in three
+places (`LiveRenderCache.liveBaseTransform`, `artToDevice`, the cut recomposition) plus
+the `m1` recovery in the cache build and the present pass's mirror.
+
+That is invisible at 100% zoom for a plain document (a uniform-scale view matrix
+commutes with the camera, so both orders agree) and appears as soon as anything is
+rotated, panned, or the layer/paste matrices are not axis-aligned — exactly the reported
+symptom. Fixed, and pinned down by tests that check the *order* by applying each
+composition to a point (`LiveRenderCacheTests.testLiveBaseAppliesTheBaseFirst`,
+`testArtToDeviceAppliesLayerBaseCamera`, `testCutRecomposesAgainstAnyCamera`).
+
+**(b) A quadratic arena growth — the 25 s frames.** One interactive frame bins every
+stroke into a staging arena, asking for more room each time. Growth was **exact-fit**:
+`allocate` + `memcpy` + `deallocate` per stroke, and a fresh raw block is a new `mmap`, so
+every stroke also faulted every page of the growing arena back in. For 2 214 strokes and a
+~20 MB arena that is tens of gigabytes of copying and tens of millions of page faults —
+and it happened on the *first* frame only (the capacity survives), which matches "the
+image eventually shows up, then it is fine". Growth is now geometric and seeded with the
+previous frame's size (`MetalRenderer_LiveCompositing.staging(needed:)`).
+
+Measured CPU cost of the same document on Linux (`ART_LIVE_PROFILE=1 swift test
+--filter LiveProfileTests`): cache build 213 ms, camera re-mapping 8 ms — so the CPU was
+never the problem and the arena was.
+
+**(c) Per-stroke full-canvas dispatches.** Every stroke dispatches over the whole canvas
+and the kernel early-outs on empty tiles, so a 2 214-stroke document launches ~72 M
+threadgroups. Bumping the live passes from 8×8 to 32×32 threads per threadgroup (the
+kernels derive their tile from `thread_position_in_grid`, so the shape is free) cuts the
+launch count 16× with identical output. Dispatching only the tiles a stroke touches needs
+a pixel-origin in the shared `Params` struct — deliberately **not** done yet, since a
+Swift/MSL layout mismatch there would silently corrupt every segment.
+
+**(d) Off-screen strokes were rasterised anyway.** Cached strokes now carry ink bounds in
+reference space (`LiveCachedStroke.referenceBounds`) and are skipped when the
+camera-transformed box misses the viewport. A stroke that touches no pixel of the target
+cannot change a pixel, so this is free correctness-wise — and a zoomed-in frame gets much
+cheaper.
+
+#### 9.3 Take 4 changes
+
+- **Orientation**: mirror composed *inside* the canvas (`mirrored.concatenated(with: clip)`),
+  wired into `--live` / `--live-only` / `--live-view`, default on via the single constant
+  `LiveCanvasRowOrder.presentsMirrored` (app setting renamed to `mirrorLiveCanvas`,
+  default on; `art2png --no-flip-y` opts out).
+- **Composition order** fixed in the five places above.
+- **Arena** grows geometrically, seeded from the previous frame.
+- **32×32 threadgroups** for all live passes.
+- **Off-screen culling** per cached stroke, with a culled counter in the report.
+- **Extra input bindings**: left drag pans (shift → rotate, cmd → zoom), middle drag
+  keeps pan/cmd-zoom/shift-rotate, the scroll wheel zooms at the pointer, all through the
+  same `commitTransform` funnel.
+- **Instrumentation**: `Renderer.lastLiveFrameTiming` (`LiveFrameTiming`) with
+  bin/encode/gpu/paper; `art2png --live*` prints it, the QL extension logs frames
+  slower than 250 ms.
+- **Testability**: the cache build moved out of the Metal-guarded file into
+  `LiveRenderCache.swift` (which is not Metal-guarded), so it runs on Linux — plus
+  `LiveCacheBuildTests` (real documents, paste layers excluded from the cache size,
+  bounds sanity) and `LiveProfileTests` (opt-in CPU profile of the geometry stages).
+
+**Not touched:** `project.pbxproj`.
+
+> **Adding a library file:** a new file in `Sources/ArtRenderLibrary` has to be listed in
+> `Package.swift`'s `sources:` array — that *is* enough for Xcode to compile it, because
+> the project references this package. What is not enough is a stale copy of
+> `Package.swift`: the first take-4 build failed with
+> `Cannot find 'buildLiveRenderCacheGeometry' in scope` for a file the manifest listed
+> correctly on disk. If a new library file is ever needed, list it in `Package.swift` and
+> make sure that manifest is the one being built. (This round ended up not needing a new
+> library file at all: the builder and the frame timing live in `LiveRenderCache.swift`,
+> which every target already compiles.)
+
+### Test points for take 3 (needs macOS)
+
+Ordered so the cheapest, most diagnostic runs come first.
+
+1. **Orientation.** `art2png --live art/mischief-document.art` → compare
+   `<file>-live.png` with `<file>.png`. The live canvas is now **mirrored by default**
+   (`LiveCanvasRowOrder.presentsMirrored`), which is the orientation macOS actually
+   showed; `art2png --no-flip-y` / the app's "Mirror canvas vertically" toggle turn it
+   back off. `--live`, `--live-only` and `--live-view` all honour it now.
+2. **Cache.** `art2png --live-cache art/*.art` (loop over the samples) → the report must
+   show a sane segment count and budget, and "N rebuilt per frame" only for documents
+   that really contain paste/merge actions.
+3. **Interactive path at 100%.** `art2png --live-view --viewport 1920x1080` →
+   `<file>-live-view.png` should match `<file>.png` closely (same strokes, same paper;
+   the AA may differ by a hair because the re-render flattens at the cache's reference
+   transform). Every render prints its stage breakdown now, e.g.
+   `Live view: 410 ms total (bin 95, encode 12, gpu 300, paper 3) — 2214 strokes / 321611 segments, 1 layers cached, 0 rebuilt, 0 culled`.
+4. **Interactive path zoomed in.** `--live-view --zoom 4` must show *more* detail than
+   `--zoom 1`, not a magnified bitmap — that is the whole point of the re-render path.
+   Also try `--rotate 0.4` and `--pan 120,-80`. A zoomed-in view should cull most strokes
+   (`… N culled` in the breakdown) and get *faster* than the fit view.
+5. **Paste documents.** `art2png --live-view art/complex2.art` and a paste document in
+   Quick Look: pasted content must sit exactly where it sits in `<file>.png`, at 100% and
+   after a pan/zoom/rotate (this was the "different depth planes" bug — see §9.2).
+6. **In Quick Look:** one long drag must stay live for the whole gesture, with the left
+   button as well as the middle one, and the scroll wheel must zoom at the pointer; HUD
+   shows mode + FPS (renders/sec); zoom shows a percentage; the four resets work from the
+   context menu and from `0`/`P`/`Z`/`R`; nothing renders when idle. Slow frames
+   (>250 ms) log their breakdown to the unified log.
+7. **Regression:** the three static render paths unchanged; `--live` (single raster)
+   still works; a document with pastes (`art/paste*`, `art/layers.art`) still looks
+   right through the "rebuilt per frame" path.
+
+### Take 4 — what the first take-3 *interactive* build taught us (2026-10-08)
+
+Reported after building take 3 on macOS:
+
+1. **Orientation: the live image is y-flipped**, and `--flip-y` did nothing —
+   `art2png --live` simply never passed the flag through to the present pass (it only
+   did for `--live-view`). The present pass *did* have a flip, but it composed the mirror
+   **after** the clip matrix, i.e. mirrored in NDC space about the canvas height, which is
+   why the app's checkbox made the image *disappear* instead of flipping it.
+2. **Pasted content sat "on a different depth plane"** as soon as the camera changed,
+   and only in the interactive path — the static path was fine.
+3. **Very slow**: 25 s for one frame of a 321 611-segment document (the CG path takes
+   1.5 s for the same file), and it got worse with `--viewport`.
+4. **"No continuous action"**: with 25 s frames, dragging cannot feel continuous.
+5. Suggested extra bindings: lmb pan, scroll-wheel zoom, lmb+shift rotate.
+
+#### 9.2 Root causes found
+
+**(a) Reversed transform composition — the "planes" bug and the broken flip.** The live
+path composed transforms as `camera.concatenating(base)`, which applies the *camera*
+first. `a.concatenating(b)` applies **a first**, then b (identical in CoreGraphics and
+Silica), so the intended order — layer, then base, then camera — was inverted in three
+places (`LiveRenderCache.liveBaseTransform`, `artToDevice`, the cut recomposition) plus
+the `m1` recovery in the cache build and the present pass's mirror.
+
+That is invisible at 100% zoom for a plain document (a uniform-scale view matrix
+commutes with the camera, so both orders agree) and appears as soon as anything is
+rotated, panned, or the layer/paste matrices are not axis-aligned — exactly the reported
+symptom. Fixed, and pinned down by tests that check the *order* by applying each
+composition to a point (`LiveRenderCacheTests.testLiveBaseAppliesTheBaseFirst`,
+`testArtToDeviceAppliesLayerBaseCamera`, `testCutRecomposesAgainstAnyCamera`).
+
+**(b) A quadratic arena growth — the 25 s frames.** One interactive frame bins every
+stroke into a staging arena, asking for more room each time. Growth was **exact-fit**:
+`allocate` + `memcpy` + `deallocate` per stroke, and a fresh raw block is a new `mmap`, so
+every stroke also faulted every page of the growing arena back in. For 2 214 strokes and a
+~20 MB arena that is tens of gigabytes of copying and tens of millions of page faults —
+and it happened on the *first* frame only (the capacity survives), which matches "the
+image eventually shows up, then it is fine". Growth is now geometric and seeded with the
+previous frame's size (`MetalRenderer_LiveCompositing.staging(needed:)`).
+
+Measured CPU cost of the same document on Linux (`ART_LIVE_PROFILE=1 swift test
+--filter LiveProfileTests`): cache build 213 ms, camera re-mapping 8 ms — so the CPU was
+never the problem and the arena was.
+
+**(c) Per-stroke full-canvas dispatches.** Every stroke dispatches over the whole canvas
+and the kernel early-outs on empty tiles, so a 2 214-stroke document launches ~72 M
+threadgroups. Bumping the live passes from 8×8 to 32×32 threads per threadgroup (the
+kernels derive their tile from `thread_position_in_grid`, so the shape is free) cuts the
+launch count 16× with identical output. Dispatching only the tiles a stroke touches needs
+a pixel-origin in the shared `Params` struct — deliberately **not** done yet, since a
+Swift/MSL layout mismatch there would silently corrupt every segment.
+
+**(d) Off-screen strokes were rasterised anyway.** Cached strokes now carry ink bounds in
+reference space (`LiveCachedStroke.referenceBounds`) and are skipped when the
+camera-transformed box misses the viewport. A stroke that touches no pixel of the target
+cannot change a pixel, so this is free correctness-wise — and a zoomed-in frame gets much
+cheaper.
+
+#### 9.3 Take 4 changes
+
+- **Orientation**: mirror composed *inside* the canvas (`mirrored.concatenated(with: clip)`),
+  wired into `--live` / `--live-only` / `--live-view`, default on via the single constant
+  `LiveCanvasRowOrder.presentsMirrored` (app setting renamed to `mirrorLiveCanvas`,
+  default on; `art2png --no-flip-y` opts out).
+- **Composition order** fixed in the five places above.
+- **Arena** grows geometrically, seeded from the previous frame.
+- **32×32 threadgroups** for all live passes.
+- **Off-screen culling** per cached stroke, with a culled counter in the report.
+- **Extra input bindings**: left drag pans (shift → rotate, cmd → zoom), middle drag
+  keeps pan/cmd-zoom/shift-rotate, the scroll wheel zooms at the pointer, all through the
+  same `commitTransform` funnel.
+- **Instrumentation**: `Renderer.lastLiveFrameTiming` (`LiveFrameTiming`) with
+  bin/encode/gpu/paper; `art2png --live*` prints it, the QL extension logs frames
+  slower than 250 ms.
+- **Testability**: the cache build moved out of the Metal-guarded file into
+  `LiveRenderCache.swift` (which is not Metal-guarded), so it runs on Linux — plus
+  `LiveCacheBuildTests` (real documents, paste layers excluded from the cache size,
+  bounds sanity) and `LiveProfileTests` (opt-in CPU profile of the geometry stages).
+
+**Not touched:** `project.pbxproj` — and, as of this round, **no new library files either**.
+
+> **Lesson (cost one build round):** a new file in `Sources/ArtRenderLibrary` has to be
+> listed in `Package.swift`'s `sources:` array *and* picked up by the Xcode project's
+> library target, and the second part is not automatic — the first take-4 build failed with
+> `Cannot find 'buildLiveRenderCacheGeometry' in scope` for a brand-new file that
+> `Package.swift` did list. Anything the live path needs therefore goes **into a file that
+> is already compiled** (`LiveRenderCache.swift`), so the project never has to learn about
+> it.

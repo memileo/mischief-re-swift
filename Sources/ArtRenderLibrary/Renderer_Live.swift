@@ -131,7 +131,7 @@ extension Renderer {
     public func livePreviewImage(_ canvas: LiveRenderedCanvas,
                                  transform: LiveViewTransform = LiveViewTransform(),
                                  size: CGSize,
-                                 flipVertically: Bool = false) -> CGImage? {
+                                 flipVertically: Bool = LiveCanvasRowOrder.presentsMirrored) -> CGImage? {
         guard let mr = metalRenderer else { return nil }
         return try? canvas.previewImage(renderer: mr, transform: transform, size: size,
                                         flipVertically: flipVertically)
@@ -143,7 +143,7 @@ extension Renderer {
                                   to drawable: MTLDrawable,
                                   transform: LiveViewTransform,
                                   clearColor: MTLClearColor = MTLClearColorMake(0, 0, 0, 1),
-                                  flipVertically: Bool = false) {
+                                  flipVertically: Bool = LiveCanvasRowOrder.presentsMirrored) {
         guard let mr = metalRenderer else { return }
         do {
             try mr.presentLiveCanvas(canvas, to: drawable, transform: transform,
@@ -156,11 +156,6 @@ extension Renderer {
     
     // MARK: - Interactive mode (re-render per view change)
     
-    /// Above this many cached segments the interactive mode is abandoned in favour of
-    /// the single-raster fallback. ~1.5 M segments ≈ 84 MB of geometry, i.e. a document
-    /// far bigger than anything a preview needs.
-    public static let liveCacheSegmentBudget = 1_500_000
-    
     /// Builds the "process once" cache for `art`.
     ///
     /// Call this once per document (on the render queue). The returned cache can then be
@@ -172,96 +167,17 @@ extension Renderer {
     public func buildLiveRenderCache(art: ArtParser,
                                      scale: CGFloat? = nil,
                                      segmentBudget: Int = Renderer.liveCacheSegmentBudget) -> LiveRenderCache? {
-        let scale = scale ?? self.scale
         guard let mr = metalRenderer, MetalRenderer.useGPURendering else { return nil }
         guard mr.prepareLiveCompositing() else { return nil }
-        
-        let baseTransform = transformFromMatrix(art.viewMatrix, scale: scale)
-        invalidateReplayCaches()
-        
-        var layers: [LiveCachedLayer] = []
-        var segmentCount = 0
-        var overBudget = false
-        
-        for layerIndex in art.layerOrder {
-            guard layerIndex < art.layers.count, !overBudget else { continue }
-            let layer = art.layers[layerIndex]
-            guard getVisibility(from: layer),
-                  let layerMatrix = layer["matrix"] as? [[Float]] else { continue }
-            
-            let layerTransform = toDirectCGTransform(layerMatrix)
-            let referenceTransform = CGAffineTransformConcat(layerTransform, baseTransform)
-            let operations = buildLayerOperations(art: art,
-                                                  layerIndex: layerIndex,
-                                                  baseTransform: baseTransform,
-                                                  flipTransform: nil)
-            guard !operations.isEmpty else { continue }
-            
-            var cached: [LiveCachedOp] = []
-            var needsRebuild = false
-            
-            for op in operations {
-                switch op {
-                    case .stroke(let stroke):
-                        guard let built = buildOpFromStroke(stroke,
-                                                             artToDevice: referenceTransform,
-                                                             flipTransform: nil) else { continue }
-                        segmentCount += built.segments.count
-                        if segmentCount > segmentBudget { overBudget = true; break }
-                        cached.append(.stroke(LiveCachedStroke(segments: built.segments,
-                                                                color: built.color,
-                                                                isEraser: built.isEraser,
-                                                                isMarker: built.isMarker)))
-                    case .cut(let meta):
-                        // `buildLayerOperations` composed base⁻¹ ∘ m1; recover m1 so the
-                        // cut can be recomposed against any camera.
-                        let selectionFrame = baseTransform.concatenating(meta.inverseAffine)
-                        cached.append(.cut(
-                            rect: [meta.rect.x, meta.rect.y, meta.rect.z, meta.rect.w], // meta.rect is a SIMD4<Float>
-                            selectionFrame: selectionFrame
-                        ))
-// Optional cleanups:
-// Avoid the array allocation — if you control the cached enum, prefer storing the SIMD type directly, since cuts are just passed through:
-// case cut(rect: SIMD4<Float>, selectionFrame: CGAffineTransform)
 
-// Consider a symmetric initializer on CutMeta so callers never hand-assemble rows:
-//    public init(inverseAffine: CGAffineTransform, rect: SIMD4<Float>, edgeWidth: Float = 0.75) {
-//        // ...
-//    }
-                        
-                    case .paste:
-                        // Pastes/merges need the full replay/resolve machinery.
-                        needsRebuild = true
-                }
-            }
-            
-            if needsRebuild {
-                // Those strokes are rebuilt per frame anyway, so they must not eat the
-                // budget or show up in the reported cache size.
-                segmentCount -= cached.reduce(0) { total, op in
-                    if case .stroke(let s) = op { return total + s.segments.count }
-                    return total
-                }
-                cached.removeAll()
-            }
-            
-            layers.append(LiveCachedLayer(layerIndex: layerIndex,
-                                          opacity: layer["opacity"] as? Float ?? 1.0,
-                                          layerTransform: layerTransform,
-                                          ops: needsRebuild ? [] : cached,
-                                          needsRebuild: needsRebuild))
+        let started = DispatchTime.now().uptimeNanoseconds
+        let cache = buildLiveRenderCacheGeometry(art: art, scale: scale,
+                                                 segmentBudget: segmentBudget)
+        if cache != nil {
+            print(String(format: "Live view: cache built in %.0f ms",
+                         Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000.0))
         }
-        
-        guard !overBudget, !layers.isEmpty else { return nil }
-        
-        print("Live view: cached \(segmentCount) segments across \(layers.count) layer(s)"
-              + (layers.contains(where: { $0.needsRebuild })
-                 ? " (\(layers.filter { $0.needsRebuild }.count) rebuilt per frame)" : ""))
-        
-        return LiveRenderCache(baseTransform: baseTransform,
-                               layers: layers,
-                               segmentCount: segmentCount,
-                               withinBudget: true)
+        return cache
     }
     
     /// Re-rasterises the cached document for `camera` into a viewport-sized canvas.
@@ -285,6 +201,8 @@ extension Renderer {
                                                               height: canvasSize.height * scale),
                                        viewportSize: viewport)
         let cameraTransform = viewMatrix.affineTransform
+        mr.liveTiming = LiveFrameTiming()
+        let frameStart = DispatchTime.now().uptimeNanoseconds
         
         do {
             try mr.makeLiveCanvasTextures(width: width, height: height,
@@ -297,6 +215,7 @@ extension Renderer {
             for (position, layer) in cache.layers.enumerated() {
                 if layer.needsRebuild {
                     // Uncached path: full action walk + the untouched dispatch pipeline.
+                    mr.liveTiming.rebuiltLayers += 1
                     let artToDevice = cache.artToDevice(layerAt: position, camera: cameraTransform)
                         ?? CGAffineTransformConcat(layer.layerTransform, cameraTransform)
                     let operations = buildLayerOperations(
@@ -312,8 +231,17 @@ extension Renderer {
                     continue
                 }
                 
-                guard let deviceOps = cache.deviceOps(forLayerAt: position, camera: cameraTransform),
-                      !deviceOps.isEmpty else { continue }
+                mr.liveTiming.cachedLayers += 1
+                let strokesInLayer = cache.strokeCount(at: position)
+                let viewportRect = CGRect(origin: .zero, size: CGSize(width: width, height: height))
+                guard let deviceOps = cache.deviceOps(forLayerAt: position,
+                                                      camera: cameraTransform,
+                                                      viewport: viewportRect),
+                      !deviceOps.isEmpty else {
+                    // Everything in this layer is off screen.
+                    mr.liveTiming.culledStrokes += strokesInLayer
+                    continue
+                }
                 try mr.renderCachedLayerIntoLiveCanvas(layerOps: deviceOps,
                                                        width: width, height: height,
                                                        opacity: layer.opacity)
@@ -326,10 +254,6 @@ extension Renderer {
                 _ = mr.uploadLivePaperTexture(data: art.paperTextureData)
             }
             let documentUnits = scale != 0 ? 1 / scale : 1
-            
-//            let documentFromCanvas = CGAffineTransform(scaleX: documentUnits, y: documentUnits)
-//                .concatenating(cameraTransform.inverted())
-            
             let documentFromCanvas: CGAffineTransform
             if cameraTransform.isInvertible {
                 documentFromCanvas = CGAffineTransform(scaleX: documentUnits, y: documentUnits)
@@ -337,6 +261,7 @@ extension Renderer {
             } else {
                 documentFromCanvas = .identity
             }
+            let paperStart = DispatchTime.now().uptimeNanoseconds
             try mr.renderLivePaperBackground(
                 paperColor: getPaperColor(for: art.paperTextureId),
                 paperStrength: art.paperStrength,
@@ -347,11 +272,18 @@ extension Renderer {
                 tileScale: 1,
                 documentFromCanvas: documentFromCanvas,
                 width: width, height: height)
+            mr.liveTiming.paperMilliseconds += MetalRenderer.milliseconds(since: paperStart)
             
             guard let device = mr.device,
                   let canvasTexture = mr.liveCanvasTexture,
                   let backgroundTexture = mr.liveBackgroundTexture else {
                 return nil
+            }
+            
+            mr.liveTiming.totalMilliseconds = MetalRenderer.milliseconds(since: frameStart)
+            lastLiveFrameTiming = mr.liveTiming
+            if Renderer.livePathTiming {
+                print("Live view: \(mr.liveTiming.summary)")
             }
             
             return LiveRenderedCanvas(device: device,

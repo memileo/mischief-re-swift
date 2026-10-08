@@ -89,14 +89,22 @@ final class LiveHUDController {
               fps: nil)
     }
 
-    /// A gesture moved. Called once per drag event.
-    func updateInteraction(_ mode: LiveInteractionMode, zoomPercent: Double) {
+    /// A gesture moved, or the view changed outside a drag (scroll-wheel zoom, for
+    /// instance — nothing will call `endInteraction` after those).
+    ///
+    /// - Parameter hold: how long the HUD stays up after the last change. During a drag the
+    ///   scheduled hide is a no-op (`interacting` is true), so it does not cut a long
+    ///   gesture short.
+    func updateInteraction(_ mode: LiveInteractionMode,
+                           zoomPercent: Double,
+                           hold: TimeInterval = 0.35) {
         apply(visible: true,
               mode: mode,
               zoomPercent: zoomPercent,
               showZoomPercent: mode.showsZoomPercent,
               message: nil,
               fps: state.fps)
+        scheduleHide(after: hold)
     }
 
     /// The gesture ended. The HUD stays up briefly so the final state is readable.

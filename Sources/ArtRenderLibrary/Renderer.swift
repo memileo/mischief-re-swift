@@ -26,6 +26,10 @@ public final class Renderer {
     
     internal let sRGBColorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
     
+    /// Breakdown of the most recent `renderLive(cache:…)` call — see LiveFrameTiming.swift.
+    /// Declared here (not in an extension) because extensions cannot hold stored properties.
+    public internal(set) var lastLiveFrameTiming: LiveFrameTiming?
+    
 #if canImport(Metal)
     internal var layerTexture: MTLTexture?
     

@@ -81,7 +81,7 @@ let package = Package(
         // These run on Linux as well as macOS.
         .testTarget(
             name: "ArtRenderLibraryTests",
-            dependencies: ["ArtRenderLibrary"],
+            dependencies: ["ArtRenderLibrary", "ArtParser"],
             path: "Tests/ArtRenderLibraryTests"
         ),
     ]

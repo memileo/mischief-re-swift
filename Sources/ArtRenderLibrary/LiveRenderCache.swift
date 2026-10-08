@@ -47,6 +47,12 @@
 //  dominated by that resolution step, so caching them is not worth the risk; the price is
 //  that such documents re-render slower.
 //
+//  Also in here
+//  -------------
+//  `LiveFrameTiming` — where an interactive frame's time went — and
+//  `buildLiveRenderCacheGeometry`, the cache builder, both here so this feature stays in
+//  files the library target already compiles (see the note below).
+//
 
 import Foundation
 import ArtParser
@@ -58,8 +64,8 @@ import CoreGraphics
 #endif
 
 // NOTE: deliberately **not** wrapped in `#if canImport(Metal)` — nothing in this file
-// touches Metal, so the cache and its re-mapping maths type-check (and unit-test) on
-// Linux as well.
+// touches Metal, so the cache, its builder, the frame timing and the re-mapping maths
+// type-check (and unit-test) on Linux as well.
 
 // MARK: - Cached geometry
 
@@ -69,6 +75,35 @@ public struct LiveCachedStroke {
     public var color: SIMD4<Float>
     public var isEraser: Bool
     public var isMarker: Bool
+    /// Conservative bounds of the stroke's *ink* (control points expanded by the radii the
+    /// kernel actually paints), in the same reference space as `segments`. Used to skip
+    /// strokes that are off screen after the camera is applied.
+    public var bounds: CGRect
+
+    /// Ink bounds of a flattened stroke, padded generously: the padding only ever costs an
+    /// extra stroke or two being rasterised, while a too-small box would clip ink.
+    public static func referenceBounds(of segments: [GPUSplineSegment],
+                                       isMarker: Bool) -> CGRect {
+        guard let first = segments.first else { return .zero }
+        var minX = min(first.p1.x, first.p2.x)
+        var maxX = max(first.p1.x, first.p2.x)
+        var minY = min(first.p1.y, first.p2.y)
+        var maxY = max(first.p1.y, first.p2.y)
+        for s in segments {
+            minX = min(minX, min(s.p1.x, s.p2.x))
+            maxX = max(maxX, max(s.p1.x, s.p2.x))
+            minY = min(minY, min(s.p1.y, s.p2.y))
+            maxY = max(maxY, max(s.p1.y, s.p2.y))
+        }
+        // The kernel sweeps a stroke's radius (plus, for markers, a soft envelope) around
+        // every sample point; markers additionally get their radius applied twice.
+        let radius = segments.reduce(Float(0)) { max($0, max($1.radius0, $1.radius1)) }
+        let pad = radius * (isMarker ? 4 : 2) + 2
+        return CGRect(x: CGFloat(minX) - CGFloat(pad),
+                      y: CGFloat(minY) - CGFloat(pad),
+                      width: CGFloat(maxX - minX) + 2 * CGFloat(pad),
+                      height: CGFloat(maxY - minY) + 2 * CGFloat(pad))
+    }
 }
 
 /// One cached op, in document space (nothing here depends on the current view).
@@ -121,6 +156,55 @@ public final class LiveRenderCache {
     }
 }
 
+// MARK: - Frame timing
+
+/// Where the time of one interactive (cached) live frame went.
+///
+/// The interactive path re-rasterises the visible document whenever the view matrix
+/// changes, so when it is slow there are three very different suspects:
+///
+///   - `bin`     CPU: re-mapping the cached geometry onto the camera + tile binning
+///   - `encode`  CPU: writing the Metal dispatches
+///   - `gpu`     GPU: the dispatches themselves, up to `waitUntilCompleted`
+///
+/// Measured unconditionally (a few `DispatchTime.now()` calls) and published as
+/// `Renderer.lastLiveFrameTiming`, so `art2png --live-view` can print it and the Quick Look
+/// extension can log a breakdown only for frames that were actually slow.
+public struct LiveFrameTiming {
+    /// Cached layers rasterised this frame (the fast path).
+    public var cachedLayers = 0
+    /// Paste/merge layers re-walked this frame (the slow, uncached path).
+    public var rebuiltLayers = 0
+    /// Strokes handed to the GPU (after off-screen culling).
+    public var strokes = 0
+    /// Strokes the cache had but that were culled because they are off screen.
+    public var culledStrokes = 0
+    /// Segments handed to the GPU.
+    public var segments = 0
+
+    public var binMilliseconds = 0.0
+    public var encodeMilliseconds = 0.0
+    /// Time spent inside `waitUntilCompleted`, i.e. GPU execution (plus any stall).
+    public var gpuMilliseconds = 0.0
+    /// Paper/background pass (its own command buffer + wait).
+    public var paperMilliseconds = 0.0
+    /// Whole `renderLive(cache:…)` call.
+    public var totalMilliseconds = 0.0
+
+    public var summary: String {
+        String(format: "%.0f ms total (bin %.0f, encode %.0f, gpu %.0f, paper %.0f) — "
+                       + "%d strokes / %d segments, %d layers cached, %d rebuilt, %d culled",
+               totalMilliseconds, binMilliseconds, encodeMilliseconds, gpuMilliseconds,
+               paperMilliseconds, strokes, segments, cachedLayers, rebuiltLayers, culledStrokes)
+    }
+}
+
+extension Renderer {
+    /// Prints the per-stage breakdown after every interactive render. `art2png --live-view`
+    /// turns this on.
+    public static var livePathTiming = false
+}
+
 // MARK: - Small transform helpers
 
 /// `CGAffineTransform.inverted()` returns an optional value on CoreGraphics but a plain
@@ -144,6 +228,13 @@ public enum LiveDeviceOp {
     case cut(meta: CutMeta)
 }
 
+extension Renderer {
+    /// Above this many cached segments the interactive mode is abandoned in favour of the
+    /// single-raster fallback. ~1.5 M segments ≈ 84 MB of geometry, i.e. a document far
+    /// bigger than anything a preview needs.
+    public static let liveCacheSegmentBudget = 1_500_000
+}
+
 // MARK: - Re-mapping
 
 extension LiveRenderCache {
@@ -151,8 +242,14 @@ extension LiveRenderCache {
     ///
     /// - Parameters:
     ///   - camera: the document-space camera, i.e. canvas px (at 100%) → view px.
+    ///   - viewport: the region being rasterised in view px. Strokes whose bounds miss it
+    ///     after the camera is applied are skipped: their ink would land outside every
+    ///     pixel of the target, so compositing them cannot change a single output pixel.
+    ///     nil disables the test (used by the cache report).
     /// - Returns: nil for a `needsRebuild` layer (those are re-walked per frame instead).
-    public func deviceOps(forLayerAt index: Int, camera: CGAffineTransform) -> [LiveDeviceOp]? {
+    public func deviceOps(forLayerAt index: Int,
+                          camera: CGAffineTransform,
+                          viewport: CGRect? = nil) -> [LiveDeviceOp]? {
         guard index < layers.count else { return nil }
         let layer = layers[index]
         guard !layer.needsRebuild else { return nil }
@@ -168,6 +265,10 @@ extension LiveRenderCache {
         for cached in layer.ops {
             switch cached {
                 case .stroke(let stroke):
+                    if let viewport,
+                       !Self.intersects(stroke.bounds, camera: camera, viewport: viewport) {
+                        continue
+                    }
                     ops.append(.stroke(segments: Self.remap(stroke.segments,
                                                             camera: camera,
                                                             radiusFactor: radiusFactor),
@@ -177,26 +278,60 @@ extension LiveRenderCache {
                 case .cut(let rect, let selectionFrame):
                     // `buildLayerOperations` builds cuts against the *base* transform
                     // (no layer matrix), so the live version uses camera ∘ base.
-                    let liveBase = camera.concatenating(baseTransform)
+                    let liveBase = liveBaseTransform(camera: camera)
                     guard let inverse = invert(liveBase) else { continue }
-                    ops.append(.cut(meta: CutMeta(inverseAffine: inverse.concatenating(selectionFrame),
+                    // dest → selection frame = m1 first, then liveBase⁻¹.
+                    ops.append(.cut(meta: CutMeta(inverseAffine: selectionFrame.concatenating(inverse),
                                                   rect: rect, edgeWidth: 0.75)))
             }
         }
         return ops
     }
-    
-    /// Transform of `liveBase` for a rebuilt layer: camera ∘ base ∘ layer.
-    public func artToDevice(layerAt index: Int, camera: CGAffineTransform) -> CGAffineTransform? {
-        guard index < layers.count else { return nil }
-        return camera
-            .concatenating(baseTransform)
-            .concatenating(layers[index].layerTransform)
+
+    /// Does a stroke's ink land inside `viewport` once `camera` is applied?
+    ///
+    /// The camera can rotate, so the box is mapped through its four corners rather than by
+    /// scaling the extents.
+    static func intersects(_ bounds: CGRect,
+                           camera: CGAffineTransform,
+                           viewport: CGRect) -> Bool {
+        guard !bounds.isEmpty, !viewport.isEmpty else { return true }
+        let p0 = CGPoint(x: bounds.minX, y: bounds.minY).applying(camera)
+        let p1 = CGPoint(x: bounds.maxX, y: bounds.minY).applying(camera)
+        let p2 = CGPoint(x: bounds.maxX, y: bounds.maxY).applying(camera)
+        let p3 = CGPoint(x: bounds.minX, y: bounds.maxY).applying(camera)
+        let minX = min(min(p0.x, p1.x), min(p2.x, p3.x))
+        let maxX = max(max(p0.x, p1.x), max(p2.x, p3.x))
+        let minY = min(min(p0.y, p1.y), min(p2.y, p3.y))
+        let maxY = max(max(p0.y, p1.y), max(p2.y, p3.y))
+        return maxX >= viewport.minX && minX <= viewport.maxX
+            && maxY >= viewport.minY && minY <= viewport.maxY
     }
     
+    /// art → device for a rebuilt (paste/merge) layer: layer first, then base, then the
+    /// camera.
+    ///
+    /// - Note on composition order: `a.concatenating(b)` applies **a first**, then `b`
+    ///   (it is `b ∘ a`) — same convention in CoreGraphics and Silica.
+    public func artToDevice(layerAt index: Int, camera: CGAffineTransform) -> CGAffineTransform? {
+        guard index < layers.count else { return nil }
+        return layers[index].layerTransform
+            .concatenating(baseTransform)
+            .concatenating(camera)
+    }
+
     /// camera ∘ baseTransform — the transform cuts (and the paper) are expressed in.
     public func liveBaseTransform(camera: CGAffineTransform) -> CGAffineTransform {
-        camera.concatenating(baseTransform)
+        baseTransform.concatenating(camera)
+    }
+
+    /// How many strokes layer `index` holds (for the "everything was culled" report).
+    public func strokeCount(at index: Int) -> Int {
+        guard index < layers.count else { return 0 }
+        return layers[index].ops.reduce(0) { total, op in
+            if case .stroke = op { return total + 1 }
+            return total
+        }
     }
     
     /// Applies a similarity transform to a flattened segment list.
@@ -230,5 +365,112 @@ extension LiveRenderCache {
             out.append(s)
         }
         return out
+    }
+}
+
+// MARK: - Building the cache
+
+extension Renderer {
+
+    /// Walks `art` once and caches every layer's flattened geometry at the reference
+    /// transform.
+    ///
+    /// Layers with paste/merge actions are recorded but left empty (`needsRebuild`): their
+    /// resolution cost belongs to those actions, and re-walking them per frame keeps that
+    /// tricky code path untouched.
+    ///
+    /// - Parameters:
+    ///   - scale: the renderer's render scale. `renderLive(cache:…)` derives its camera from
+    ///     `canvasSize * Renderer.scale`, so any other value here would mis-register all
+    ///     cached geometry.
+    ///   - segmentBudget: give up (return nil) past this many cached segments; callers fall
+    ///     back to the single-raster mode.
+    /// - Returns: nil when the document does not fit the budget or has nothing to draw.
+    @discardableResult
+    public func buildLiveRenderCacheGeometry(art: ArtParser,
+                                            scale: CGFloat? = nil,
+                                            segmentBudget: Int = Renderer.liveCacheSegmentBudget) -> LiveRenderCache? {
+        let scale = scale ?? self.scale
+        let baseTransform = transformFromMatrix(art.viewMatrix, scale: scale)
+        invalidateReplayCaches()
+
+        var layers: [LiveCachedLayer] = []
+        var segmentCount = 0
+        var overBudget = false
+
+        for layerIndex in art.layerOrder {
+            guard layerIndex < art.layers.count, !overBudget else { continue }
+            let layer = art.layers[layerIndex]
+            guard getVisibility(from: layer),
+                  let layerMatrix = layer["matrix"] as? [[Float]] else { continue }
+
+            let layerTransform = toDirectCGTransform(layerMatrix)
+            let referenceTransform = CGAffineTransformConcat(layerTransform, baseTransform)
+            let operations = buildLayerOperations(art: art,
+                                                  layerIndex: layerIndex,
+                                                  baseTransform: baseTransform,
+                                                  flipTransform: nil)
+            guard !operations.isEmpty else { continue }
+
+            var cached: [LiveCachedOp] = []
+            var needsRebuild = false
+
+            for op in operations {
+                switch op {
+                    case .stroke(let stroke):
+                        guard let built = buildOpFromStroke(stroke,
+                                                             artToDevice: referenceTransform,
+                                                             flipTransform: nil) else { continue }
+                        segmentCount += built.segments.count
+                        if segmentCount > segmentBudget { overBudget = true; break }
+                        cached.append(.stroke(LiveCachedStroke(
+                            segments: built.segments,
+                            color: built.color,
+                            isEraser: built.isEraser,
+                            isMarker: built.isMarker,
+                            bounds: LiveCachedStroke.referenceBounds(of: built.segments,
+                                                                    isMarker: built.isMarker))))
+
+                    case .cut(let meta):
+                        // `buildLayerOperations` stores base⁻¹ ∘ m1; recover m1 so the cut can
+                        // be recomposed against any camera (`a.concatenating(b)` applies a
+                        // first, so m1 = inverseAffine ∘ base).
+                        cached.append(.cut(
+                            rect: [meta.rect.x, meta.rect.y, meta.rect.z, meta.rect.w],
+                            selectionFrame: meta.inverseAffine.concatenating(baseTransform)))
+
+                    case .paste:
+                        // Pastes/merges need the full replay/resolve machinery.
+                        needsRebuild = true
+                }
+            }
+
+            if needsRebuild {
+                // Those strokes are rebuilt per frame anyway, so they must not eat the
+                // budget or show up in the reported cache size.
+                segmentCount -= cached.reduce(0) { total, op in
+                    if case .stroke(let s) = op { return total + s.segments.count }
+                    return total
+                }
+                cached.removeAll()
+            }
+
+            layers.append(LiveCachedLayer(layerIndex: layerIndex,
+                                          opacity: layer["opacity"] as? Float ?? 1.0,
+                                          layerTransform: layerTransform,
+                                          ops: needsRebuild ? [] : cached,
+                                          needsRebuild: needsRebuild))
+        }
+
+        guard !overBudget, !layers.isEmpty else { return nil }
+
+        let rebuilding = layers.filter { $0.needsRebuild }.count
+        print("Live view: cached \(segmentCount) segments across \(layers.count) layer(s)"
+              + (rebuilding > 0 ? " (\(rebuilding) rebuilt per frame)" : ""))
+
+        return LiveRenderCache(baseTransform: baseTransform,
+                               layers: layers,
+                               segmentCount: segmentCount,
+                               withinBudget: true)
     }
 }

@@ -35,7 +35,7 @@ private enum Keys {
     static let useCache = "useCache"
     static let cacheSizeMB = "cacheSizeMB"
     static let generateThumbnails = "generateThumbnails"
-    static let flipLiveCanvas = "flipLiveCanvas"
+    static let mirrorLiveCanvas = "mirrorLiveCanvas"
 }
 
 /// Reads/writes the shared suite. This *is* the plist you were going to
@@ -65,11 +65,11 @@ struct Settings {
         get { d.object(forKey: Keys.generateThumbnails) as? Bool ?? true }
         set { d.set(newValue, forKey: Keys.generateThumbnails) }
     }
-    /// Escape hatch for the live view's canvas row order. `false` = canvas row 0 at the
-    /// top, which is what the static render path implies. Flip it if the live preview
-    /// shows the document mirrored.
-    var flipLiveCanvas: Bool {
-        get { d.object(forKey: Keys.flipLiveCanvas) as? Bool ?? false }
-        set { d.set(newValue, forKey: Keys.flipLiveCanvas) }
+    /// The live canvas texture has to be mirrored when presented, otherwise the document
+    /// shows upside down (measured on macOS 14/15). Only untick if *your* display shows it
+    /// the other way round.
+    var mirrorLiveCanvas: Bool {
+        get { d.object(forKey: Keys.mirrorLiveCanvas) as? Bool ?? true }
+        set { d.set(newValue, forKey: Keys.mirrorLiveCanvas) }
     }
 }

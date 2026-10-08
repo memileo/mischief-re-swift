@@ -34,7 +34,7 @@ func main() {
         print("  --zoom F               Zoom factor for --live-view (1 = as the file shows)")
         print("  --pan X,Y              Pan in view pixels for --live-view")
         print("  --rotate R             Rotation in radians for --live-view")
-        print("  --flip-y               macOS only: Mirror the live view vertically")
+        print("  --no-flip-y            macOS only: Do not mirror the live canvas (mirrored by default)")
     }
     
     guard args.count > 1 else {
@@ -55,7 +55,7 @@ func main() {
     var liveOnly = false
     var useLiveView = false
     var liveCacheReport = false
-    var flipY = false
+    var flipY = true          // the live canvas needs mirroring on macOS; --no-flip-y opts out
     var viewportSize = CGSize(width: 1600, height: 900)
     var liveZoom: CGFloat = 1
     var livePan = CGPoint.zero
@@ -119,6 +119,9 @@ func main() {
             i += 1
         } else if args[i] == "--flip-y" {
             flipY = true
+            i += 1
+        } else if args[i] == "--no-flip-y" {
+            flipY = false
             i += 1
         } else if args[i] == "--zoom" {
             i += 1
@@ -184,6 +187,8 @@ func main() {
     
     let canvasSize = CGSize(width: 1920, height: 1080)
     let renderer = Renderer(canvasSize: canvasSize, scale: scale, forceCPU: forceCPU, useSegmentRendering: useSegmentRendering)
+    // Per-stage breakdown of the interactive frames (`bin` / `encode` / `gpu` / `paper`).
+    Renderer.livePathTiming = useLiveCanvas || useLiveView
     
     // ── GP Export path ──
     if let gpPath = gpExportPath {
@@ -212,7 +217,8 @@ func main() {
         guard let liveImage = renderer.livePreviewImage(
             live,
             transform: LiveViewTransform(),
-            size: CGSize(width: Int(live.pixelSize.width), height: Int(live.pixelSize.height)))
+            size: CGSize(width: Int(live.pixelSize.width), height: Int(live.pixelSize.height)),
+            flipVertically: flipY)
         else {
             print("Error: Failed to render/read back the live preview")
             exit(1)

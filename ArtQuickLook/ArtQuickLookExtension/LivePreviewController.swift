@@ -54,9 +54,12 @@ final class LivePreviewSession {
     /// Serialises all rendering for one preview (the MetalRenderer is stateful).
     private let renderQueue = DispatchQueue(label: "org.potato.ArtQuickLook.live",
                                            qos: .userInitiated)
+    /// Frames slower than this log their stage breakdown (bin / encode / gpu / paper), so
+    /// "the preview feels sluggish" can be diagnosed without a rebuild.
+    private static let slowFrameMilliseconds: Double = 250
     private let canvasSize: CGSize
     private let scale: CGFloat
-    private let flipCanvas: Bool
+    private let mirrorCanvas: Bool
 
     // ── Render queue only ──
     private var queueRenderer: ArtRenderLibrary.Renderer?
@@ -81,13 +84,13 @@ final class LivePreviewSession {
     /// - Note: deliberately *no* `Renderer` yet — constructing one loads the metallib,
     ///   builds every pipeline and allocates render targets, which must not happen on the
     ///   main thread while Quick Look is opening the preview.
-    init(art: ArtParser, canvasSize: CGSize, scale: CGFloat, flipCanvas: Bool = false) throws {
+    init(art: ArtParser, canvasSize: CGSize, scale: CGFloat, mirrorCanvas: Bool = true) throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw LivePreviewError.noMetalDevice
         }
         self.canvasSize = canvasSize
         self.scale = scale
-        self.flipCanvas = flipCanvas
+        self.mirrorCanvas = mirrorCanvas
         self.art = art
         self.view = LivePreviewView.make(device: device)
 
@@ -99,7 +102,7 @@ final class LivePreviewSession {
             renderer.presentLiveCanvas(canvas, to: drawable,
                                        transform: transform,
                                        clearColor: clearColor,
-                                       flipVertically: self.flipCanvas)
+                                       flipVertically: self.mirrorCanvas)
         }
     }
 
@@ -164,7 +167,7 @@ final class LivePreviewSession {
     // MARK: - Rendering (render queue)
 
     private func run(_ request: LiveRenderRequest) {
-        renderQueue.async { [weak self] in
+        renderQueue.async { [weak self] () -> Void in
             guard let self = self else { return }
 
             // First time: build the renderer, then the geometry cache.
@@ -190,6 +193,10 @@ final class LivePreviewSession {
                                                  art: self.art,
                                                  camera: request.transform,
                                                  viewport: request.viewport)
+                if let timing = renderer.lastLiveFrameTiming,
+                   timing.totalMilliseconds > Self.slowFrameMilliseconds {
+                    NSLog("ArtQuickLook live frame (slow): %@", timing.summary)
+                }
                 self.finish(canvas, renderer: renderer,
                             interactive: canvas != nil,
                             failed: canvas == nil)

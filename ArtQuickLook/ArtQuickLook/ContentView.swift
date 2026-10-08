@@ -8,7 +8,7 @@ final class SettingsStore: ObservableObject {
     @Published var useCache: Bool           { didSet { settings.useCache = useCache } }
     @Published var cacheSizeMB: Int         { didSet { settings.cacheSizeMB = cacheSizeMB } }
     @Published var generateThumbnails: Bool { didSet { settings.generateThumbnails = generateThumbnails } }
-    @Published var flipLiveCanvas: Bool     { didSet { settings.flipLiveCanvas = flipLiveCanvas } }
+    @Published var mirrorLiveCanvas: Bool    { didSet { settings.mirrorLiveCanvas = mirrorLiveCanvas } }
     
     init(settings: Settings = Settings()) {
         self.settings = settings
@@ -18,7 +18,7 @@ final class SettingsStore: ObservableObject {
         useCache = settings.useCache
         cacheSizeMB = settings.cacheSizeMB
         generateThumbnails = settings.generateThumbnails
-        flipLiveCanvas = settings.flipLiveCanvas
+        mirrorLiveCanvas = settings.mirrorLiveCanvas
     }
 }
 
@@ -85,10 +85,10 @@ struct LiveViewHelp: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.top, 4)
 
-            Toggle("Flip canvas vertically", isOn: $store.flipLiveCanvas)
+            Toggle("Mirror canvas vertically", isOn: $store.mirrorLiveCanvas)
                 .font(.caption)
                 .padding(.top, 6)
-                .help("Only if the live preview shows the document mirrored.")
+                .help("The live canvas needs mirroring to appear upright on macOS. Only untick if the preview shows the document upside down.")
         }
     }
 }

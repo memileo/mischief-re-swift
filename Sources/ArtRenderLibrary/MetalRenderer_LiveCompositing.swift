@@ -275,9 +275,12 @@ extension MetalRenderer {
         }
         
         // ── 1. Tile-bin every stroke into the staging arena (CPU only), keeping order.
+        var clock = DispatchTime.now().uptimeNanoseconds
         let (steps, bins) = try bin(layerOps: layerOps, width: width, height: height)
+        liveTiming.binMilliseconds += Self.milliseconds(since: clock)
         
         // ── 2. One copy, then encode each step against its slice of the arena.
+        clock = DispatchTime.now().uptimeNanoseconds
         try uploadArena(byteCount: liveStagingUsed)
         for step in steps {
             switch step {
@@ -287,6 +290,7 @@ extension MetalRenderer {
                     try dispatchLiveCut(meta: meta, width: width, height: height, encoder: encoder)
             }
         }
+        liveTiming.encodeMilliseconds += Self.milliseconds(since: clock)
         
         // Stack the finished layer onto the canvas in the same command buffer.
         guard let canvas = liveCanvasTexture, let layer = gpuRenderTarget else {
@@ -297,14 +301,36 @@ extension MetalRenderer {
         encoder.setTexture(layer, index: 0)
         encoder.setTexture(canvas, index: 1)
         encoder.setBytes(&layerOpacity, length: MemoryLayout<Float>.stride, index: 0)
-        encoder.dispatchThreadgroups(
-            MTLSize(width: (width + 7) / 8, height: (height + 7) / 8, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+        encoder.dispatchThreadgroups(Self.liveGroups(width: width, height: height),
+                                     threadsPerThreadgroup: Self.liveThreads)
         encoder.endEncoding()
         
+        clock = DispatchTime.now().uptimeNanoseconds
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
+        liveTiming.gpuMilliseconds += Self.milliseconds(since: clock)
         if let err = commandBuffer.error { throw err }
+    }
+    
+    static func milliseconds(since start: UInt64) -> Double {
+        Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000.0
+    }
+
+    /// Threads per threadgroup for the live passes: one thread per pixel, but 32×32 of
+    /// them instead of 8×8.
+    ///
+    /// The segment kernels derive their tile from `thread_position_in_grid`, so the thread
+    /// shape is free — and it is worth choosing well: a live frame dispatches *once per
+    /// stroke*, and each launch covers the whole canvas, so the launch overhead of the
+    /// (mostly empty) tiles dominates. 32×32 = 1024 threads is the hardware maximum, which
+    /// makes it 16× fewer threadgroup launches for identical work.
+    static let liveThreads = MTLSize(width: 32, height: 32, depth: 1)
+
+    /// Threadgroups needed for `width` × `height` pixels at `liveThreads`.
+    static func liveGroups(width: Int, height: Int) -> MTLSize {
+        MTLSize(width: (width + Int(liveThreads.width) - 1) / Int(liveThreads.width),
+                height: (height + Int(liveThreads.height) - 1) / Int(liveThreads.height),
+                depth: 1)
     }
     
     /// Bins every stroke into `liveStaging` and returns the ordered op list.
@@ -314,13 +340,22 @@ extension MetalRenderer {
         var bins: [LiveStrokeBin] = []
         var steps: [LiveLayerStep] = []
         steps.reserveCapacity(layerOps.count)
-        
+
+        // Last frame's footprint is a very good guess for this one (same document, a
+        // similar camera), so ask for it up front — that is what keeps a steady-state
+        // frame allocation-free.
+        if liveStagingUsed > 0, staging(needed: liveStagingUsed) == nil {
+            throw MetalRendererError.bufferCreationFailed
+        }
+
         for op in layerOps {
             switch op {
                 case .cut(let meta):
                     steps.append(.cut(meta))
                 case .stroke(let segments, let color, let isEraser, let isMarker):
                     guard !segments.isEmpty else { continue }
+                    liveTiming.strokes += 1
+                    liveTiming.segments += segments.count
                     let (tileIndicesData, tileListData) = buildSegmentTileIndices(
                         segments: segments,
                         textureWidth: width,
@@ -328,7 +363,14 @@ extension MetalRenderer {
                         tileSize: tileSize,
                         isMarker: isMarker,
                         transform: nil)
-                    if tileListData.isEmpty { continue }
+                    // Nothing of this stroke lands in the target, so nothing is lost by
+                    // skipping it entirely (the same test the segment binner applies).
+                    if tileListData.isEmpty {
+                        liveTiming.culledStrokes += 1
+                        liveTiming.strokes -= 1
+                        liveTiming.segments -= segments.count
+                        continue
+                    }
                     
                     var bin = LiveStrokeBin()
                     bin.segmentCount = segments.count
@@ -385,16 +427,25 @@ extension MetalRenderer {
     
     /// CPU staging buffer, grown on demand (existing contents are preserved — strokes
     /// are written as they are binned, so a grow must not drop the earlier ones).
+    ///
+    /// - Important: growth is **geometric**, never exact-fit. `bin` asks for more room once
+    ///   per stroke, so an exact-fit policy reallocated and copied the whole arena n times
+    ///   on the first frame of an n-stroke document — and because a fresh raw block is a new
+    ///   mmap, every one of those copies also faulted every page in again. For a ~20 MB
+    ///   arena that turned the first frame into tens of seconds; with doubling plus the
+    ///   previous frame's size as a hint it is a handful of allocations overall.
     private func staging(needed: Int) -> UnsafeMutableRawPointer? {
         if needed > liveStagingCapacity {
-            let grown = UnsafeMutableRawPointer.allocate(byteCount: needed,
+            let target = max(needed, liveStagingCapacity * 2)
+            let capacity = Self.alignUp(target, Self.liveArenaAlignment)
+            let grown = UnsafeMutableRawPointer.allocate(byteCount: capacity,
                                                          alignment: Self.liveArenaAlignment)
             if let old = liveStaging {
                 memcpy(grown, old, liveStagingCapacity)
                 old.deallocate()
             }
             liveStaging = grown
-            liveStagingCapacity = needed
+            liveStagingCapacity = capacity
         }
         return liveStaging
     }
@@ -445,9 +496,8 @@ extension MetalRenderer {
         encoder.setBuffer(arena, offset: bin.tileIndexOffset, index: 2)
         encoder.setBuffer(arena, offset: bin.tileListOffset, index: 3)
         encoder.setTexture(gpuRenderTarget, index: 0)
-        encoder.dispatchThreadgroups(
-            MTLSize(width: (width + 7) / 8, height: (height + 7) / 8, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+        encoder.dispatchThreadgroups(Self.liveGroups(width: width, height: height),
+                                     threadsPerThreadgroup: Self.liveThreads)
     }
     
     /// Cut dispatch into a caller-supplied encoder.
@@ -463,9 +513,8 @@ extension MetalRenderer {
         encoder.setComputePipelineState(pipeline)
         encoder.setBytes(&cutMeta, length: MemoryLayout<CutMeta>.stride, index: 0)
         encoder.setTexture(gpuRenderTarget, index: 0)
-        encoder.dispatchThreadgroups(
-            MTLSize(width: (width + 7) / 8, height: (height + 7) / 8, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+        encoder.dispatchThreadgroups(Self.liveGroups(width: width, height: height),
+                                     threadsPerThreadgroup: Self.liveThreads)
     }
     
     // MARK: - Layer compositing
@@ -503,10 +552,8 @@ extension MetalRenderer {
         encoder.setTexture(canvas, index: 1)
         encoder.setBytes(&layerOpacity, length: MemoryLayout<Float>.stride, index: 0)
         
-        let threads = MTLSize(width: 8, height: 8, depth: 1)
-        encoder.dispatchThreadgroups(
-            MTLSize(width: (width + 7) / 8, height: (height + 7) / 8, depth: 1),
-            threadsPerThreadgroup: threads)
+        encoder.dispatchThreadgroups(Self.liveGroups(width: width, height: height),
+                                     threadsPerThreadgroup: Self.liveThreads)
         encoder.endEncoding()
         
         commandBuffer.commit()
@@ -577,9 +624,8 @@ extension MetalRenderer {
         if let sampler = linearSampler { encoder.setSamplerState(sampler, index: 0) }
         encoder.setTexture(target, index: 1)
         
-        encoder.dispatchThreadgroups(
-            MTLSize(width: (width + 7) / 8, height: (height + 7) / 8, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+        encoder.dispatchThreadgroups(Self.liveGroups(width: width, height: height),
+                                     threadsPerThreadgroup: Self.liveThreads)
         encoder.endEncoding()
         
         commandBuffer.commit()

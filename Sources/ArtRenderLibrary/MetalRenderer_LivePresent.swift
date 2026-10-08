@@ -31,7 +31,7 @@ extension MetalRenderer {
                            to drawable: MTLDrawable,
                            transform: LiveViewTransform,
                            clearColor: MTLClearColor = MTLClearColorMake(0, 0, 0, 1),
-                           flipVertically: Bool = false) throws -> MTLCommandBuffer? {
+                           flipVertically: Bool = LiveCanvasRowOrder.presentsMirrored) throws -> MTLCommandBuffer? {
         guard let camDrawable = drawable as? CAMetalDrawable else {
             throw MetalRendererError.unsupportedDrawable
         }
@@ -52,7 +52,7 @@ extension MetalRenderer {
                            pipeline: MTLRenderPipelineState?,
                            transform: LiveViewTransform,
                            clearColor: MTLClearColor = MTLClearColorMake(0, 0, 0, 1),
-                           flipVertically: Bool = false,
+                           flipVertically: Bool = LiveCanvasRowOrder.presentsMirrored,
                            waitForCompletion: Bool) throws -> MTLCommandBuffer? {
         guard let pipeline = pipeline,
               let queue = commandQueue,
@@ -119,7 +119,7 @@ extension MetalRenderer {
     func renderLivePreviewTexture(_ canvas: LiveRenderedCanvas,
                                   transform: LiveViewTransform,
                                   size: CGSize,
-                                  flipVertically: Bool = false) throws -> MTLTexture? {
+                                  flipVertically: Bool = LiveCanvasRowOrder.presentsMirrored) throws -> MTLTexture? {
         guard let device = self.device else { throw MetalRendererError.deviceNotAvailable }
         let width = max(Int(size.width), 1)
         let height = max(Int(size.height), 1)
@@ -147,18 +147,21 @@ extension MetalRenderer {
     ///
     /// All of the maths lives in `LiveViewTransform.clipMatrix` (portable, unit tested);
     /// this only flattens it into the shader's scalar layout and applies the optional
-    /// vertical flip of the canvas.
+    /// vertical mirror of the canvas (see `LiveCanvasRowOrder`).
+    ///
+    /// - Note: `a.concatenated(with: b)` applies **a first**, then b.
     static func livePresentUniforms(transform: LiveViewTransform,
                                    canvasPixelSize: CGSize,
                                    viewportSize: CGSize,
-                                   flipVertically: Bool = false) -> LivePresentUniforms {
+                                   flipVertically: Bool = LiveCanvasRowOrder.presentsMirrored) -> LivePresentUniforms {
         var clip = transform.clipMatrix(canvasPixelSize: canvasPixelSize,
                                          viewportSize: viewportSize)
         if flipVertically {
-            // Mirror inside the canvas: y → canvasHeight - y, composed after the view
-            // transform so only the canvas's own row order changes.
-            clip = clip.concatenated(with: LiveViewMatrix(a: 1, b: 0, c: 0, d: -1,
-                                                           tx: 0, ty: canvasPixelSize.height))
+            // Mirror *inside the canvas*, so it composes with the view transform: the
+            // canvas position is mirrored first, then the view transform is applied.
+            let mirrored = LiveViewMatrix(a: 1, b: 0, c: 0, d: -1,
+                                          tx: 0, ty: canvasPixelSize.height)
+            clip = mirrored.concatenated(with: clip)
         }
         return LivePresentUniforms(
             m00: Float(clip.a), m10: Float(clip.b),

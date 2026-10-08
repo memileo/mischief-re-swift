@@ -118,4 +118,132 @@ final class LiveRenderCacheTests: XCTestCase {
     func testInvertRejectsDegenerateMatrices() {
         XCTAssertNil(invert(CGAffineTransform(a: 0, b: 0, c: 0, d: 0, tx: 5, ty: 5)))
     }
+
+    // MARK: - Composition order
+    //
+    // `a.concatenating(b)` applies *a first*, then b. Every transform below therefore has to
+    // be written "innermost first" — getting that backwards moved pasted content relative to
+    // the rest of the document as soon as the camera changed.
+
+    private func cache(base: CGAffineTransform,
+                       layer: CGAffineTransform,
+                       ops: [LiveCachedOp]) -> LiveRenderCache {
+        LiveRenderCache(baseTransform: base,
+                        layers: [LiveCachedLayer(layerIndex: 0, opacity: 1,
+                                                 layerTransform: layer,
+                                                 ops: ops,
+                                                 needsRebuild: false)],
+                        segmentCount: 0,
+                        withinBudget: true)
+    }
+
+    private func stroke(_ x: Float, _ y: Float) -> LiveCachedOp {
+        let segments = [segment(x, y)]
+        return .stroke(LiveCachedStroke(
+            segments: segments,
+            color: SIMD4<Float>(0, 0, 0, 1),
+            isEraser: false,
+            isMarker: false,
+            bounds: LiveCachedStroke.referenceBounds(of: segments, isMarker: false)))
+    }
+
+    /// liveBase = camera ∘ base, i.e. document px land where the camera puts them.
+    func testLiveBaseAppliesTheBaseFirst() {
+        let base = CGAffineTransform(a: 2, b: 0, c: 0, d: 2, tx: 10, ty: 20)
+        let camera = camera(scale: 3, rotate: .pi / 5, translate: CGPoint(x: -4, y: 9))
+        let cache = self.cache(base: base, layer: .identity, ops: [])
+
+        let expected = CGPoint(x: 5, y: 5).applying(base).applying(camera)
+        let actual = CGPoint(x: 5, y: 5).applying(cache.liveBaseTransform(camera: camera))
+        XCTAssertEqual(actual.x, expected.x, accuracy: 1e-6)
+        XCTAssertEqual(actual.y, expected.y, accuracy: 1e-6)
+    }
+
+    /// A rebuilt (paste) layer: layer first, then base, then camera — the same order the
+    /// static path uses for `artToDevice`.
+    func testArtToDeviceAppliesLayerBaseCamera() {
+        let layer = CGAffineTransform(a: 1, b: 0, c: 0, d: 1, tx: 100, ty: 0)
+        let base = CGAffineTransform(a: 1, b: 0.3, c: 0, d: 1, tx: 0, ty: 50)
+        let cam = camera(scale: 2, rotate: 0.7, translate: CGPoint(x: 3, y: -3))
+        let cache = self.cache(base: base, layer: layer, ops: [])
+
+        let expected = CGPoint(x: 1, y: 2).applying(layer).applying(base).applying(cam)
+        let actual = CGPoint(x: 1, y: 2).applying(cache.artToDevice(layerAt: 0, camera: cam)!)
+        XCTAssertEqual(actual.x, expected.x, accuracy: 1e-6)
+        XCTAssertEqual(actual.y, expected.y, accuracy: 1e-6)
+    }
+
+    /// The cut must still erase the region it erased in the static path: what the kernel
+    /// gets back is `liveBase⁻¹ ∘ m1`, which has to invert to `m1` exactly.
+    func testCutRecomposesAgainstAnyCamera() {
+        let base = CGAffineTransform(a: 1.5, b: 0.1, c: -0.2, d: 0.9, tx: 30, ty: -8)
+        let selectionFrame = CGAffineTransform(a: 0.8, b: 0.4, c: -0.1, d: 1.2, tx: 7, ty: 11)
+        for cam in [camera(scale: 1),
+                    camera(scale: 2.7, rotate: -0.9, translate: CGPoint(x: 12, y: 34)),
+                    camera(scale: 0.31, rotate: 2.2)] {
+            let cache = self.cache(base: base, layer: .identity,
+                                   ops: [.cut(rect: [0, 0, 40, 40], selectionFrame: selectionFrame)])
+            guard let ops = cache.deviceOps(forLayerAt: 0, camera: cam),
+                  case .cut(let meta)? = ops.first else {
+                return XCTFail("expected a cut op")
+            }
+            // liveBase ∘ (liveBase⁻¹ ∘ m1) == m1
+            let round = CGPoint(x: 5, y: 5).applying(meta.inverseAffine)
+                .applying(cache.liveBaseTransform(camera: cam))
+            let expected = CGPoint(x: 5, y: 5).applying(selectionFrame)
+            XCTAssertEqual(round.x, expected.x, accuracy: 1e-4)
+            XCTAssertEqual(round.y, expected.y, accuracy: 1e-4)
+        }
+    }
+
+    // MARK: - Off-screen culling
+
+    func testCullingDropsStrokesOutsideTheViewport() {
+        let cache = self.cache(base: .identity, layer: .identity,
+                               ops: [stroke(50, 50), stroke(5_000, 5_000)])
+        let cam = camera(scale: 2, rotate: 0.3, translate: CGPoint(x: 10, y: 10))
+
+        XCTAssertEqual(cache.deviceOps(forLayerAt: 0, camera: cam)?.count, 2)
+        let culled = cache.deviceOps(forLayerAt: 0, camera: cam,
+                                     viewport: CGRect(x: 0, y: 0, width: 800, height: 600))
+        XCTAssertEqual(culled?.count, 1)
+        XCTAssertEqual(cache.strokeCount(at: 0), 2)
+    }
+
+    func testCullingKeepsStrokesThatTouchTheViewport() {
+        let cache = self.cache(base: .identity, layer: .identity,
+                               ops: [stroke(0, 0), stroke(-400, -400), stroke(400, 400)])
+        // 1:1 camera, so the stroke 400 px off to the top left is off the view while the
+        // two inside stay.
+        let viewport = CGRect(x: 0, y: 0, width: 800, height: 600)
+        XCTAssertEqual(cache.deviceOps(forLayerAt: 0, camera: .identity, viewport: viewport)?.count, 2)
+        // Zoomed out far enough to contain the far corner.
+        let zoomedOut = CGRect(x: -1_000, y: -1_000, width: 3_000, height: 3_000)
+        XCTAssertEqual(cache.deviceOps(forLayerAt: 0, camera: .identity, viewport: zoomedOut)?.count, 3)
+    }
+
+    /// Culling is decided on the *camera-transformed* box: a quarter turn swings the far
+    /// stroke into the view, which an axis-aligned test on the untransformed box would miss.
+    func testCullingAccountsForRotation() {
+        let cache = self.cache(base: .identity, layer: .identity, ops: [stroke(1_000, 0)])
+        let viewport = CGRect(x: 0, y: 0, width: 800, height: 600)
+        // (1000, 0) → rotated a quarter turn clockwise → (0, -1000) → then down 1000 px.
+        let cam = camera(rotate: -.pi / 2, translate: CGPoint(x: 0, y: 1_000))
+        XCTAssertEqual(cache.deviceOps(forLayerAt: 0, camera: .identity, viewport: viewport)?.count, 0)
+        XCTAssertEqual(cache.deviceOps(forLayerAt: 0, camera: cam, viewport: viewport)?.count, 1)
+    }
+
+    /// `referenceBounds` has to contain the ink it is culled against, markers included.
+    func testReferenceBoundsCoversTheStroke() {
+        let segments = [segment(100, 200, r0: 4, r1: 9)]
+        let bounds = LiveCachedStroke.referenceBounds(of: segments, isMarker: false)
+        XCTAssertLessThanOrEqual(bounds.minX, 99)
+        XCTAssertLessThanOrEqual(bounds.minY, 199)
+        XCTAssertGreaterThanOrEqual(bounds.maxX, 102)
+        XCTAssertGreaterThanOrEqual(bounds.maxY, 202)
+
+        let marker = LiveCachedStroke.referenceBounds(of: segments, isMarker: true)
+        XCTAssertGreaterThan(marker.width, bounds.width)
+        XCTAssertGreaterThan(marker.height, bounds.height)
+    }
 }

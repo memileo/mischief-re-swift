@@ -78,12 +78,11 @@ public final class LiveRenderedCanvas {
     /// Runs the present pass offscreen and reads the result back: the exact image the
     /// live view draws for `transform`. Test/debug aid for `art2png --live-view`.
     ///
-    /// - Parameter flipVertically: escape hatch for the canvas row order. See
-    ///   `MetalRenderer_LivePresent.presentLiveCanvas`.
+    /// - Parameter flipVertically: canvas row order, see `LiveCanvasRowOrder`.
     func previewImage(renderer: MetalRenderer,
                       transform: LiveViewTransform = LiveViewTransform(),
                       size: CGSize,
-                      flipVertically: Bool = false) throws -> CGImage? {
+                      flipVertically: Bool = LiveCanvasRowOrder.presentsMirrored) throws -> CGImage? {
         let texture = try renderer.renderLivePreviewTexture(self, transform: transform,
                                                              size: size,
                                                              flipVertically: flipVertically)

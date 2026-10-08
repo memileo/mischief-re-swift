@@ -17,6 +17,9 @@
 //    Quick Look panel, where MTKView's CADisplayLink is not something we can rely on.
 //  - All input funnels through `commitTransform(...)`, which mutates the transform, tells
 //    the shared HUD and asks for a refresh — one code path for gestures and resets alike.
+//  - Bindings: left drag pans (shift → rotate, cmd → zoom), middle drag pans (cmd → zoom,
+//    shift → rotate), the scroll wheel zooms at the pointer, and 0/P/Z/R + the context menu
+//    do the resets.
 //
 
 import Cocoa
@@ -51,6 +54,9 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     private var dragMode: LiveInteractionMode = .pan
     private var dragAnchor = CGPoint.zero        // grab point, in view pixels
     private var lastDragLocation = CGPoint.zero  // previous event, in view pixels
+    /// The `…MouseDown` mask of the button that started the current drag, so a release
+    /// outside the view can be detected from `pressedMouseButtons`.
+    private var dragButtonMask: NSEvent.EventTypeMask = []
 
     /// Viewport (device pixels) last reported to the session.
     private var reportedViewport = CGSize.zero
@@ -59,11 +65,15 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     // and non-Retina; the transform itself works in pixels)
     private static let zoomSensitivity: CGFloat = 0.010     // exp factor per point
     private static let rotateSensitivity: CGFloat = 0.010  // radians per point
+    /// `scrollWheel` reports lines, not points; converted to an exp factor here.
+    private static let scrollZoomSensitivity: CGFloat = 0.060
     private static let interactionHold: TimeInterval = 0.35
     private static let resetHold: TimeInterval = 0.5
 
-    private static var isMiddleButtonDown: Bool {
-        NSEvent.pressedMouseButtons & Int(NSEvent.EventTypeMask.otherMouseDown.rawValue) != 0
+    /// A drag button can be released outside the view, in which case no `…MouseUp` is
+    /// delivered here — `draw(in:)` notices and ends the gesture.
+    private static func isPressed(_ mask: NSEvent.EventTypeMask) -> Bool {
+        !mask.isEmpty && NSEvent.pressedMouseButtons & Int(mask.rawValue) != 0
     }
 
     // MARK: - Init
@@ -212,10 +222,10 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
-        // The middle button can be released outside the view, in which case no
-        // `otherMouseUp` is delivered here.
-        if isDragging && !Self.isMiddleButtonDown {
-            finishDrag()
+        // A drag button can be released outside the view, in which case no `…MouseUp`
+        // is delivered here.
+        if isDragging && !Self.isPressed(dragButtonMask) {
+            endDrag()
         }
 
         guard let canvas = canvas, let present = present else { return }
@@ -254,7 +264,14 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         }
     }
 
-    // MARK: - Middle-button interaction
+    // MARK: - Pointer interaction
+    //
+    // Two equivalent bindings, so the view feels normal on a trackpad-less mouse as well
+    // as with one that has a middle button:
+    //
+    //   left button          pan           (shift → rotate, cmd → zoom)
+    //   middle button        pan           (cmd → zoom, shift → rotate)
+    //   scroll wheel         zoom at the pointer
 
     /// Backing scale of the window (the target's SDK does not expose
     /// `NSView.contentScaleFactor`).
@@ -275,7 +292,7 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         return CGPoint(x: point.x * scale, y: y * scale)
     }
 
-    /// mmb pan, mmb+cmd zoom, mmb+shift rotate (cmd wins over shift).
+    /// Modifiers pick the mode; cmd wins over shift.
     private func mode(for flags: NSEvent.ModifierFlags) -> LiveInteractionMode {
         if flags.contains(.command) { return .zoom }
         if flags.contains(.shift) { return .rotate }
@@ -287,20 +304,80 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         return size.width > 0 && size.height > 0 ? size : .zero
     }
 
+    // ── Left button ──
+
+    override func mouseDown(with event: NSEvent) {
+        beginDrag(mode: mode(for: event.modifierFlags),
+                  location: pixelLocation(of: event),
+                  button: .leftMouseDown)
+        // A left drag is a pan, not a selection, so the view must not also start a text
+        // selection or hand the event back to the window.
+        window?.makeFirstResponder(self)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        drag(to: pixelLocation(of: event), mode: mode(for: event.modifierFlags))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        endDrag()
+    }
+
+    // ── Middle button ──
+
     override func otherMouseDown(with event: NSEvent) {
-        isDragging = true
-        dragMode = mode(for: event.modifierFlags)
-        let location = pixelLocation(of: event)
-        dragAnchor = location
-        lastDragLocation = location
-        hud.beginInteraction(dragMode, zoomPercent: viewTransform.zoomPercent)
-        NSCursor.closedHand.set()
+        beginDrag(mode: mode(for: event.modifierFlags),
+                  location: pixelLocation(of: event),
+                  button: .otherMouseDown)
     }
 
     override func otherMouseDragged(with event: NSEvent) {
+        drag(to: pixelLocation(of: event), mode: mode(for: event.modifierFlags))
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        endDrag()
+    }
+
+    // ── Scroll wheel ──
+
+    override func scrollWheel(with event: NSEvent) {
+        // Natural scrolling can invert the sign; `hasPreciseScrollingDeltas` means points
+        // instead of lines, so the sensitivity is calibrated for lines and scaled.
+        var delta = event.scrollingDeltaY
+        if event.hasPreciseScrollingDeltas { delta *= 0.1 }
+
+        guard delta != 0, viewportSize != .zero else {
+            super.scrollWheel(with: event)
+            return
+        }
+        // Scrolling up zooms in.
+        let factor = exp(delta * Self.scrollZoomSensitivity)
+        commitTransform(mode: .zoom) { viewTransform in
+            viewTransform.zoom(by: factor,
+                               anchor: pixelLocation(of: event),
+                               viewportSize: viewportSize)
+        }
+    }
+
+    // ── Shared drag handling ──
+
+    private func beginDrag(mode: LiveInteractionMode,
+                           location: CGPoint,
+                           button: NSEvent.EventTypeMask) {
+        // `NSEvent.EventTypeMask.leftMouseDown` / `.otherMouseDown` — note that `.left` and
+        // `.other` are `NSEvent.ButtonType` cases, not mask cases.
+        isDragging = true
+        dragMode = mode
+        dragButtonMask = button
+        dragAnchor = location
+        lastDragLocation = location
+        hud.beginInteraction(mode, zoomPercent: viewTransform.zoomPercent)
+        NSCursor.closedHand.set()
+    }
+
+    private func drag(to location: CGPoint, mode eventMode: LiveInteractionMode) {
         guard isDragging else { return }
-        let location = pixelLocation(of: event)
-        let eventMode = mode(for: event.modifierFlags)
 
         // Modifiers pressed/released mid-drag: re-anchor at the current location so the
         // gesture continues from where the pointer is instead of jumping.
@@ -340,13 +417,10 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         }
     }
 
-    override func otherMouseUp(with event: NSEvent) {
-        finishDrag()
-    }
-
-    private func finishDrag() {
+    private func endDrag() {
         guard isDragging else { return }
         isDragging = false
+        dragButtonMask = []
         NSCursor.arrow.set()
         hud.endInteraction(hold: Self.interactionHold)
     }

@@ -83,6 +83,23 @@ public struct LiveViewMatrix: Equatable {
     }
 }
 
+// MARK: - Canvas row order
+
+/// Which way round the live canvas texture is presented.
+///
+/// Measured on macOS 14/15 (Apple silicon): presenting the canvas with **row 0 at the top**
+/// of the drawable shows the document upside down — even though the *same* texture is
+/// upright in the static CoreGraphics path, which draws it row 0-at-top inside a y-flipped
+/// context. That asymmetry is not explained, so this is the single place that states which
+/// way round the canvas goes; everything else defaults to it.
+///
+/// `Settings.mirrorLiveCanvas` (app) / `art2png --no-flip-y` mirror it back for a display
+/// that behaves the other way round.
+public enum LiveCanvasRowOrder {
+    /// Mirror the canvas vertically when presenting it.
+    public static let presentsMirrored = true
+}
+
 // MARK: - Transform
 
 /// User-controlled view transform for the live preview. Value type: every gesture

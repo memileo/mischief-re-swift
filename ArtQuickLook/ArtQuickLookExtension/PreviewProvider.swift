@@ -72,7 +72,7 @@ class PreviewProvider: NSViewController, QLPreviewingController {
                 session = try LivePreviewSession(art: art,
                                                  canvasSize: geometry.canvasSize,
                                                  scale: geometry.scale,
-                                                 flipCanvas: Settings().flipLiveCanvas)
+                                                 mirrorCanvas: Settings().mirrorLiveCanvas)
             } catch {
                 NSLog("ArtQuickLook live view unavailable: \(error.localizedDescription) — using static preview")
                 self.renderStaticPreviewInBackground(art: art, geometry: geometry, handler: handler)

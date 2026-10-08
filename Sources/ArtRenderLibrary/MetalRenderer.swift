@@ -138,6 +138,8 @@ class MetalRenderer {
     /// Set once the live pipelines exist. A stale metallib (missing the live
     /// kernels) leaves this false and callers fall back to the static path.
     internal var liveCompositingPrepared = false
+    /// Stage timings of the interactive frame currently being built — see LiveFrameTiming.swift.
+    internal var liveTiming = LiveFrameTiming()
     
     // CPU-readable staging texture (shared storage) used for readback after blit
     private(set) var stagingTexture: MTLTexture?
