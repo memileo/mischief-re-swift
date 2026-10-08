@@ -27,6 +27,14 @@ func main() {
         print("  --live                 macOS only: Also render through the live Metal canvas path")
         print("                          (writes <input>-live.png next to the normal output)")
         print("  --live-only            macOS only: Only render the live canvas path")
+        print("  --live-view            macOS only: Interactive (re-render) path; writes")
+        print("                          <input>-live-view.png for the given view")
+        print("  --live-cache           macOS only: Report geometry cache size / budget")
+        print("  --viewport WxH         Viewport for --live-view (default 1600x900)")
+        print("  --zoom F               Zoom factor for --live-view (1 = as the file shows)")
+        print("  --pan X,Y              Pan in view pixels for --live-view")
+        print("  --rotate R             Rotation in radians for --live-view")
+        print("  --flip-y               macOS only: Mirror the live view vertically")
     }
     
     guard args.count > 1 else {
@@ -45,6 +53,13 @@ func main() {
     var useSegmentRendering = true
     var useLiveCanvas = false
     var liveOnly = false
+    var useLiveView = false
+    var liveCacheReport = false
+    var flipY = false
+    var viewportSize = CGSize(width: 1600, height: 900)
+    var liveZoom: CGFloat = 1
+    var livePan = CGPoint.zero
+    var liveRotation: CGFloat = 0
     
     var i = 1
     while i < args.count {
@@ -95,6 +110,45 @@ func main() {
         } else if args[i] == "--live-only" {
             useLiveCanvas = true
             liveOnly = true
+            i += 1
+        } else if args[i] == "--live-view" {
+            useLiveView = true
+            i += 1
+        } else if args[i] == "--live-cache" {
+            liveCacheReport = true
+            i += 1
+        } else if args[i] == "--flip-y" {
+            flipY = true
+            i += 1
+        } else if args[i] == "--zoom" {
+            i += 1
+            guard i < args.count, let v = Double(args[i]) else {
+                print("Error: --zoom requires a numeric value"); exit(1)
+            }
+            liveZoom = CGFloat(v)
+            i += 1
+        } else if args[i] == "--rotate" {
+            i += 1
+            guard i < args.count, let v = Double(args[i]) else {
+                print("Error: --rotate requires a numeric value"); exit(1)
+            }
+            liveRotation = CGFloat(v)
+            i += 1
+        } else if args[i] == "--pan" {
+            i += 1
+            guard i < args.count else { print("Error: --pan requires X,Y"); exit(1) }
+            let parts = args[i].split(separator: ",").compactMap { Double($0) }
+            guard parts.count == 2 else { print("Error: --pan requires X,Y"); exit(1) }
+            livePan = CGPoint(x: CGFloat(parts[0]), y: CGFloat(parts[1]))
+            i += 1
+        } else if args[i] == "--viewport" {
+            i += 1
+            guard i < args.count,
+                  let w = Double(args[i].split(separator: "x").first ?? ""),
+                  let h = Double(args[i].split(separator: "x").last ?? "") else {
+                print("Error: --viewport requires WxH"); exit(1)
+            }
+            viewportSize = CGSize(width: CGFloat(w), height: CGFloat(h))
             i += 1
         } else if args[i] == "--help" || args[i] == "-h" {
             info()
@@ -169,9 +223,50 @@ func main() {
         
         if liveOnly { exit(0) }
     }
+    
+    // ── Interactive (re-render) path + cache report ──
+    if useLiveView || liveCacheReport {
+        guard let cache = renderer.buildLiveRenderCache(art: art, scale: scale) else {
+            print("Error: live geometry cache failed to build")
+            exit(1)
+        }
+        let megabytes = Double(cache.segmentCount * MemoryLayout<GPUSplineSegment>.stride) / 1_048_576.0
+        print("""
+              Live cache: \(cache.segmentCount) segments (\(String(format: "%.1f", megabytes)) MB), \
+              \(cache.layers.count) layers, \
+              \(cache.rebuildingLayers) rebuilt per frame (paste/merge), \
+              budget \(Renderer.liveCacheSegmentBudget)
+              """)
+        
+        if useLiveView {
+            var transform = LiveViewTransform()
+            if liveZoom != 1 { _ = transform.zoom(by: liveZoom, anchor: CGPoint(x: viewportSize.width / 2, y: viewportSize.height / 2), viewportSize: viewportSize) }
+            if livePan != .zero { _ = transform.pan(by: livePan) }
+            if liveRotation != 0 { _ = transform.rotate(by: liveRotation, anchor: CGPoint(x: viewportSize.width / 2, y: viewportSize.height / 2), viewportSize: viewportSize) }
+            
+            guard let live = renderer.renderLive(cache: cache, art: art, camera: transform,
+                                                 viewport: viewportSize, clearPaper: true) else {
+                print("Error: interactive live render failed")
+                exit(1)
+            }
+            guard let image = renderer.livePreviewImage(live, transform: live.presentTransform,
+                                                        size: live.pixelSize,
+                                                        flipVertically: flipY) else {
+                print("Error: failed to read back the interactive live render")
+                exit(1)
+            }
+            let viewPath = inputURL.deletingPathExtension().appendingPathExtension("live-view.png").path
+            saveCGImageAsPNG(image, to: viewPath)
+            print("Live view (\(Int(live.pixelSize.width))×\(Int(live.pixelSize.height)), "
+                  + "zoom \(String(format: "%.2f", transform.zoom))x, "
+                  + "rotate \(String(format: "%.3f", transform.rotation)) rad): \(viewPath)")
+        }
+        
+        if liveCacheReport && !useLiveView { exit(0) }
+    }
 #else
-    if useLiveCanvas {
-        print("Error: --live / --live-only require macOS (Metal)")
+    if useLiveCanvas || useLiveView || liveCacheReport {
+        print("Error: --live / --live-view / --live-cache require macOS (Metal)")
         exit(1)
     }
 #endif

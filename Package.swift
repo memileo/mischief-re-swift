@@ -59,6 +59,7 @@ let package = Package(
                 // Live Metal view (interactive pan/zoom/rotate preview)
                 "LiveViewTransform.swift",
                 "LiveRenderedCanvas.swift",
+                "LiveRenderCache.swift",
                 "MetalRenderer_LiveCompositing.swift",
                 "MetalRenderer_LivePresent.swift",
                 "Renderer_Live.swift",

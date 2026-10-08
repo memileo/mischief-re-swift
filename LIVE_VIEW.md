@@ -2,6 +2,14 @@
 
 Status: **in progress** (updated as work proceeds; see [Progress log](#progress-log))
 
+> **Working agreements (2026-10-08):**
+> - **Never touch `project.pbxproj`.** New files that live *inside* the Xcode project
+>   (extension Swift files, `.metal` files) get a sibling `ADD_TO_XCODE.txt` note and are
+>   added by hand. Files under `Sources/ArtRenderLibrary/` need nothing — SwiftPM picks
+>   them up from the `sources:` list in `Package.swift`, which is ours to edit.
+> - The metallib is built with the **ArtRenderShaders** scheme in Xcode and copied to
+>   `Sources/ArtRenderLibrary/ArtRenderShaders.metallib`.
+
 ## 1. Goal
 
 Add a **live view** preview mode to the Quick Look extension:
@@ -201,7 +209,9 @@ resource bundle copies). `--verify-only` reports whether it is up to date.
 | `ArtQuickLook/ArtQuickLookExtension/LiveHUD.swift` | shared HUD state/logic + overlay view |
 | `ArtQuickLook/ArtQuickLookExtension/LivePreviewController.swift` | glue: render off-main, install canvas, fallback |
 | `Scripts/build-metallib.sh` | metallib rebuild helper (with kernel verification) |
+| `Sources/ArtRenderLibrary/LiveRenderCache.swift` | the "process once" geometry cache + the per-frame camera re-mapping |
 | `Tests/ArtRenderLibraryTests/LiveViewTransformTests.swift` | 15 Linux-runnable tests for the transform maths |
+| `Tests/ArtRenderLibraryTests/LiveRenderCacheTests.swift` | 8 Linux-runnable tests for the cache re-mapping maths |
 
 ### Modified
 
@@ -267,6 +277,27 @@ per-mode HUD tweaks, `Scripts/build-metallib.sh` in CI, README screenshots.
 
 **Test point:** regression pass over the three original render paths.
 
+### Stage 7 — Take 3: re-render architecture (this round)
+See §9. Work in this order so each step is independently testable:
+
+- **7a** SDK/robustness fixes in the extension (no `contentScaleFactor`,
+  `NSCursor.closedHand`, no `isOpaque`/`acceptsFirstResponder` overrides), live view as
+  a radio option, no 1× floor, explicit canvas orientation flag + `--live-view` dump.
+  **Test:** gestures track 1:1 on Retina *and* non-Retina; the dump either matches
+  `<file>.png` or reveals the flip (then set the flag).
+- **7b** `LiveRenderCache`: geometry flattened once at a reference transform, per layer,
+  with a memory budget. `art2png --live-cache` reports budget usage.
+  **Test:** the cache builds on every `art/*.art` and the report looks sane.
+- **7c** `renderLive(camera:size:)`: re-map cached geometry, dispatch, composite into a
+  screen-sized canvas, paper in document space.
+  **Test:** `art2png --live-view --zoom 4 --rotate 0.3` produces a *re-rasterised*
+  image (crisper than `--live`), and `--live-view` at 100% matches `--live`.
+- **7d** Extension: request-a-rerender scheduler with coalescing, FPS = renders/sec.
+  **Test:** one long drag stays live for the whole gesture; HUD FPS is sane; nothing
+  happens when idle.
+- **7e** Fallback wiring: budget exceeded → single-raster mode; a setting to force it for
+  A/B comparison.
+
 ## 7b. Known limitations / deliberate choices
 
 - **Embedded images** (`art.images`) are not drawn by the live path, matching the
@@ -280,7 +311,56 @@ per-mode HUD tweaks, `Scripts/build-metallib.sh` in CI, README screenshots.
   check in the draw loop rather than delivering `otherMouseUp`.
 - The middle button is reserved while the live view is up.
 
-## 7. Risks
+## 9. Take 3 — what the first working build taught us (2026-10-08)
+
+Reported after building on macOS:
+
+1. **It renders, it is a bit faster than the CG path, the HUD looks right.**
+2. **The image is y-flipped.** The present pass assumed canvas row 0 = document top
+   (which is what the static path implies). Rather than guess again, the orientation is
+   now a single Swift-side flag (`LiveRenderedCanvas.flipsVertically`) and there is an
+   `art2png --live-view` dump so the correct value can be confirmed in one command
+   against the static PNG.
+3. **"Not quite what I had in mind":** transforming one raster is not a live view. The
+   document must be **re-rendered** for the new view matrix so strokes stay crisp at any
+   zoom, with the parsed/processed stroke data kept in memory so only the cheap part is
+   redone. Above a large memory budget, fall back to the single-raster mode.
+4. **Gestures only applied for a fraction of a second.** The old gating depended on
+   MTKView's display link running inside the Quick Look host. The new scheduler does not:
+   every change schedules a re-render on a serial queue, coalescing while one is in
+   flight, and presents when it finishes. FPS = completed renders per second.
+5. **Live view should be a radio-button option**, not a separate toggle.
+6. **No 1× floor** on the render scale — a weak GPU on a Retina display should be able
+   to render below 1×.
+7. SDK constraints found while compiling: `NSView.contentScaleFactor`,
+   `NSView.acceptsFirstResponder()` and `MTKView.isOpaque` are not usable in this target,
+   and `NSCursor.closed` does not exist.
+
+### 9.1 Target architecture (take 3)
+
+```
+                   ┌──────────────────────── once per document ──────────────────────┐
+  ArtParser ─────► │ LiveRenderCache:  per layer, per op, geometry flattened in      │
+                   │ *reference* space (100% zoom).  Strokes/cuts only; a layer that │
+                   │ contains paste/merge actions is marked `needsRebuild` and is      │
+                   │ re-walked per frame so it stays exactly correct.                 │
+                   │ Budget: ~4M cached points; over that → fall back to raster mode. │
+                   └───────────────────────────────────────────────────────────────┘
+                                        │
+  view change ─► camera (LiveViewTransform) ─► for each layer:
+                                        │    artToDevice = camera ∘ base ∘ layer
+                                        │    • re-map cached control points + radii (no recursion)
+                                        │    • re-classify segmentType (scale-invariant)
+                                        │    • dispatch + composite onto a **screen-sized** canvas
+                                        │    • paper background tiled in *document* space
+                                        └─► present (identity transform) ─► MTKView
+```
+
+Re-rendering at screen resolution (instead of transforming a document-sized raster) is
+what makes zooming in show real detail, and it also bounds the per-frame cost by the
+window size rather than by the zoom level.
+
+The single-raster mode stays as the fallback and as the reference for `--live`.
 
 - **Stale metallib** → live mode silently falls back. Mitigated by a loud log + the
   build script + documented step.
@@ -361,18 +441,96 @@ A claim in the review that `SIMD3<Float>` matches MSL `float3` was checked and i
 incorrect (`MemoryLayout<SIMD3<Float>>.size == 16` vs MSL's 12), so the scalar uniform
 layout stays.
 
-### Test points still to run (needs macOS)
+### Take 3 progress (2026-10-08)
 
-1. `Scripts/build-metallib.sh` → metallib contains the four new functions.
-2. `swift build -c release` on macOS, then `art2png --live art/<file>.art` →
-   `<file>-live.png` must match `<file>.png` (paper, layer opacity, background) — the
-   live hook runs the real present pass at 100% zoom, so the two PNGs should be
-   pixel-close.
-3. Build the **ArtQuickLook** scheme, tick "Live Metal view", open a `.art` in Quick
-   Look: pan / zoom / rotate, FPS HUD, zoom %, all four resets, and no redraws at
-   idle.
-4. Regression: the three existing render paths still look identical (the layer-op
-   extraction is a pure move, but verify anyway).
-5. Try a file with embedded images (`art/embedd.art`): note that the default GPU
-   segment path already drops them, and the live path behaves the same (see
-   "Stretch" below).
+**7a — SDK fixes, UI, orientation**
+- No `NSView.contentScaleFactor` / `NSView.acceptsFirstResponder()` /
+  `MTKView.isOpaque` in this target: backing scale now comes from
+  `window?.backingScaleFactor`, the cursor is `NSCursor.closedHand`, and neither override
+  is used. (All three were commented out in the macOS build; they are now written the way
+  that SDK accepts.)
+- Live view is back in the **radio group** (`RenderPath.allCases`), the separate toggle is
+  gone, and the shortcut help + a "Flip canvas vertically" escape hatch only appear while
+  it is selected.
+- **No 1× floor**: `previewScale` is used as-is, so a weak GPU on Retina can rasterise
+  below 1×.
+- Canvas row order is now one flag: `presentLiveCanvas(..., flipVertically:)`, plumbed
+  through `LiveRenderedCanvas.previewImage` and the app setting, so the orientation
+  question is settled with `art2png --live [--flip-y]` instead of by eye.
+
+**7b — `LiveRenderCache`** (`Sources/ArtRenderLibrary/LiveRenderCache.swift`)
+- Per layer: flattened segments at the 100% reference transform, plus cut rects with
+  their selection-frame transform. Layers containing paste/merge are flagged
+  `needsRebuild`.
+- Budget: 1.5 M segments (~84 MB) → cache refused → single-raster fallback.
+- Deliberately **not** wrapped in `#if canImport(Metal`, so the maths type-checks and
+  unit-tests on Linux: 8 new tests in `LiveRenderCacheTests` (identity/scale/translate/
+  rotation re-mapping, chord-to-radius invariance under a similarity, inversion).
+
+**7c — `renderLive(cache:camera:viewport:)`**
+- Re-maps cached geometry with the camera, dispatches a whole layer in **one command
+  buffer** (per-stroke dispatches, so overlap compositing matches the static path),
+  composites onto a **viewport-sized** canvas (so zooming in gains real detail and the
+  per-frame cost is bounded by the window, not by the zoom), and bakes the paper in
+  *document* space so it travels with the artwork.
+- Two hazards found while writing it, both worth remembering:
+  - **Shared buffers under many dispatches.** The static path reuses `segmentBuffer` /
+    `tileIndicesBuffer` per stroke, which is only safe because it waits for each command
+    buffer. Encoding a whole layer into one command buffer means the CPU finishes writing
+    every dispatch before the GPU starts the first, so those buffers would be overwritten
+    mid-flight. Fixed with a per-layer **arena**: every dispatch binds its own `offset:`
+    into one buffer, and the scheduler's one-render-at-a-time rule makes reusing it across
+    frames safe. (`setBytes` snapshots its value, so params/cuts can still share one
+    command buffer.)
+  - **Paper tile units.** The tile size is in *document* units, so the interactive path
+    needs `camera⁻¹ ∘ scale⁻¹` and `tileScale: 1`; the raster path keeps `tileScale: scale`
+    because it tiles in canvas pixels.
+
+**7d — request-driven scheduling**
+- `LivePreviewView` no longer depends on MTKView's display link: it reports
+  `(transform, viewport)` changes and the session re-rasterises on its own queue,
+  coalescing to the newest transform while a render is in flight. FPS = completed
+  re-renders per second. The single-raster fallback keeps the old "transform and
+  redraw" behaviour (no re-render per change).
+
+**7e — fallbacks**
+- Cache unavailable/over budget, or Metal/kernels missing → single raster, announced in
+  the log; nothing fails hard. Total failure still falls back to the static preview.
+- `art2png`: `--live-view`, `--live-cache`, `--zoom`, `--pan`, `--rotate`, `--viewport`,
+  `--flip-y`.
+- `Scripts/build-metallib.sh` gained `--from-xcode` (installs the metallib the
+  **ArtRenderShaders** scheme just produced — that is the route that works) and now
+  refuses to install an incomplete library.
+
+**Not touched:** `project.pbxproj` (per the agreement above). No new files were added
+inside the Xcode project: the cache lives in `Sources/ArtRenderLibrary/` (SwiftPM picks it
+up via `Package.swift`) and the shader change is inside the existing
+`liveCompositeKernels.metal`.
+
+### Test points for take 3 (needs macOS)
+
+Ordered so the cheapest, most diagnostic runs come first.
+
+1. **Orientation.** `art2png --live art/mischief-document.art` → compare
+   `<file>-live.png` with `<file>.png`. If the live one is mirrored, the present pass
+   needs `flipVertically: true` (the app exposes it as "Flip canvas vertically", and
+   `art2png --flip-y` tests it) — that settles the question in one command instead of by
+   eye in Quick Look.
+2. **Cache.** `art2png --live-cache art/*.art` (loop over the samples) → the report must
+   show a sane segment count and budget, and "N rebuilt per frame" only for documents
+   that really contain paste/merge actions.
+3. **Interactive path at 100%.** `art2png --live-view --viewport 1920x1080` →
+   `<file>-live-view.png` should match `<file>.png` closely (same strokes, same paper;
+   the AA may differ by a hair because the re-render flattens at the cache's reference
+   transform).
+4. **Interactive path zoomed in.** `--live-view --zoom 4` must show *more* detail than
+   `--zoom 1`, not a magnified bitmap — that is the whole point of the re-render path.
+   Also try `--rotate 0.4` and `--pan 120,-80`.
+5. **In Quick Look:** one long middle-button drag must stay live for the whole gesture
+   (this was the "only a fraction of a second" bug); HUD shows mode + FPS (renders/sec);
+   zoom shows a percentage; the four resets work from the context menu and from
+   `0`/`P`/`Z`/`R`; nothing renders when idle (check with `sample`/`Instruments` or just
+   that the fan stays quiet).
+6. **Regression:** the three static render paths unchanged; `--live` (single raster)
+   still works; a document with pastes (`art/paste*`, `art/layers.art`) still looks
+   right through the "rebuilt per frame" path.

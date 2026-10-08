@@ -57,48 +57,47 @@ class PreviewProvider: NSViewController, QLPreviewingController {
     }
     
     // MARK: - Live Metal view
-    
+
     private var liveSession: LivePreviewSession?
-    
+
     private func presentLivePreview(art: ArtParser,
                                     geometry: PreviewGeometry,
                                     handler: @escaping (Error?) -> Void) {
         DispatchQueue.main.async {
             let session: LivePreviewSession
             do {
-                // The live view shows a document raster, so a scale below 1x would only
-                // make it blurry — floor it at 1x.
+                // No 1x floor: a weak GPU on a Retina display should be able to rasterise
+                // the document below 1x. The interactive mode re-rasterises per view
+                // change anyway, so this is only the geometry cache's resolution.
                 session = try LivePreviewSession(art: art,
                                                  canvasSize: geometry.canvasSize,
-                                                 scale: max(1.0, geometry.scale))
+                                                 scale: geometry.scale,
+                                                 flipCanvas: Settings().flipLiveCanvas)
             } catch {
                 NSLog("ArtQuickLook live view unavailable: \(error.localizedDescription) — using static preview")
                 self.renderStaticPreviewInBackground(art: art, geometry: geometry, handler: handler)
                 return
             }
-            
+
             self.liveSession = session
             self.replaceContent(with: session.view)
             self.preferredContentSize = geometry.preferredContentSize
-            
-            // Tell Quick Look we are ready right away: the GPU render happens on a
+
+            // Tell Quick Look we are ready right away: the document is rasterised on a
             // background queue and lands in the view when it is done.
             handler(nil)
-            
-            session.render(onReady: { [weak self] view in
-                // The view may only have its real size now; force one frame at it.
-                view.needsLayout = true
-                view.layoutSubtreeIfNeeded()
-                view.needsDisplay = true
-                self?.preferredContentSize = geometry.preferredContentSize
-            }, onFailure: { [weak self] error in
+
+            session.onFailure = { [weak self] error in
                 NSLog("ArtQuickLook live render failed: \(error.localizedDescription) — using static preview")
                 guard let self = self else { return }
                 self.liveSession = nil
-                // The preview was already announced to Quick Look, so just swap the
-                // content instead of calling the completion handler a second time.
+                // The preview was already announced to Quick Look, so swap the content
+                // instead of calling the completion handler a second time.
                 self.renderStaticPreviewInBackground(art: art, geometry: geometry, handler: nil)
-            })
+            }
+            // First render (this is also what builds the geometry cache). The view
+            // reports its real viewport itself once it has been laid out.
+            session.view.requestFirstRender()
         }
     }
     

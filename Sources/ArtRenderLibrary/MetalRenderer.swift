@@ -128,6 +128,13 @@ class MetalRenderer {
     internal var livePresentUniformsIndex = 0
     /// Linear sampling **with mips**, so zooming out below 1:1 does not alias.
     internal var livePresentSampler: MTLSamplerState?
+    // Interactive (re-render) mode scratch space — see MetalRenderer_LiveCompositing.
+    // Stored here because extensions cannot declare stored properties.
+    internal var liveStaging: UnsafeMutableRawPointer?
+    internal var liveStagingCapacity = 0
+    internal var liveArena: MTLBuffer?
+    internal var liveArenaCapacity = 0
+    internal var liveStagingUsed = 0
     /// Set once the live pipelines exist. A stale metallib (missing the live
     /// kernels) leaves this false and callers fall back to the static path.
     internal var liveCompositingPrepared = false

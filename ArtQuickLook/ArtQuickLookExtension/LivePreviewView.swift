@@ -2,30 +2,41 @@
 //  LivePreviewView.swift
 //  ArtQuickLookExtension
 //
-//  The interactive live preview: an MTKView that presents the already-composited
-//  canvas through a pan / zoom / rotate view transform.
+//  The interactive live preview surface: an MTKView plus input handling, a HUD and the
+//  reset functions.
 //
 //  Design notes
-//  - The document is rendered **once** into GPU textures (`Renderer.renderLive`).
-//    Panning / zooming / rotating only rewrites a small uniform buffer, so the view
-//    can be redrawn at display rate without touching the CPU compositor.
-//  - `isPaused = true` by default: frames are produced only when something changes
-//    (a drag, a reset, a resize, a freshly installed canvas).
-//  - All input funnels through `commitTransform(...)`, which mutates the transform,
-//    tells the shared HUD and schedules a redraw — one code path for gestures and
-//    resets alike.
+//  - The document itself is owned by `LivePreviewSession`. This view only owns the
+//    **view transform** (pan / zoom / rotate) and reports changes:
+//        `onRenderRequest(transform, viewport)` → session re-rasterises
+//        `present(canvas, transform, drawable, clearColor)` → session draws
+//    In interactive mode a canvas already contains the camera, so it is presented 1:1;
+//    in the single-raster fallback the live transform is used instead.
+//  - No display link dependency: frames happen when a canvas arrives, when the transform
+//    changes (fallback mode), or on a resize. That keeps the gesture responsive inside a
+//    Quick Look panel, where MTKView's CADisplayLink is not something we can rely on.
+//  - All input funnels through `commitTransform(...)`, which mutates the transform, tells
+//    the shared HUD and asks for a refresh — one code path for gestures and resets alike.
 //
 
 import Cocoa
 import MetalKit
+import QuartzCore        // CACurrentMediaTime
 import ArtRenderLibrary
 
 final class LivePreviewView: MTKView, MTKViewDelegate {
 
+    // MARK: - Wiring to the session
+
+    /// Something changed: re-rasterise the document for this transform + viewport
+    /// (viewport in device pixels).
+    var onRenderRequest: ((LiveViewTransform, CGSize) -> Void)?
+    /// Draw a canvas into a drawable. The transform is the one to present with.
+    var present: ((LiveRenderedCanvas, LiveViewTransform, MTLDrawable, MTLClearColor) -> Void)?
+
     // MARK: - Model
 
     private var canvas: LiveRenderedCanvas?
-    private var renderer: ArtRenderLibrary.Renderer?
     private var viewTransform = LiveViewTransform()
 
     private let hud = LiveHUDController()
@@ -35,17 +46,17 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         return view
     }()
 
-    // Drag bookkeeping
+    /// Drag bookkeeping
     private var isDragging = false
     private var dragMode: LiveInteractionMode = .pan
     private var dragAnchor = CGPoint.zero        // grab point, in view pixels
     private var lastDragLocation = CGPoint.zero  // previous event, in view pixels
 
-    // Redraw gating
-    private var pauseWork: DispatchWorkItem?
+    /// Viewport (device pixels) last reported to the session.
+    private var reportedViewport = CGSize.zero
 
-    // Gesture tuning (per **point** of mouse travel, so the feel is the same on
-    // Retina and non-Retina; the transform itself works in pixels)
+    // Gesture tuning (per **point** of mouse travel, so the feel is the same on Retina
+    // and non-Retina; the transform itself works in pixels)
     private static let zoomSensitivity: CGFloat = 0.010     // exp factor per point
     private static let rotateSensitivity: CGFloat = 0.010  // radians per point
     private static let interactionHold: TimeInterval = 0.35
@@ -75,13 +86,12 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
 
         framebufferOnly = true
         colorPixelFormat = .bgra8Unorm
-//        isOpaque = true // readonly
         clearColor = MTLClearColorMake(0.11, 0.11, 0.12, 1)
         autoResizeDrawable = true
         enableSetNeedsDisplay = true
         preferredFramesPerSecond = 60
         delegate = self
-        isPaused = true                    // only refresh when something changes
+        isPaused = true                    // nothing redraws unless something asks
         menu = Self.makeResetMenu(target: self)
         addSubview(hudView)
         hud.onChange = { [weak self] state in self?.hudView.state = state }
@@ -89,23 +99,37 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
 
     // MARK: - Canvas
 
-    /// Installs a freshly rendered canvas (called on the main thread).
-    func install(canvas: LiveRenderedCanvas, renderer: ArtRenderLibrary.Renderer) {
+    var hasCanvas: Bool { canvas != nil }
+
+    /// Installs a freshly rendered canvas (main thread).
+    func install(canvas: LiveRenderedCanvas) {
+        let first = self.canvas == nil
         self.canvas = canvas
-        self.renderer = renderer
-        viewTransform = LiveViewTransform()     // show the file's own view matrix first
-        hud.reset()
-        // The view may only just have been sized; let the drawable catch up first.
+        if first {
+            viewTransform = LiveViewTransform()   // show the file's view matrix first
+            hud.reset()
+        }
         refreshFrameSoon()
     }
 
-    // MARK: - Public API (status + reset functions)
-
-    /// Transient status line through the same HUD the gestures use (e.g. "Rendering…"
-    /// while the GPU canvas is being built).
+    /// Transient status line through the same HUD the gestures use.
     func showStatus(_ message: String, hold: TimeInterval = 1.5) {
         hud.announce(message, zoomPercent: viewTransform.zoomPercent, hold: hold)
     }
+
+    /// Asks the session for the document at the current transform. Safe to call before
+    /// the view has a window: the first report happens as soon as the viewport is known.
+    func requestFirstRender() {
+        if viewportSize != .zero {
+            reportChange()
+        } else {
+            pendingFirstRender = true
+        }
+    }
+
+    private var pendingFirstRender = false
+
+    // MARK: - Public API (reset functions)
 
     /// Back to the view matrix stored in the file: no pan, 100% zoom, no rotation.
     @objc func resetView() { performReset(.all) }
@@ -126,79 +150,81 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
             }
         }
         hud.announce(kind.label, zoomPercent: viewTransform.zoomPercent, hold: Self.resetHold)
-        // Let a few frames through so the FPS readout covers the reset too, and keep
-        // rendering for as long as the HUD stays up.
-        beginContinuousUpdates()
-        endContinuousUpdates(after: Self.resetHold)
     }
 
     // MARK: - The shared funnel
 
-    /// The single place a transform change becomes a HUD update + redraw.
+    /// The single place a transform change becomes a HUD update + a redraw request.
     private func commitTransform(mode: LiveInteractionMode,
                                  _ mutate: (inout LiveViewTransform) -> Void) {
         let before = viewTransform
         mutate(&viewTransform)
         guard viewTransform != before else { return }
         hud.updateInteraction(mode, zoomPercent: viewTransform.zoomPercent)
+        // The session decides what this means: a re-render (interactive mode) or just a
+        // redraw of the same canvas with the new transform (single-raster fallback).
+        // Deliberately no extra frame here — presenting a stale canvas would make the
+        // FPS readout lie about how fast the view actually updates.
+        reportChange()
+    }
+
+    /// Asks the session for the current state, and remembers the viewport we reported.
+    private func reportChange() {
+        let viewport = viewportSize
+        guard viewport != .zero else { return }
+        reportedViewport = viewport
+        pendingFirstRender = false
+        onRenderRequest?(viewTransform, viewport)
+    }
+
+    // MARK: - Redraw
+
+    /// Redraw the current canvas once (no re-render).
+    func refresh() {
         refreshFrame()
     }
 
-    // MARK: - Redraw gating
-
     private func refreshFrame() {
         guard canvas != nil else { return }
-        if isPaused {
-            // `display()` alone gives one immediate frame (a paused MTKView routes it
-            // to the delegate). Adding setNeedsDisplay(true) as well would schedule a
-            // second, redundant frame — and inflate the FPS readout.
-            display()
-        }
+        // `display()` alone gives one immediate frame (a paused MTKView routes it to the
+        // delegate). Adding setNeedsDisplay(true) as well would schedule a second,
+        // redundant frame — and inflate the FPS readout.
+        display()
     }
 
-    /// For cases where the drawable is not ready *yet* (resize, just-added view).
+    /// For cases where the drawable is not ready *yet* (resize, just-installed canvas).
     private func refreshFrameSoon() {
         DispatchQueue.main.async { [weak self] in self?.refreshFrame() }
-    }
-
-    private func beginContinuousUpdates() {
-        pauseWork?.cancel()
-        pauseWork = nil
-        if isPaused { isPaused = false }
-    }
-
-    private func endContinuousUpdates(after delay: TimeInterval = LivePreviewView.interactionHold) {
-        pauseWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self = self, !self.isDragging else { return }
-            self.isPaused = true
-        }
-        pauseWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     // MARK: - MTKViewDelegate
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
-        // The drawable is resized *after* this callback, so refresh on the next turn of
-        // the run loop instead of drawing into the old (possibly zero-sized) drawable.
-        refreshFrameSoon()
+        // The drawable is resized *after* this callback, so ask the session on the next
+        // turn of the run loop instead of drawing into the old (possibly 0-sized) one.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.refreshFrameSoon()
+            if self.pendingFirstRender || (size != self.reportedViewport && self.canvas != nil) {
+                self.reportChange()
+            }
+        }
     }
 
     func draw(in view: MTKView) {
         // The middle button can be released outside the view, in which case no
-        // `otherMouseUp` is delivered here. We are redrawing every frame while dragging
-        // (the HUD is up), so this is a cheap place to notice.
+        // `otherMouseUp` is delivered here.
         if isDragging && !Self.isMiddleButtonDown {
             finishDrag()
         }
 
-        guard let canvas = canvas, let renderer = renderer else { return }
+        guard let canvas = canvas, let present = present else { return }
         let timestamp = CACurrentMediaTime()
         guard let drawable = currentDrawable else { return }
 
-        renderer.presentLiveCanvas(canvas, to: drawable, transform: viewTransform,
-                                  clearColor: clearColor)
+        // A viewport-sized canvas was rasterised for the current camera already.
+        let transform = canvas.isViewportRerendered ? LiveViewTransform() : viewTransform
+        present(canvas, transform, drawable, clearColor)
         drawable.present()
 
         hud.registerFrame(at: timestamp, zoomPercent: viewTransform.zoomPercent)
@@ -214,29 +240,39 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
             return
         }
         window?.makeFirstResponder(self)
+        // The viewport is only known now: ask for the first frame.
         refreshFrameSoon()
+        reportChange()
     }
-
-//    override func acceptsFirstResponder() -> Bool { true }
 
     override func layout() {
         super.layout()
         hudView.frame = bounds
+        if viewportSize != reportedViewport {
+            refreshFrameSoon()
+            if canvas != nil { reportChange() }
+        }
     }
 
     // MARK: - Middle-button interaction
 
+    /// Backing scale of the window (the target's SDK does not expose
+    /// `NSView.contentScaleFactor`).
+    private var pixelScale: CGFloat {
+        max(window?.backingScaleFactor ?? 1, 1)
+    }
+
     /// Event location → **view pixels, y down**.
     ///
-    /// NSEvent locations are AppKit coordinates (origin bottom-left, y up) and
-    /// `MTKView.isFlipped` is false, whereas the transform maths (and the canvas
-    /// texture row order) is y-down top-left — hence the vertical flip here.
+    /// The transform maths (and the canvas texture row order) is y-down top-left. AppKit
+    /// event coordinates are y-up for a non-flipped view, so the y axis is mirrored —
+    /// but only when the receiver is actually not flipped (`MTKView`'s flippedness
+    /// differs between OS/SDK versions, so ask instead of assuming).
     private func pixelLocation(of event: NSEvent) -> CGPoint {
         let point = convert(event.locationInWindow, from: nil)
-//        let scale = contentScaleFactor
-        let scale = 1.0
-        return CGPoint(x: point.x * scale,
-                       y: (bounds.maxY - point.y) * scale)
+        let scale = pixelScale
+        let y = isFlipped ? point.y : (bounds.maxY - point.y)
+        return CGPoint(x: point.x * scale, y: y * scale)
     }
 
     /// mmb pan, mmb+cmd zoom, mmb+shift rotate (cmd wins over shift).
@@ -248,7 +284,7 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
 
     private var viewportSize: CGSize {
         let size = drawableSize
-        return size.width > 0 && size.height > 0 ? size : CGSize(width: 1, height: 1)
+        return size.width > 0 && size.height > 0 ? size : .zero
     }
 
     override func otherMouseDown(with event: NSEvent) {
@@ -258,8 +294,7 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         dragAnchor = location
         lastDragLocation = location
         hud.beginInteraction(dragMode, zoomPercent: viewTransform.zoomPercent)
-        beginContinuousUpdates()
-//        NSCursor.closed.set() // Type 'NSCursor' has no member 'closed'
+        NSCursor.closedHand.set()
     }
 
     override func otherMouseDragged(with event: NSEvent) {
@@ -284,7 +319,7 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
 
         let viewport = viewportSize
         // Zoom/rotate speeds are specified per point; the deltas arrive in pixels.
-        let pointScale = max(1.0, 1) // Cannot find 'contentScaleFactor' in scope
+        let pointScale = pixelScale
         switch dragMode {
             case .pan:
                 commitTransform(mode: .pan) { viewTransform in
@@ -313,9 +348,7 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         guard isDragging else { return }
         isDragging = false
         NSCursor.arrow.set()
-        // HUD and redraw stop together so the FPS number never freezes on screen.
         hud.endInteraction(hold: Self.interactionHold)
-        endContinuousUpdates(after: Self.interactionHold)
     }
 
     // MARK: - Keyboard

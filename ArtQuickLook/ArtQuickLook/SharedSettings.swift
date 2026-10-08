@@ -35,6 +35,7 @@ private enum Keys {
     static let useCache = "useCache"
     static let cacheSizeMB = "cacheSizeMB"
     static let generateThumbnails = "generateThumbnails"
+    static let flipLiveCanvas = "flipLiveCanvas"
 }
 
 /// Reads/writes the shared suite. This *is* the plist you were going to
@@ -63,5 +64,12 @@ struct Settings {
     var generateThumbnails: Bool {
         get { d.object(forKey: Keys.generateThumbnails) as? Bool ?? true }
         set { d.set(newValue, forKey: Keys.generateThumbnails) }
+    }
+    /// Escape hatch for the live view's canvas row order. `false` = canvas row 0 at the
+    /// top, which is what the static render path implies. Flip it if the live preview
+    /// shows the document mirrored.
+    var flipLiveCanvas: Bool {
+        get { d.object(forKey: Keys.flipLiveCanvas) as? Bool ?? false }
+        set { d.set(newValue, forKey: Keys.flipLiveCanvas) }
     }
 }

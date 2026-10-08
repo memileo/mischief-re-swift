@@ -20,12 +20,18 @@ extension MetalRenderer {
     
     /// Presents `canvas` into `drawable` using `transform`.
     ///
+    /// - Parameter flipVertically: canvas row-order escape hatch. `false` puts canvas
+    ///   row 0 at the top of the screen, which is what the static path implies (the
+    ///   y-down CoreGraphics context puts a CGImage's row 0 at the visual top). Flip it
+    ///   if the document comes up mirrored. Only the present pass is affected — geometry
+    ///   and compositing never care.
     /// - Returns: the command buffer, already committed (not waited on).
     @discardableResult
     func presentLiveCanvas(_ canvas: LiveRenderedCanvas,
                            to drawable: MTLDrawable,
                            transform: LiveViewTransform,
-                           clearColor: MTLClearColor = MTLClearColorMake(0, 0, 0, 1)) throws -> MTLCommandBuffer? {
+                           clearColor: MTLClearColor = MTLClearColorMake(0, 0, 0, 1),
+                           flipVertically: Bool = false) throws -> MTLCommandBuffer? {
         guard let camDrawable = drawable as? CAMetalDrawable else {
             throw MetalRendererError.unsupportedDrawable
         }
@@ -34,6 +40,7 @@ extension MetalRenderer {
                                      pipeline: livePresentPipeline,
                                      transform: transform,
                                      clearColor: clearColor,
+                                     flipVertically: flipVertically,
                                      waitForCompletion: false)
     }
     
@@ -45,6 +52,7 @@ extension MetalRenderer {
                            pipeline: MTLRenderPipelineState?,
                            transform: LiveViewTransform,
                            clearColor: MTLClearColor = MTLClearColorMake(0, 0, 0, 1),
+                           flipVertically: Bool = false,
                            waitForCompletion: Bool) throws -> MTLCommandBuffer? {
         guard let pipeline = pipeline,
               let queue = commandQueue,
@@ -61,7 +69,8 @@ extension MetalRenderer {
         let drawableSize = CGSize(width: target.width, height: target.height)
         let uniforms = Self.livePresentUniforms(transform: transform,
                                                 canvasPixelSize: canvas.pixelSize,
-                                                viewportSize: drawableSize)
+                                                viewportSize: drawableSize,
+                                                flipVertically: flipVertically)
         
         // A ring of uniform buffers: MTKView keeps several drawables in flight, and
         // frame N must not be shaded with frame N+1's transform.
@@ -109,7 +118,8 @@ extension MetalRenderer {
     /// (`art2png --live`).
     func renderLivePreviewTexture(_ canvas: LiveRenderedCanvas,
                                   transform: LiveViewTransform,
-                                  size: CGSize) throws -> MTLTexture? {
+                                  size: CGSize,
+                                  flipVertically: Bool = false) throws -> MTLTexture? {
         guard let device = self.device else { throw MetalRendererError.deviceNotAvailable }
         let width = max(Int(size.width), 1)
         let height = max(Int(size.height), 1)
@@ -126,21 +136,30 @@ extension MetalRenderer {
                               to: target,
                               pipeline: livePresentPipelineRGBA,
                               transform: transform,
+                              flipVertically: flipVertically,
                               waitForCompletion: true)
         return target
     }
     
     // MARK: - Uniforms
-    
+
     /// Builds the canvas-pixels → clip-space matrix for the shader uniform struct.
     ///
     /// All of the maths lives in `LiveViewTransform.clipMatrix` (portable, unit tested);
-    /// this only flattens it into the shader's scalar layout.
+    /// this only flattens it into the shader's scalar layout and applies the optional
+    /// vertical flip of the canvas.
     static func livePresentUniforms(transform: LiveViewTransform,
                                    canvasPixelSize: CGSize,
-                                   viewportSize: CGSize) -> LivePresentUniforms {
-        let clip = transform.clipMatrix(canvasPixelSize: canvasPixelSize,
-                                        viewportSize: viewportSize)
+                                   viewportSize: CGSize,
+                                   flipVertically: Bool = false) -> LivePresentUniforms {
+        var clip = transform.clipMatrix(canvasPixelSize: canvasPixelSize,
+                                         viewportSize: viewportSize)
+        if flipVertically {
+            // Mirror inside the canvas: y → canvasHeight - y, composed after the view
+            // transform so only the canvas's own row order changes.
+            clip = clip.concatenated(with: LiveViewMatrix(a: 1, b: 0, c: 0, d: -1,
+                                                           tx: 0, ty: canvasPixelSize.height))
+        }
         return LivePresentUniforms(
             m00: Float(clip.a), m10: Float(clip.b),
             m01: Float(clip.c), m11: Float(clip.d),

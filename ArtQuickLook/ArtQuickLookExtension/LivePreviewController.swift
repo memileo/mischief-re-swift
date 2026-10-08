@@ -2,10 +2,33 @@
 //  LivePreviewController.swift
 //  ArtQuickLookExtension
 //
-//  Owns the lifetime of a live preview: renders the document on a background queue
-//  (the GPU work in Renderer.renderLive blocks on every dispatch, so it must not run on
-//  the main thread), hands the finished canvas to the view on the main thread, and
-//  reports failure so the caller can fall back to the static preview.
+//  Owns a live preview: builds the render cache once, then re-rasterises the document
+//  on a background queue whenever the view transform changes.
+//
+//  Scheduling
+//  ----------
+//  Every change (drag event, reset, resize, first frame) is a *request*, not a frame:
+//  the request records the latest transform and kicks the render queue. While a render
+//  is in flight further requests only overwrite that latest transform, so a fast mouse
+//  produces a handful of frames instead of one per event, and the view never depends on
+//  MTKView's display link running inside the Quick Look host. Exactly one render is in
+//  flight at a time — the renderer relies on that (its per-frame geometry arena is
+//  reused between frames).
+//
+//  Threading
+//  ---------
+//  The render queue owns the `ArtRenderLibrary.Renderer` and the geometry cache; the main
+//  thread owns everything the view touches. The two only meet through immutable values
+//  handed over in `finish(...)`, so there is no shared mutable state between them.
+//
+//  Two modes
+//  ---------
+//  - interactive (default): the document is rasterised for the current camera into a
+//    viewport-sized canvas, so zooming in shows real detail instead of a magnified
+//    bitmap. Transform changes schedule a re-render.
+//  - single raster (fallback): the document is rendered once and transformed while
+//    presenting. Used when the geometry cache does not fit the memory budget or Metal /
+//    the live kernels are unavailable. Transform changes only redraw.
 //
 
 import Cocoa
@@ -16,11 +39,13 @@ import ArtRenderLibrary
 enum LivePreviewError: LocalizedError {
     case noMetalDevice
     case viewUnavailable
+    case renderUnavailable
 
     var errorDescription: String? {
         switch self {
             case .noMetalDevice:    return "No Metal device for the live view"
             case .viewUnavailable:  return "Could not create the live Metal view"
+            case .renderUnavailable: return "Live Metal rendering failed"
         }
     }
 }
@@ -31,50 +56,162 @@ final class LivePreviewSession {
                                            qos: .userInitiated)
     private let canvasSize: CGSize
     private let scale: CGFloat
-    private var art: ArtParser?
+    private let flipCanvas: Bool
 
-    /// Main thread only.
+    // ── Render queue only ──
+    private var queueRenderer: ArtRenderLibrary.Renderer?
+    private var cache: LiveRenderCache?
+    private let art: ArtParser
+
+    // ── Main thread only ──
+    private var latestRequest: LiveRenderRequest?
+    private var rendering = false
+    private var didShowStatus = false
+    private var didAnnounceFallback = false
+    /// Published from `finish(...)` so the present closure (main thread) never has to
+    /// read the render-queue-owned renderer.
+    private var presentRenderer: ArtRenderLibrary.Renderer?
+
     let view: LivePreviewView
+    /// True while the document is re-rasterised per view change.
+    private(set) var isInteractive = false
+    /// Called on the main thread when nothing can be shown at all.
+    var onFailure: ((Error) -> Void)?
 
     /// - Note: deliberately *no* `Renderer` yet — constructing one loads the metallib,
-    ///   builds every pipeline and allocates render targets, which must not happen on
-    ///   the main thread while Quick Look is opening the preview.
-    init(art: ArtParser, canvasSize: CGSize, scale: CGFloat) throws {
+    ///   builds every pipeline and allocates render targets, which must not happen on the
+    ///   main thread while Quick Look is opening the preview.
+    init(art: ArtParser, canvasSize: CGSize, scale: CGFloat, flipCanvas: Bool = false) throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw LivePreviewError.noMetalDevice
         }
         self.canvasSize = canvasSize
         self.scale = scale
-        self.view = LivePreviewView.make(device: device)
+        self.flipCanvas = flipCanvas
         self.art = art
+        self.view = LivePreviewView.make(device: device)
+
+        view.onRenderRequest = { [weak self] transform, viewport in
+            self?.request(transform: transform, viewport: viewport)
+        }
+        view.present = { [weak self] canvas, transform, drawable, clearColor in
+            guard let self = self, let renderer = self.presentRenderer else { return }
+            renderer.presentLiveCanvas(canvas, to: drawable,
+                                       transform: transform,
+                                       clearColor: clearColor,
+                                       flipVertically: self.flipCanvas)
+        }
     }
 
-    /// Renders the document. `onReady` and `onFailure` are called on the main thread.
-    func render(onReady: @escaping (LivePreviewView) -> Void,
-                onFailure: @escaping (Error) -> Void) {
-        guard let art = art else {
-            DispatchQueue.main.async { onFailure(LivePreviewError.viewUnavailable) }
+    // MARK: - Requests (main thread)
+
+    /// Something changed: make the document look like this.
+    func request(transform: LiveViewTransform, viewport: CGSize) {
+        guard viewport.width >= 1, viewport.height >= 1 else { return }
+
+        // Single-raster mode already shows any transform without re-rendering — the view
+        // simply presents again with the new transform.
+        guard isInteractive || presentRenderer == nil else {
+            view.refresh()
             return
         }
 
-        let canvasSize = self.canvasSize
-        let scale = self.scale
-        view.showStatus("Rendering…", hold: 3)
+        // The first request also builds the renderer + geometry cache, which can take a
+        // moment on a large document.
+        if !didShowStatus {
+            didShowStatus = true
+            view.showStatus("Rendering…", hold: 3)
+        }
 
-        renderQueue.async { [weak self] in
-            let renderer = ArtRenderLibrary.Renderer(canvasSize: canvasSize,
-                                                     scale: scale,
-                                                     forceCPU: false,
-                                                     useSegmentRendering: true)
-            let canvas = renderer.renderLive(art: art)
-            DispatchQueue.main.async {
-                guard let self = self, let canvas = canvas else {
-                    onFailure(LivePreviewError.viewUnavailable)
-                    return
-                }
-                self.view.install(canvas: canvas, renderer: renderer)
-                onReady(self.view)
+        latestRequest = LiveRenderRequest(transform: transform, viewport: viewport)
+        kick()
+    }
+
+    private func kick() {
+        guard !rendering, let request = latestRequest else { return }
+        latestRequest = nil                 // coalesce: only the newest state survives
+        rendering = true
+        run(request)
+    }
+
+    /// Hand a finished render over to the main thread.
+    ///
+    /// - Note: `renderer` is passed by value so the main thread never reads
+    ///   render-queue state.
+    private func finish(_ canvas: LiveRenderedCanvas?,
+                        renderer: ArtRenderLibrary.Renderer?,
+                        interactive: Bool,
+                        failed: Bool = false) {
+        DispatchQueue.main.async {
+            if let canvas = canvas {
+                self.presentRenderer = renderer
+                self.view.install(canvas: canvas)
+                self.isInteractive = interactive
+            } else if failed && !self.view.hasCanvas {
+                // Nothing was ever drawn: hand over to the static preview.
+                self.rendering = false
+                self.onFailure?(LivePreviewError.renderUnavailable)
+                return
             }
+            // A nil canvas with one already on screen is a transient failure: keep the
+            // current mode so the next change retries the same way.
+            self.rendering = false
+            // A newer request arrived while we were busy: keep going, but only once.
+            if self.latestRequest != nil { self.kick() }
         }
     }
+
+    // MARK: - Rendering (render queue)
+
+    private func run(_ request: LiveRenderRequest) {
+        renderQueue.async { [weak self] in
+            guard let self = self else { return }
+
+            // First time: build the renderer, then the geometry cache.
+            if self.queueRenderer == nil {
+                let renderer = ArtRenderLibrary.Renderer(canvasSize: self.canvasSize,
+                                                         scale: self.scale,
+                                                         forceCPU: false,
+                                                         useSegmentRendering: true)
+                self.queueRenderer = renderer
+                if let cache = renderer.buildLiveRenderCache(art: self.art, scale: self.scale) {
+                    self.cache = cache
+                }
+            }
+
+            guard let renderer = self.queueRenderer else {
+                self.finish(nil, renderer: nil, interactive: false, failed: true)
+                return
+            }
+
+            // Interactive path: re-rasterise the cached document for this camera.
+            if let cache = self.cache {
+                let canvas = renderer.renderLive(cache: cache,
+                                                 art: self.art,
+                                                 camera: request.transform,
+                                                 viewport: request.viewport)
+                self.finish(canvas, renderer: renderer,
+                            interactive: canvas != nil,
+                            failed: canvas == nil)
+                return
+            }
+
+            // Fallback: one document render, transformed while presenting.
+            let canvas = renderer.renderLive(art: self.art)
+            if !self.didAnnounceFallback {
+                self.didAnnounceFallback = true
+                DispatchQueue.main.async {
+                    NSLog("ArtQuickLook live view: single-raster mode for this document "
+                          + "(geometry cache unavailable or over budget)")
+                }
+            }
+            self.finish(canvas, renderer: renderer, interactive: false, failed: canvas == nil)
+        }
+    }
+}
+
+/// A queued "make the document look like this" request.
+private struct LiveRenderRequest {
+    let transform: LiveViewTransform
+    let viewport: CGSize
 }

@@ -38,8 +38,12 @@ struct LivePaperParams {
     float paperStrength;
     float bgR, bgG, bgB;
     float hasTexture;    // 1 = art.paperTextureId != 0
-    float tileW, tileH;  // paper tile size in canvas pixels (0.666 * scale * image size)
+    float tileW, tileH;  // paper tile size in canvas points (0.666 * image size)
     float canvasW, canvasH;
+    // canvas pixels -> canvas points, so the paper is anchored to the page and pans /
+    // zooms with the view instead of sitting on the glass.
+    float m00, m01, m02;
+    float m10, m11, m12;
 };
 
 // MARK: - Layer stacking
@@ -69,10 +73,13 @@ kernel void liveCompositeLayerKernel(
 
 // MARK: - Paper / background
 
-/// bakes the whole background in one pass:
+/// Bakes the whole background in one pass:
 ///   paperTextureId == 0 -> flat background colour
 ///   paperTextureId != 0 -> paper colour, tiled paper texture at paperStrength,
 ///                          then multiplied by the background colour
+///
+/// The tile pattern is evaluated in canvas space (canvas px -> canvas points via the
+/// supplied matrix), so it is anchored to the page and pans/zooms with the view.
 kernel void livePaperBackgroundKernel(
                                         const device LivePaperParams &params [[buffer(0)]],
                                         texture2d<float, access::sample>   paper   [[texture(0)]],
@@ -89,8 +96,11 @@ kernel void livePaperBackgroundKernel(
         // paper colour first, then the tiled texture over it at paperStrength
         float3 colour = float3(params.paperR, params.paperG, params.paperB);
 
+        float2 doc = float2(params.m00 * px.x + params.m01 * px.y + params.m02,
+                            params.m10 * px.x + params.m11 * px.y + params.m12);
+
         float2 tile = max(float2(params.tileW, params.tileH), float2(1.0f));
-        float2 tileUV = fract(px / tile);
+        float2 tileUV = fract(doc / tile);
         float4 texel = paper.sample(linearClamp, tileUV);
 
         colour = mix(colour, texel.rgb, saturate(params.paperStrength) * texel.a);

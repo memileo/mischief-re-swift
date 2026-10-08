@@ -192,6 +192,21 @@ public struct CutMeta {
     }
 }
 
+public extension CutMeta {
+    /// Recovers the affine that was packed into `row0`/`row1` in `init`.
+    /// Exact inverse of the packing: row0 = (a, c, tx, 0), row1 = (b, d, ty, 0).
+    var inverseAffine: CGAffineTransform {
+        CGAffineTransform(
+            a:  CGFloat(row0.x),
+            b:  CGFloat(row1.x),
+            c:  CGFloat(row0.y),
+            d:  CGFloat(row1.y),
+            tx: CGFloat(row0.z),
+            ty: CGFloat(row1.z)
+        )
+    }
+}
+
 public struct Stamp {
     public var center: SIMD2<Float>
     public var radius: Float

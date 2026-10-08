@@ -36,8 +36,11 @@ struct LivePaperParams {
     var paperStrength: Float
     var bgR: Float, bgG: Float, bgB: Float
     var hasTexture: Float
-    var tileW: Float, tileH: Float
+    var tileW: Float, tileH: Float          // paper tile size in *document* units
     var canvasW: Float, canvasH: Float
+    // canvas pixels -> document units, so the paper is pinned to the document
+    var m00: Float, m01: Float, m02: Float
+    var m10: Float, m11: Float, m12: Float
 }
 
 extension MetalRenderer {
@@ -155,22 +158,29 @@ extension MetalRenderer {
     
     // MARK: - Canvas textures
     
-    /// (Re)creates the canvas + background textures for a `width` × `height` document.
+    /// (Re)creates the canvas + background textures for a `width` × `height` canvas.
     ///
-    /// Also drops the previous document's paper texture — a `Renderer` can be reused for
-    /// a second document of the same size, and the stale paper would be tiled into it.
-    func makeLiveCanvasTextures(width: Int, height: Int) throws {
+    /// - Parameters:
+    ///   - mipmapped: true for the single-raster mode (the canvas is then minified and
+    ///     wants mips); false for the interactive mode, where the canvas matches the
+    ///     viewport 1:1 and mips would cost a blit for nothing.
+    ///   - resetPaper: drop the decoded paper texture (new document). A per-frame resize
+    ///     must not force a re-decode.
+    func makeLiveCanvasTextures(width: Int, height: Int,
+                                mipmapped: Bool = true,
+                                resetPaper: Bool = true) throws {
         guard let device = self.device else { throw MetalRendererError.deviceNotAvailable }
         guard width > 0, height > 0 else { throw MetalRendererError.textureCreationFailed }
         
-        livePaperTexture = nil
+        if resetPaper { livePaperTexture = nil }
         
         if let canvas = liveCanvasTexture,
-           canvas.width == width, canvas.height == height {
+           canvas.width == width, canvas.height == height,
+           (canvas.mipmapLevelCount > 1) == mipmapped {
             return                                  // already the right size
         }
         
-        let mipCount = Self.mipLevelCount(width: width, height: height)
+        let mipCount = mipmapped ? Self.mipLevelCount(width: width, height: height) : 1
         
         func makeTexture() -> MTLTexture? {
             let desc = MTLTextureDescriptor.texture2DDescriptor(
@@ -198,9 +208,268 @@ extension MetalRenderer {
         }
         return levels
     }
+    // MARK: - Interactive (cached) layer compositing
+    
+    // Scratch space for one interactive frame's geometry: a CPU staging buffer (reused
+    // across frames) plus the Metal buffer it is copied into.
+    //
+    // Why an arena instead of the shared `segmentBuffer`/`tileIndicesBuffer` that the
+    // static path reuses per stroke: that is safe there only because every stroke gets
+    // its *own* command buffer followed by `waitUntilCompleted()`. Encoding a whole
+    // layer into one command buffer means the CPU has finished writing every dispatch
+    // before the GPU starts the first, so a shared buffer would be overwritten under the
+    // GPU's feet. Here each dispatch binds its own `offset:` into one buffer instead.
+    //
+    // Reusing the arena across frames is safe because only one render is ever in flight
+    // (the present pass commits without waiting, but it shares a single MTLCommandQueue
+    // with the render, and Metal executes command buffers in commit order).
+    private static let liveArenaAlignment = 256
+    
+    private static func alignUp(_ value: Int, _ alignment: Int) -> Int {
+        (value + alignment - 1) / alignment * alignment
+    }
+    
+    /// One stroke's slice of the arena.
+    private struct LiveStrokeBin {
+        var segmentOffset = 0, segmentCount = 0
+        var tileIndexOffset = 0
+        var tileListOffset = 0
+        var color = SIMD4<Float>(0, 0, 0, 1)
+        var isEraser = false
+        var isMarker = false
+        var hasNoise = false
+    }
+    
+    /// The layer's ops in their original order — a `cut` erases what was drawn *below*
+    /// it, so strokes and cuts must not be reordered.
+    private enum LiveLayerStep {
+        case stroke(Int)          // index into the bins array
+        case cut(CutMeta)
+    }
+    
+    /// Rasterises a **cached** layer for the current camera and stacks it onto the
+    /// canvas.
+    ///
+    /// The whole layer is encoded into a *single* command buffer, so a frame costs one GPU
+    /// round trip instead of one per stroke. Dispatches are still one per stroke, so
+    /// overlapping strokes composite exactly like the static path (the kernel does not get
+    /// to merge coverage across strokes).
+    ///
+    /// - Note: `layerOps` are `LiveDeviceOp`s (cache + camera already applied), in
+    ///   document order.
+    func renderCachedLayerIntoLiveCanvas(layerOps: [LiveDeviceOp],
+                                         width: Int, height: Int,
+                                         opacity: Float) throws {
+        guard let compositePipeline = liveCompositeLayerPipeline else {
+            throw MetalRendererError.pipelineMissing("liveCompositeLayerKernel")
+        }
+        guard !layerOps.isEmpty else { return }
+        
+        try ensureRenderTargets(width: width, height: height)
+        try clearTexture(gpuRenderTarget!)
+        
+        guard let queue = commandQueue,
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw MetalRendererError.textureCreationFailed
+        }
+        
+        // ── 1. Tile-bin every stroke into the staging arena (CPU only), keeping order.
+        let (steps, bins) = try bin(layerOps: layerOps, width: width, height: height)
+        
+        // ── 2. One copy, then encode each step against its slice of the arena.
+        try uploadArena(byteCount: liveStagingUsed)
+        for step in steps {
+            switch step {
+                case .stroke(let index):
+                    try encode(stroke: bins[index], width: width, height: height, encoder: encoder)
+                case .cut(let meta):
+                    try dispatchLiveCut(meta: meta, width: width, height: height, encoder: encoder)
+            }
+        }
+        
+        // Stack the finished layer onto the canvas in the same command buffer.
+        guard let canvas = liveCanvasTexture, let layer = gpuRenderTarget else {
+            throw MetalRendererError.textureCreationFailed
+        }
+        var layerOpacity = opacity
+        encoder.setComputePipelineState(compositePipeline)
+        encoder.setTexture(layer, index: 0)
+        encoder.setTexture(canvas, index: 1)
+        encoder.setBytes(&layerOpacity, length: MemoryLayout<Float>.stride, index: 0)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (width + 7) / 8, height: (height + 7) / 8, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+        encoder.endEncoding()
+        
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let err = commandBuffer.error { throw err }
+    }
+    
+    /// Bins every stroke into `liveStaging` and returns the ordered op list.
+    private func bin(layerOps: [LiveDeviceOp],
+                     width: Int, height: Int) throws -> ([LiveLayerStep], [LiveStrokeBin]) {
+        var cursor = 0
+        var bins: [LiveStrokeBin] = []
+        var steps: [LiveLayerStep] = []
+        steps.reserveCapacity(layerOps.count)
+        
+        for op in layerOps {
+            switch op {
+                case .cut(let meta):
+                    steps.append(.cut(meta))
+                case .stroke(let segments, let color, let isEraser, let isMarker):
+                    guard !segments.isEmpty else { continue }
+                    let (tileIndicesData, tileListData) = buildSegmentTileIndices(
+                        segments: segments,
+                        textureWidth: width,
+                        textureHeight: height,
+                        tileSize: tileSize,
+                        isMarker: isMarker,
+                        transform: nil)
+                    if tileListData.isEmpty { continue }
+                    
+                    var bin = LiveStrokeBin()
+                    bin.segmentCount = segments.count
+                    bin.color = color
+                    bin.isEraser = isEraser
+                    bin.isMarker = isMarker
+                    bin.hasNoise = segments.contains { $0.noiseSeed != 0 }
+                    
+                    // Layout: segments, tile indices, tile list — each 256-aligned so it
+                    // can be bound as an MTLBuffer offset.
+                    cursor = Self.alignUp(cursor, Self.liveArenaAlignment)
+                    bin.segmentOffset = cursor
+                    cursor += MemoryLayout<GPUSplineSegment>.stride * segments.count
+                    cursor = Self.alignUp(cursor, Self.liveArenaAlignment)
+                    bin.tileIndexOffset = cursor
+                    cursor += MemoryLayout<TileIndex>.stride * tileIndicesData.count
+                    cursor = Self.alignUp(cursor, Self.liveArenaAlignment)
+                    bin.tileListOffset = cursor
+                    cursor += MemoryLayout<UInt32>.stride * tileListData.count
+                    
+                    guard let base = staging(needed: cursor) else {
+                        throw MetalRendererError.bufferCreationFailed
+                    }
+                    segments.withUnsafeBytes { raw in
+                        if let src = raw.baseAddress {
+                            (base + bin.segmentOffset).copyMemory(
+                                from: src,
+                                byteCount: MemoryLayout<GPUSplineSegment>.stride * segments.count)
+                        }
+                    }
+                    tileIndicesData.withUnsafeBytes { raw in
+                        if let src = raw.baseAddress {
+                            (base + bin.tileIndexOffset).copyMemory(
+                                from: src,
+                                byteCount: MemoryLayout<TileIndex>.stride * tileIndicesData.count)
+                        }
+                    }
+                    tileListData.withUnsafeBytes { raw in
+                        if let src = raw.baseAddress {
+                            (base + bin.tileListOffset).copyMemory(
+                                from: src,
+                                byteCount: MemoryLayout<UInt32>.stride * tileListData.count)
+                        }
+                    }
+                    
+                    steps.append(.stroke(bins.count))
+                    bins.append(bin)
+            }
+        }
+        
+        liveStagingUsed = Self.alignUp(cursor, Self.liveArenaAlignment)
+        return (steps, bins)
+    }
+    
+    /// CPU staging buffer, grown on demand (existing contents are preserved — strokes
+    /// are written as they are binned, so a grow must not drop the earlier ones).
+    private func staging(needed: Int) -> UnsafeMutableRawPointer? {
+        if needed > liveStagingCapacity {
+            let grown = UnsafeMutableRawPointer.allocate(byteCount: needed,
+                                                         alignment: Self.liveArenaAlignment)
+            if let old = liveStaging {
+                memcpy(grown, old, liveStagingCapacity)
+                old.deallocate()
+            }
+            liveStaging = grown
+            liveStagingCapacity = needed
+        }
+        return liveStaging
+    }
+    
+    /// Copies the staging buffer into the GPU arena (once per layer).
+    private func uploadArena(byteCount: Int) throws {
+        guard byteCount > 0 else { return }
+        guard let device = self.device, let base = liveStaging else { return }
+        if liveArena == nil || liveArenaCapacity < byteCount {
+            liveArena = device.makeBuffer(length: byteCount, options: .storageModeShared)
+            liveArenaCapacity = byteCount
+        }
+        guard let arena = liveArena else { throw MetalRendererError.bufferCreationFailed }
+        memcpy(arena.contents(), base, byteCount)
+    }
+    
+    /// Encodes one stroke's dispatch, reading its data from the arena.
+    private func encode(stroke bin: LiveStrokeBin,
+                        width: Int, height: Int,
+                        encoder: MTLComputeCommandEncoder) throws {
+        guard let arena = liveArena else { throw MetalRendererError.bufferCreationFailed }
+        
+        // One dispatch = one kernel, so noise segments never share a dispatch with clean
+        // ones (mirrors `MetalRenderer_Dispatch.dispatchStrokeToGPU`).
+        var pipeline: MTLComputePipelineState?
+        if bin.hasNoise, let p = segmentNoiseCompositePipeline, let noise = noiseTexture {
+            pipeline = p
+            encoder.setTexture(noise, index: 1)
+            if let sampler = linearSampler { encoder.setSamplerState(sampler, index: 0) }
+        } else {
+            pipeline = segmentAACompositePipeline
+        }
+        guard let pipeline = pipeline else {
+            throw MetalRendererError.pipelineMissing("segmentAACompositeKernel")
+        }
+        
+        var params = Params(
+            textureWidth: UInt32(width), textureHeight: UInt32(height),
+            tileSize: UInt32(tileSize),
+            tilesPerRow: (UInt32(width) + UInt32(tileSize) - 1) / UInt32(tileSize),
+            stampCount: UInt32(bin.segmentCount),
+            penColor: bin.color, noiseScale: 0.4,
+            isEraser: bin.isEraser, isMarker: bin.isMarker)
+        
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBytes(&params, length: MemoryLayout<Params>.stride, index: 0)
+        encoder.setBuffer(arena, offset: bin.segmentOffset, index: 1)
+        encoder.setBuffer(arena, offset: bin.tileIndexOffset, index: 2)
+        encoder.setBuffer(arena, offset: bin.tileListOffset, index: 3)
+        encoder.setTexture(gpuRenderTarget, index: 0)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (width + 7) / 8, height: (height + 7) / 8, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+    }
+    
+    /// Cut dispatch into a caller-supplied encoder.
+    private func dispatchLiveCut(meta: CutMeta,
+                                 width: Int, height: Int,
+                                 encoder: MTLComputeCommandEncoder) throws {
+        guard let pipeline = segmentCutCompositePipeline else {
+            throw MetalRendererError.pipelineMissing("segmentCutCompositeKernel")
+        }
+        // `setBytes` snapshots the value at encode time, which is why several cuts can
+        // share one command buffer (unlike a shared MTLBuffer).
+        var cutMeta = meta
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBytes(&cutMeta, length: MemoryLayout<CutMeta>.stride, index: 0)
+        encoder.setTexture(gpuRenderTarget, index: 0)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (width + 7) / 8, height: (height + 7) / 8, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+    }
     
     // MARK: - Layer compositing
-    
+
     /// Rasterises one layer's operations into `gpuRenderTarget` and stacks the result
     /// onto the canvas with `opacity`.
     ///
@@ -249,11 +518,19 @@ extension MetalRenderer {
     
     /// Bakes paper colour + tiled paper texture + background multiply into the
     /// background texture. Mirrors `Renderer.render(art:)`'s background block.
+    ///
+    /// - Parameters:
+    ///   - documentFromCanvas: canvas pixels → canvas points (identity for the raster
+    ///     path, `camera⁻¹ ∘ scale⁻¹` when the canvas *is* the viewport). The paper is
+    ///     tiled in canvas space so it is anchored to the page, not to the glass.
+    ///   - tileScale: extra multiplier on the tile size; pass the render `scale` for
+    ///     the legacy (canvas-space) tiling, 1 for document-space tiling.
     func renderLivePaperBackground(paperColor: (r: CGFloat, g: CGFloat, b: CGFloat),
                                    paperStrength: Float,
                                    backgroundColor: [UInt8],
                                    paperTextureData: [UInt8],
-                                   paperScale: CGFloat,
+                                   tileScale: CGFloat,
+                                   documentFromCanvas: CGAffineTransform,
                                    width: Int, height: Int) throws {
         guard let pipeline = livePaperBackgroundPipeline else {
             throw MetalRendererError.pipelineMissing("livePaperBackgroundKernel")
@@ -269,9 +546,9 @@ extension MetalRenderer {
         var tileW: Float = 0, tileH: Float = 0
         
         if hasTexture, let paper = livePaperTexture {
-            // Same tile size as the CoreGraphics path: image size × 0.666 × scale.
-            tileW = Float(paper.width) * 0.666 * Float(paperScale)
-            tileH = Float(paper.height) * 0.666 * Float(paperScale)
+            // Same tile size as the CoreGraphics path: image size × 0.666 × tileScale.
+            tileW = Float(paper.width) * 0.666 * Float(tileScale)
+            tileH = Float(paper.height) * 0.666 * Float(tileScale)
         } else if !paperTextureData.isEmpty {
             print("Live view: paper texture could not be decoded — using flat paper colour")
         }
@@ -284,7 +561,9 @@ extension MetalRenderer {
             bgB: Float(backgroundColor[2]) / 255.0,
             hasTexture: hasTexture ? 1 : 0,
             tileW: tileW, tileH: tileH,
-            canvasW: Float(width), canvasH: Float(height))
+            canvasW: Float(width), canvasH: Float(height),
+            m00: Float(documentFromCanvas.a), m01: Float(documentFromCanvas.c), m02: Float(documentFromCanvas.tx),
+            m10: Float(documentFromCanvas.b), m11: Float(documentFromCanvas.d), m12: Float(documentFromCanvas.ty))
         
         encoder.setComputePipelineState(pipeline)
         encoder.setBytes(&params, length: MemoryLayout<LivePaperParams>.stride, index: 0)

@@ -2,16 +2,13 @@ import SwiftUI
 
 final class SettingsStore: ObservableObject {
     private var settings: Settings
-    /// Last selected static render path, so un-toggling the live view restores it.
-    private var lastStaticPath: RenderPath = .gpuSegments
     
     @Published var previewScale: Double     { didSet { settings.previewScale = previewScale } }
-    @Published var renderPath: RenderPath   { didSet { settings.renderPath = renderPath; liveViewEnabled = renderPath.isLiveView } }
+    @Published var renderPath: RenderPath   { didSet { settings.renderPath = renderPath } }
     @Published var useCache: Bool           { didSet { settings.useCache = useCache } }
     @Published var cacheSizeMB: Int         { didSet { settings.cacheSizeMB = cacheSizeMB } }
     @Published var generateThumbnails: Bool { didSet { settings.generateThumbnails = generateThumbnails } }
-    /// Mirror of `renderPath.isLiveView`, published so the toggle repaints on its own.
-    @Published private(set) var liveViewEnabled = false
+    @Published var flipLiveCanvas: Bool     { didSet { settings.flipLiveCanvas = flipLiveCanvas } }
     
     init(settings: Settings = Settings()) {
         self.settings = settings
@@ -21,26 +18,7 @@ final class SettingsStore: ObservableObject {
         useCache = settings.useCache
         cacheSizeMB = settings.cacheSizeMB
         generateThumbnails = settings.generateThumbnails
-        liveViewEnabled = renderPath.isLiveView
-        lastStaticPath = Self.staticRenderPaths.first(where: { $0 == renderPath }) ?? .gpuSegments
-    }
-    
-    /// The static (single image) render paths. The live view is not one of them.
-    static let staticRenderPaths: [RenderPath] = RenderPath.allCases.filter { !$0.isLiveView }
-    
-    /// Binding target for the "Live Metal view" toggle: turning it on switches to
-    /// `.liveMetal`, turning it off restores the previously selected static path.
-    var liveViewToggle: Binding<Bool> {
-        Binding(
-            get: { self.liveViewEnabled },
-            set: { enabled in
-                if enabled {
-                    if !self.renderPath.isLiveView { self.lastStaticPath = self.renderPath }
-                    self.renderPath = .liveMetal
-                } else if self.renderPath.isLiveView {
-                    self.renderPath = self.lastStaticPath
-                }
-            })
+        flipLiveCanvas = settings.flipLiveCanvas
     }
 }
 
@@ -52,15 +30,12 @@ struct ContentView: View {
             ScaleRow(store: store)
             
             Picker("Render using:", selection: $store.renderPath) {
-                ForEach(SettingsStore.staticRenderPaths) { Text($0.label).tag($0) }
+                ForEach(RenderPath.allCases) { Text($0.label).tag($0) }
             }
             .pickerStyle(.radioGroup)
             
-            Toggle("Live Metal view", isOn: store.liveViewToggle)
-                .help("Interactive GPU view: pan / zoom / rotate without re-rendering.")
-            
-            if store.liveViewEnabled {
-                LiveViewHelp()
+            if store.renderPath.isLiveView {
+                LiveViewHelp(store: store)
             }
             
 //            CacheRow(store: store)
@@ -78,8 +53,10 @@ struct ContentView: View {
     }
 }
 
-/// Shortcut reference for the live view, shown while the live view is enabled.
+/// Shortcut reference for the live view, shown while the live view is selected.
 struct LiveViewHelp: View {
+    @ObservedObject var store: SettingsStore
+
     private let rows: [(String, String)] = [
         ("MMB drag", "Pan"),
         ("MMB + ⌘ drag", "Zoom"),
@@ -99,10 +76,19 @@ struct LiveViewHelp: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            Text("“Preview image scale” sets the document raster resolution (minimum 1×) in live view.")
+            Text("""
+                 The document is re-rendered on the GPU for the current view, so zooming in \
+                 keeps full detail. “Preview image scale” sets the geometry cache's resolution.
+                 """)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
                 .padding(.top, 4)
+
+            Toggle("Flip canvas vertically", isOn: $store.flipLiveCanvas)
+                .font(.caption)
+                .padding(.top, 6)
+                .help("Only if the live preview shows the document mirrored.")
         }
     }
 }
