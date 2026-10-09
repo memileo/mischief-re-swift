@@ -20,18 +20,17 @@ extension MetalRenderer {
     
     /// Presents `canvas` into `drawable` using `transform`.
     ///
-    /// - Parameter flipVertically: canvas row-order escape hatch. `false` puts canvas
-    ///   row 0 at the top of the screen, which is what the static path implies (the
-    ///   y-down CoreGraphics context puts a CGImage's row 0 at the visual top). Flip it
-    ///   if the document comes up mirrored. Only the present pass is affected — geometry
-    ///   and compositing never care.
+    /// - Note: canvas row order is not adjustable here. The present matrix is exactly the
+    ///   mapping the gestures work in (`LiveViewTransform.clipMatrix`), and any extra
+    ///   mirror on top of it mirrors the *display* relative to the pan/zoom/rotate maths —
+    ///   which looks right in a still frame and feels inverted the moment you drag. The
+    ///   orientation therefore lives in that one matrix, not in a separate flip.
     /// - Returns: the command buffer, already committed (not waited on).
     @discardableResult
     func presentLiveCanvas(_ canvas: LiveRenderedCanvas,
                            to drawable: MTLDrawable,
                            transform: LiveViewTransform,
-                           clearColor: MTLClearColor = MTLClearColorMake(0, 0, 0, 1),
-                           flipVertically: Bool = LiveCanvasRowOrder.presentsMirrored) throws -> MTLCommandBuffer? {
+                           clearColor: MTLClearColor = MTLClearColorMake(0, 0, 0, 1)) throws -> MTLCommandBuffer? {
         guard let camDrawable = drawable as? CAMetalDrawable else {
             throw MetalRendererError.unsupportedDrawable
         }
@@ -40,7 +39,6 @@ extension MetalRenderer {
                                      pipeline: livePresentPipeline,
                                      transform: transform,
                                      clearColor: clearColor,
-                                     flipVertically: flipVertically,
                                      waitForCompletion: false)
     }
     
@@ -52,7 +50,6 @@ extension MetalRenderer {
                            pipeline: MTLRenderPipelineState?,
                            transform: LiveViewTransform,
                            clearColor: MTLClearColor = MTLClearColorMake(0, 0, 0, 1),
-                           flipVertically: Bool = LiveCanvasRowOrder.presentsMirrored,
                            waitForCompletion: Bool) throws -> MTLCommandBuffer? {
         guard let pipeline = pipeline,
               let queue = commandQueue,
@@ -69,8 +66,7 @@ extension MetalRenderer {
         let drawableSize = CGSize(width: target.width, height: target.height)
         let uniforms = Self.livePresentUniforms(transform: transform,
                                                 canvasPixelSize: canvas.pixelSize,
-                                                viewportSize: drawableSize,
-                                                flipVertically: flipVertically)
+                                                viewportSize: drawableSize)
         
         // A ring of uniform buffers: MTKView keeps several drawables in flight, and
         // frame N must not be shaded with frame N+1's transform.
@@ -118,8 +114,7 @@ extension MetalRenderer {
     /// (`art2png --live`).
     func renderLivePreviewTexture(_ canvas: LiveRenderedCanvas,
                                   transform: LiveViewTransform,
-                                  size: CGSize,
-                                  flipVertically: Bool = LiveCanvasRowOrder.presentsMirrored) throws -> MTLTexture? {
+                                  size: CGSize) throws -> MTLTexture? {
         guard let device = self.device else { throw MetalRendererError.deviceNotAvailable }
         let width = max(Int(size.width), 1)
         let height = max(Int(size.height), 1)
@@ -127,7 +122,7 @@ extension MetalRenderer {
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba8Unorm, width: width, height: height, mipmapped: false)
         desc.usage = [.renderTarget, .shaderRead]
-        desc.storageMode = .shared
+        desc.storageMode = .managed
         guard let target = device.makeTexture(descriptor: desc) else {
             throw MetalRendererError.textureCreationFailed
         }
@@ -136,7 +131,6 @@ extension MetalRenderer {
                               to: target,
                               pipeline: livePresentPipelineRGBA,
                               transform: transform,
-                              flipVertically: flipVertically,
                               waitForCompletion: true)
         return target
     }
@@ -146,23 +140,14 @@ extension MetalRenderer {
     /// Builds the canvas-pixels → clip-space matrix for the shader uniform struct.
     ///
     /// All of the maths lives in `LiveViewTransform.clipMatrix` (portable, unit tested);
-    /// this only flattens it into the shader's scalar layout and applies the optional
-    /// vertical mirror of the canvas (see `LiveCanvasRowOrder`).
-    ///
-    /// - Note: `a.concatenated(with: b)` applies **a first**, then b.
+    /// this only flattens it into the shader's scalar layout. No mirroring happens here —
+    /// the orientation is part of that one matrix, because a mirror composed on top of it
+    /// would mirror the display relative to the gesture maths.
     static func livePresentUniforms(transform: LiveViewTransform,
                                    canvasPixelSize: CGSize,
-                                   viewportSize: CGSize,
-                                   flipVertically: Bool = LiveCanvasRowOrder.presentsMirrored) -> LivePresentUniforms {
-        var clip = transform.clipMatrix(canvasPixelSize: canvasPixelSize,
+                                   viewportSize: CGSize) -> LivePresentUniforms {
+        let clip = transform.clipMatrix(canvasPixelSize: canvasPixelSize,
                                          viewportSize: viewportSize)
-        if flipVertically {
-            // Mirror *inside the canvas*, so it composes with the view transform: the
-            // canvas position is mirrored first, then the view transform is applied.
-            let mirrored = LiveViewMatrix(a: 1, b: 0, c: 0, d: -1,
-                                          tx: 0, ty: canvasPixelSize.height)
-            clip = mirrored.concatenated(with: clip)
-        }
         return LivePresentUniforms(
             m00: Float(clip.a), m10: Float(clip.b),
             m01: Float(clip.c), m11: Float(clip.d),

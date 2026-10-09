@@ -38,7 +38,7 @@ extension MetalRenderer {
         let h = src.height
         let descTex = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: w, height: h, mipmapped: false)
         descTex.usage = [.renderTarget, .shaderRead, .shaderWrite]
-        descTex.storageMode = .shared
+        descTex.storageMode = .managed
         guard let dst = device.makeTexture(descriptor: descTex) else {
             throw NSError(domain: "MetalRenderer", code: -5, userInfo: [NSLocalizedDescriptionKey: "Failed to create destination texture"])
         }
@@ -221,7 +221,7 @@ extension MetalRenderer {
             // Create texture and upload raw buffer
             let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: pixelFormat, width: w, height: h, mipmapped: false)
             desc.usage = [.shaderRead]
-            desc.storageMode = .shared
+            desc.storageMode = .managed
             guard let tex = device.makeTexture(descriptor: desc) else {
                 print("uploadNoiseTexture: failed to create texture (fallback)")
                 return false
@@ -254,7 +254,7 @@ extension MetalRenderer {
         let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: pixelFormat, width: w, height: h, mipmapped: false)
         desc.usage = [.shaderRead]
         // Use .shared for safety when writing from CPU; on macOS .managed is also possible but .shared works cross-platform.
-        desc.storageMode = .shared
+        desc.storageMode = .managed
         
         guard let texture = device.makeTexture(descriptor: desc) else {
             print("uploadNoiseTexture: failed to create Metal texture")

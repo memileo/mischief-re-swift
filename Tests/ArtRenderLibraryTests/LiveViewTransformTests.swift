@@ -57,14 +57,43 @@ final class LiveViewTransformTests: XCTestCase {
 
     // MARK: - Clip space
 
-    func testClipMatrixFlipsYAndFitsNDC() {
+    func testClipMatrixKeepsYDownAndFitsNDC() {
         let clip = LiveViewTransform().clipMatrix(canvasPixelSize: canvas, viewportSize: viewport)
-        // canvas top-left → view (0, 100) → ndc (-1, 1 - 100/600*2)
+        // canvas top-left → view (0, 100) → ndc (-1, 100/600*2 - 1)
         assertPoint(clip.applying(CGPoint(x: 0, y: 0)),
-                    CGPoint(x: -1, y: 1 - 200.0 / 600.0))
-        // canvas bottom-right → view (800, 500) → ndc (1, 1 - 500/600*2)
+                    CGPoint(x: -1, y: 200.0 / 600.0 - 1))
+        // canvas bottom-right → view (800, 500) → ndc (1, 1000/600*2 - 1)
         assertPoint(clip.applying(CGPoint(x: 2000, y: 1000)),
-                    CGPoint(x: 1, y: 1 - 1000.0 / 600.0))
+                    CGPoint(x: 1, y: 1000.0 / 600.0 - 1))
+    }
+
+    /// The present matrix has to agree with the gesture maths, which lives in y-down view
+    /// pixels: canvas row 0 (the document's top) must land at the drawable's top, which is
+    /// clip-space y = -1, and increasing canvas y must increase clip y. A mirrored display
+    /// here still *looks* fine in a single frame while vertical panning runs backwards and
+    /// zoom-to-the-pointer anchors at the mirrored spot — so this is pinned down explicitly.
+    func testClipMatrixAgreesWithGestureOrientation() {
+        // Canvas filling the viewport exactly: its row 0 is the drawable's top row.
+        let exact = LiveViewTransform().clipMatrix(canvasPixelSize: viewport, viewportSize: viewport)
+        XCTAssertEqual(exact.applying(CGPoint(x: 0, y: 0)).y, -1, accuracy: 1e-6)
+        XCTAssertEqual(exact.applying(CGPoint(x: 0, y: viewport.height)).y, 1, accuracy: 1e-6)
+
+        // Aspect-fitted: still the same orientation, just letterboxed.
+        let clip = LiveViewTransform().clipMatrix(canvasPixelSize: canvas, viewportSize: viewport)
+        let top = clip.applying(CGPoint(x: 0, y: 0))
+        let bottom = clip.applying(CGPoint(x: 0, y: canvas.height))
+        XCTAssertGreaterThan(bottom.y, top.y)
+        XCTAssertLessThan(top.y, 0)
+
+        // Same for the view-pixels matrix the gestures are expressed in: canvas y grows
+        // downwards, view y grows downwards.
+        var transform = LiveViewTransform()
+        transform.pan(by: CGPoint(x: 0, y: 10))
+        let view = transform.matrix(canvasPixelSize: canvas, viewportSize: viewport)
+        let above = view.applying(CGPoint(x: 500, y: 100))
+        let below = view.applying(CGPoint(x: 500, y: 200))
+        XCTAssertGreaterThan(below.y, above.y)
+        XCTAssertGreaterThan(below.y - above.y, 0, "panning down must move content down")
     }
 
     // MARK: - Pan

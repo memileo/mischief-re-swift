@@ -672,7 +672,7 @@ extension MetalRenderer {
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba8Unorm, width: w, height: h, mipmapped: false)
         desc.usage = [.shaderRead]
-        desc.storageMode = .shared
+        desc.storageMode = .managed
         guard let texture = device.makeTexture(descriptor: desc) else { return nil }
         texture.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0,
                         withBytes: rgba, bytesPerRow: bytesPerRow)
@@ -707,7 +707,7 @@ extension MetalRenderer {
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false)
         desc.usage = [.shaderRead]
-        desc.storageMode = .shared
+        desc.storageMode = .managed
         guard let texture = device.makeTexture(descriptor: desc) else { return nil }
         var white: UInt32 = 0xFFFFFFFF          // RGBA8, little endian
         texture.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0,

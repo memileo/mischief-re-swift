@@ -35,7 +35,6 @@ private enum Keys {
     static let useCache = "useCache"
     static let cacheSizeMB = "cacheSizeMB"
     static let generateThumbnails = "generateThumbnails"
-    static let mirrorLiveCanvas = "mirrorLiveCanvas"
 }
 
 /// Reads/writes the shared suite. This *is* the plist you were going to
@@ -64,12 +63,5 @@ struct Settings {
     var generateThumbnails: Bool {
         get { d.object(forKey: Keys.generateThumbnails) as? Bool ?? true }
         set { d.set(newValue, forKey: Keys.generateThumbnails) }
-    }
-    /// The live canvas texture has to be mirrored when presented, otherwise the document
-    /// shows upside down (measured on macOS 14/15). Only untick if *your* display shows it
-    /// the other way round.
-    var mirrorLiveCanvas: Bool {
-        get { d.object(forKey: Keys.mirrorLiveCanvas) as? Bool ?? true }
-        set { d.set(newValue, forKey: Keys.mirrorLiveCanvas) }
     }
 }

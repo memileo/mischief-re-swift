@@ -623,7 +623,8 @@ extension MetalRenderer {
             mipmapped: false
         )
         stagingDesc.usage = [.shaderRead, .shaderWrite]
-        stagingDesc.storageMode = .shared
+        stagingDesc.storageMode = .managed
+//        stagingDesc.cpuCacheMode = .writeCombined
         
         // Create distance field texture - keep as float for precision
         let distanceFieldDesc = MTLTextureDescriptor.texture2DDescriptor(

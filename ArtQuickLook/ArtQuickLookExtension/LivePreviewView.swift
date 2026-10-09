@@ -57,6 +57,8 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     /// The `…MouseDown` mask of the button that started the current drag, so a release
     /// outside the view can be detected from `pressedMouseButtons`.
     private var dragButtonMask: NSEvent.EventTypeMask = []
+    /// When the last drag event arrived — see `dragLapseGrace`.
+    private var lastDragEventTime: CFTimeInterval = CACurrentMediaTime()
 
     /// Viewport (device pixels) last reported to the session.
     private var reportedViewport = CGSize.zero
@@ -72,9 +74,16 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
 
     /// A drag button can be released outside the view, in which case no `…MouseUp` is
     /// delivered here — `draw(in:)` notices and ends the gesture.
+    ///
+    /// Only trusted *after* the drag has been quiet for a moment (see `dragLapseGrace`):
+    /// inside a Quick Look host `pressedMouseButtons` can read empty while the user is
+    /// still dragging, which used to cancel the gesture after its first frame.
     private static func isPressed(_ mask: NSEvent.EventTypeMask) -> Bool {
         !mask.isEmpty && NSEvent.pressedMouseButtons & Int(mask.rawValue) != 0
     }
+
+    /// How long a drag must be silent before a "button not down" reading is believed.
+    private static let dragLapseGrace: TimeInterval = 0.35
 
     // MARK: - Init
 
@@ -222,9 +231,13 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
-        // A drag button can be released outside the view, in which case no `…MouseUp`
-        // is delivered here.
-        if isDragging && !Self.isPressed(dragButtonMask) {
+        // A drag button can be released outside the view, in which case no `…MouseUp` is
+        // delivered here. Guarded by the grace period: a single frame with an empty
+        // `pressedMouseButtons` is not proof of a release (the Quick Look host can swallow
+        // the button-down), and acting on it killed the gesture after one frame.
+        if isDragging,
+           !Self.isPressed(dragButtonMask),
+           CACurrentMediaTime() - lastDragEventTime > Self.dragLapseGrace {
             endDrag()
         }
 
@@ -372,6 +385,7 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         dragButtonMask = button
         dragAnchor = location
         lastDragLocation = location
+        lastDragEventTime = CACurrentMediaTime()
         hud.beginInteraction(mode, zoomPercent: viewTransform.zoomPercent)
         NSCursor.closedHand.set()
     }
@@ -389,6 +403,7 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
             return
         }
 
+        lastDragEventTime = CACurrentMediaTime()
         let dx = location.x - lastDragLocation.x
         let dy = location.y - lastDragLocation.y
         lastDragLocation = location
@@ -427,13 +442,17 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
 
     // MARK: - Keyboard
 
+    /// Resets, on ⌃0 / ⌃P / ⌃Z / ⌃R — and on the bare keys too, in case they ever arrive.
+    ///
+    /// Deliberately *not* ⌘-based: ⌘O/⌘P/⌘Z/⌘R belong to the system and Finder, and never
+    /// reach a Quick Look extension at all. The context menu is the guaranteed path.
     override func keyDown(with event: NSEvent) {
         switch event.charactersIgnoringModifiers?.lowercased() {
-            case "0": resetView()
-            case "p": resetPanTransform()
-            case "z": resetZoomTransform()
-            case "r": resetRotationTransform()
-            default: super.keyDown(with: event)
+        case "0": resetView()
+        case "p": resetPanTransform()
+        case "z": resetZoomTransform()
+        case "r": resetRotationTransform()
+        default: super.keyDown(with: event)
         }
     }
 
@@ -454,6 +473,7 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     private static func item(_ title: String, _ key: String,
                              _ action: Selector, _ target: LivePreviewView) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.keyEquivalentModifierMask = .control
         item.target = target
         return item
     }

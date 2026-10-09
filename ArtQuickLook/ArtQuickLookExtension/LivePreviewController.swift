@@ -59,7 +59,6 @@ final class LivePreviewSession {
     private static let slowFrameMilliseconds: Double = 250
     private let canvasSize: CGSize
     private let scale: CGFloat
-    private let mirrorCanvas: Bool
 
     // ── Render queue only ──
     private var queueRenderer: ArtRenderLibrary.Renderer?
@@ -84,13 +83,12 @@ final class LivePreviewSession {
     /// - Note: deliberately *no* `Renderer` yet — constructing one loads the metallib,
     ///   builds every pipeline and allocates render targets, which must not happen on the
     ///   main thread while Quick Look is opening the preview.
-    init(art: ArtParser, canvasSize: CGSize, scale: CGFloat, mirrorCanvas: Bool = true) throws {
+    init(art: ArtParser, canvasSize: CGSize, scale: CGFloat) throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw LivePreviewError.noMetalDevice
         }
         self.canvasSize = canvasSize
         self.scale = scale
-        self.mirrorCanvas = mirrorCanvas
         self.art = art
         self.view = LivePreviewView.make(device: device)
 
@@ -101,8 +99,7 @@ final class LivePreviewSession {
             guard let self = self, let renderer = self.presentRenderer else { return }
             renderer.presentLiveCanvas(canvas, to: drawable,
                                        transform: transform,
-                                       clearColor: clearColor,
-                                       flipVertically: self.mirrorCanvas)
+                                       clearColor: clearColor)
         }
     }
 

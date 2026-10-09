@@ -34,7 +34,6 @@ func main() {
         print("  --zoom F               Zoom factor for --live-view (1 = as the file shows)")
         print("  --pan X,Y              Pan in view pixels for --live-view")
         print("  --rotate R             Rotation in radians for --live-view")
-        print("  --no-flip-y            macOS only: Do not mirror the live canvas (mirrored by default)")
     }
     
     guard args.count > 1 else {
@@ -55,7 +54,6 @@ func main() {
     var liveOnly = false
     var useLiveView = false
     var liveCacheReport = false
-    var flipY = true          // the live canvas needs mirroring on macOS; --no-flip-y opts out
     var viewportSize = CGSize(width: 1600, height: 900)
     var liveZoom: CGFloat = 1
     var livePan = CGPoint.zero
@@ -117,11 +115,9 @@ func main() {
         } else if args[i] == "--live-cache" {
             liveCacheReport = true
             i += 1
-        } else if args[i] == "--flip-y" {
-            flipY = true
-            i += 1
-        } else if args[i] == "--no-flip-y" {
-            flipY = false
+        } else if args[i] == "--flip-y" || args[i] == "--no-flip-y" {
+            // Removed: canvas row order is no longer adjustable (see LiveViewTransform).
+            print("Warning: \(args[i]) is gone — the live canvas orientation is fixed")
             i += 1
         } else if args[i] == "--zoom" {
             i += 1
@@ -217,8 +213,7 @@ func main() {
         guard let liveImage = renderer.livePreviewImage(
             live,
             transform: LiveViewTransform(),
-            size: CGSize(width: Int(live.pixelSize.width), height: Int(live.pixelSize.height)),
-            flipVertically: flipY)
+            size: CGSize(width: Int(live.pixelSize.width), height: Int(live.pixelSize.height)))
         else {
             print("Error: Failed to render/read back the live preview")
             exit(1)
@@ -256,8 +251,7 @@ func main() {
                 exit(1)
             }
             guard let image = renderer.livePreviewImage(live, transform: live.presentTransform,
-                                                        size: live.pixelSize,
-                                                        flipVertically: flipY) else {
+                                                        size: live.pixelSize) else {
                 print("Error: failed to read back the interactive live render")
                 exit(1)
             }

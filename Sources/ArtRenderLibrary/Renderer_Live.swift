@@ -130,11 +130,9 @@ extension Renderer {
     /// With the neutral transform this is the document fitted to `size`.
     public func livePreviewImage(_ canvas: LiveRenderedCanvas,
                                  transform: LiveViewTransform = LiveViewTransform(),
-                                 size: CGSize,
-                                 flipVertically: Bool = LiveCanvasRowOrder.presentsMirrored) -> CGImage? {
+                                 size: CGSize) -> CGImage? {
         guard let mr = metalRenderer else { return nil }
-        return try? canvas.previewImage(renderer: mr, transform: transform, size: size,
-                                        flipVertically: flipVertically)
+        return try? canvas.previewImage(renderer: mr, transform: transform, size: size)
     }
     
     /// Draws a live canvas into `drawable` through the given view transform. Safe to
@@ -142,13 +140,11 @@ extension Renderer {
     public func presentLiveCanvas(_ canvas: LiveRenderedCanvas,
                                   to drawable: MTLDrawable,
                                   transform: LiveViewTransform,
-                                  clearColor: MTLClearColor = MTLClearColorMake(0, 0, 0, 1),
-                                  flipVertically: Bool = LiveCanvasRowOrder.presentsMirrored) {
+                                  clearColor: MTLClearColor = MTLClearColorMake(0, 0, 0, 1)) {
         guard let mr = metalRenderer else { return }
         do {
             try mr.presentLiveCanvas(canvas, to: drawable, transform: transform,
-                                     clearColor: clearColor,
-                                     flipVertically: flipVertically)
+                                     clearColor: clearColor)
         } catch {
             print("Live view: present failed — \(error)")
         }

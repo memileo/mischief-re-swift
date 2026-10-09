@@ -71,8 +71,7 @@ class PreviewProvider: NSViewController, QLPreviewingController {
                 // change anyway, so this is only the geometry cache's resolution.
                 session = try LivePreviewSession(art: art,
                                                  canvasSize: geometry.canvasSize,
-                                                 scale: geometry.scale,
-                                                 mirrorCanvas: Settings().mirrorLiveCanvas)
+                                                 scale: geometry.scale)
             } catch {
                 NSLog("ArtQuickLook live view unavailable: \(error.localizedDescription) — using static preview")
                 self.renderStaticPreviewInBackground(art: art, geometry: geometry, handler: handler)

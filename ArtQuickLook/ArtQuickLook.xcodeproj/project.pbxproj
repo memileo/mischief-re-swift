@@ -28,6 +28,12 @@
 		7C1F09432F8EE520003D4C2A /* convertTo8bitShader.metal in Sources */ = {isa = PBXBuildFile; fileRef = 7C1F093B2F8EE520003D4C2A /* convertTo8bitShader.metal */; };
 		7C1F09442F8EE520003D4C2A /* fxaaKernel.metal in Sources */ = {isa = PBXBuildFile; fileRef = 7C1F093C2F8EE520003D4C2A /* fxaaKernel.metal */; };
 		7C3AE6152F1E2AF8004EED00 /* PreviewViewController.xib in Resources */ = {isa = PBXBuildFile; fileRef = 7C3AE6142F1E2AF8004EED00 /* PreviewViewController.xib */; };
+		7C4BF93D3079540D00220546 /* LiveDocumentWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C4BF93C3079540D00220546 /* LiveDocumentWindow.swift */; };
+		7C4BF9413079560300220546 /* ArtRenderLibrary in Frameworks */ = {isa = PBXBuildFile; productRef = 7C4BF9403079560300220546 /* ArtRenderLibrary */; };
+		7C4BF9423079561E00220546 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7C0E40F82EAAE99D00FFCEAB /* Metal.framework */; };
+		7C4BF9443079561E00220546 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7C4BF9433079561E00220546 /* MetalKit.framework */; };
+		7C4BF9453079562C00220546 /* AppKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7C0E40FE2EAAEA0500FFCEAB /* AppKit.framework */; };
+		7C4BF9473079569D00220546 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7C4BF9463079569C00220546 /* QuartzCore.framework */; };
 		7C5108B22EAB663000480ED0 /* PreviewProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C5108B12EAB663000480ED0 /* PreviewProvider.swift */; };
 		7C90164E3065815700981936 /* SharedSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C90164D3065815700981936 /* SharedSettings.swift */; };
 		7C90164F3065815700981936 /* SharedSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C90164D3065815700981936 /* SharedSettings.swift */; };
@@ -104,6 +110,9 @@
 		7C1F093B2F8EE520003D4C2A /* convertTo8bitShader.metal */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.metal; path = convertTo8bitShader.metal; sourceTree = "<group>"; };
 		7C1F093C2F8EE520003D4C2A /* fxaaKernel.metal */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.metal; path = fxaaKernel.metal; sourceTree = "<group>"; };
 		7C3AE6142F1E2AF8004EED00 /* PreviewViewController.xib */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.xib; path = PreviewViewController.xib; sourceTree = "<group>"; };
+		7C4BF93C3079540D00220546 /* LiveDocumentWindow.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = LiveDocumentWindow.swift; sourceTree = "<group>"; };
+		7C4BF9433079561E00220546 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
+		7C4BF9463079569C00220546 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		7C5108B12EAB663000480ED0 /* PreviewProvider.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = PreviewProvider.swift; sourceTree = "<group>"; };
 		7C90164D3065815700981936 /* SharedSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedSettings.swift; sourceTree = "<group>"; };
 		7C901650306594D700981936 /* ArtQuickLookRelease.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = ArtQuickLookRelease.entitlements; sourceTree = "<group>"; };
@@ -122,6 +131,11 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				7C4BF9473079569D00220546 /* QuartzCore.framework in Frameworks */,
+				7C4BF9453079562C00220546 /* AppKit.framework in Frameworks */,
+				7C4BF9443079561E00220546 /* MetalKit.framework in Frameworks */,
+				7C4BF9423079561E00220546 /* Metal.framework in Frameworks */,
+				7C4BF9413079560300220546 /* ArtRenderLibrary in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -167,6 +181,7 @@
 		7C0E40CF2EAAE68500FFCEAB /* ArtQuickLook */ = {
 			isa = PBXGroup;
 			children = (
+				7C4BF93C3079540D00220546 /* LiveDocumentWindow.swift */,
 				7C901650306594D700981936 /* ArtQuickLookRelease.entitlements */,
 				7C0E41092EAAFCBA00FFCEAB /* Info.plist */,
 				7C0E40D02EAAE68500FFCEAB /* ArtQuickLookApp.swift */,
@@ -190,6 +205,8 @@
 		7C0E40E42EAAE79900FFCEAB /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				7C4BF9463079569C00220546 /* QuartzCore.framework */,
+				7C4BF9433079561E00220546 /* MetalKit.framework */,
 				7C0E40FE2EAAEA0500FFCEAB /* AppKit.framework */,
 				7C0E40FC2EAAE9FB00FFCEAB /* CoreImage.framework */,
 				7C0E40FA2EAAE9E600FFCEAB /* CoreGraphics.framework */,
@@ -267,10 +284,12 @@
 			buildRules = (
 			);
 			dependencies = (
+				7C4BF93F3079550D00220546 /* PBXTargetDependency */,
 				7C0E40F22EAAE79900FFCEAB /* PBXTargetDependency */,
 			);
 			name = ArtQuickLook;
 			packageProductDependencies = (
+				7C4BF9403079560300220546 /* ArtRenderLibrary */,
 			);
 			productName = ArtQuickLook;
 			productReference = 7C0E40CD2EAAE68500FFCEAB /* ArtQuickLook.app */;
@@ -382,6 +401,7 @@
 			files = (
 				7C90164E3065815700981936 /* SharedSettings.swift in Sources */,
 				7C0E40D32EAAE68500FFCEAB /* ContentView.swift in Sources */,
+				7C4BF93D3079540D00220546 /* LiveDocumentWindow.swift in Sources */,
 				7C0E40D12EAAE68500FFCEAB /* ArtQuickLookApp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -425,6 +445,10 @@
 			isa = PBXTargetDependency;
 			target = 7C0E40E22EAAE79900FFCEAB /* ArtQuickLookExtension */;
 			targetProxy = 7C0E40F12EAAE79900FFCEAB /* PBXContainerItemProxy */;
+		};
+		7C4BF93F3079550D00220546 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			productRef = 7C4BF93E3079550D00220546 /* ArtRenderLibrary */;
 		};
 		7C972D0E2EC9C49D0012B690 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
@@ -734,6 +758,14 @@
 /* End XCConfigurationList section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		7C4BF93E3079550D00220546 /* ArtRenderLibrary */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = ArtRenderLibrary;
+		};
+		7C4BF9403079560300220546 /* ArtRenderLibrary */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = ArtRenderLibrary;
+		};
 		7C972D0D2EC9C49D0012B690 /* ArtRenderLibrary */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = ArtRenderLibrary;

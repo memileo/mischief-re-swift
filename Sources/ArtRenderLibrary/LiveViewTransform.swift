@@ -83,23 +83,6 @@ public struct LiveViewMatrix: Equatable {
     }
 }
 
-// MARK: - Canvas row order
-
-/// Which way round the live canvas texture is presented.
-///
-/// Measured on macOS 14/15 (Apple silicon): presenting the canvas with **row 0 at the top**
-/// of the drawable shows the document upside down — even though the *same* texture is
-/// upright in the static CoreGraphics path, which draws it row 0-at-top inside a y-flipped
-/// context. That asymmetry is not explained, so this is the single place that states which
-/// way round the canvas goes; everything else defaults to it.
-///
-/// `Settings.mirrorLiveCanvas` (app) / `art2png --no-flip-y` mirror it back for a display
-/// that behaves the other way round.
-public enum LiveCanvasRowOrder {
-    /// Mirror the canvas vertically when presenting it.
-    public static let presentsMirrored = true
-}
-
 // MARK: - Transform
 
 /// User-controlled view transform for the live preview. Value type: every gesture
@@ -237,19 +220,33 @@ public struct LiveViewTransform: Equatable {
 
     /// Canvas pixels → Metal clip space.
     ///
-    /// Composes `matrix(canvasPixelSize:viewportSize:)` with the view-pixels → NDC step
-    /// (NDC is y-up, our pixels are y-down, so the document comes out upright):
+    /// Composes `matrix(canvasPixelSize:viewportSize:)` with the view-pixels → clip-space
+    /// step. View pixels are y-down (row 0 = top of the canvas) and the drawable shows
+    /// clip-space `-1` at the top, so
     ///
-    ///     ndc.x =  viewX / viewW * 2 - 1
-    ///     ndc.y = 1 - viewY / viewH * 2
+    ///     ndc.x = viewX / viewW * 2 - 1
+    ///     ndc.y = viewY / viewH * 2 - 1
+    ///
+    /// which is the identity on the canvas' own orientation: canvas row 0 lands at ndc.y
+    /// = -1. Everything the gestures do (pan, zoom anchor, rotate anchor) lives in those
+    /// same y-down view pixels, so this mapping must stay the one the gestures assume —
+    /// see the note on the y sign below.
     public func clipMatrix(canvasPixelSize: CGSize, viewportSize: CGSize) -> LiveViewMatrix {
         let view = matrix(canvasPixelSize: canvasPixelSize, viewportSize: viewportSize)
         let sx = 2.0 / max(viewportSize.width, 1)
-        let sy = -2.0 / max(viewportSize.height, 1)
-        // [sx 0 -1; 0 sy 1] · view
+        let sy = 2.0 / max(viewportSize.height, 1)
+        // [sx 0 -1; 0 sy -1] · view
+        //
+        // - Note the **positive** sy and the `-1` offset: the view's y axis points *down*
+        //   (row 0 at the top of the canvas, `matrix` maps canvas→view y-down), and the
+        //   drawable this presents into puts clip-space `-1` at the top of the screen.
+        //   Getting that sign backwards flips the image — and, worse, mirrors the display
+        //   relative to the pan/zoom/rotate maths, which is expressed in those same
+        //   y-down view pixels: vertical panning then runs the wrong way and a
+        //   zoom-to-the-pointer anchors at the mirrored point.
         return LiveViewMatrix(a: sx * view.a, b: sy * view.b,
                               c: sx * view.c, d: sy * view.d,
                               tx: sx * view.tx - 1.0,
-                              ty: sy * view.ty + 1.0)
+                              ty: sy * view.ty - 1.0)
     }
 }

@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 final class SettingsStore: ObservableObject {
     private var settings: Settings
@@ -8,7 +9,6 @@ final class SettingsStore: ObservableObject {
     @Published var useCache: Bool           { didSet { settings.useCache = useCache } }
     @Published var cacheSizeMB: Int         { didSet { settings.cacheSizeMB = cacheSizeMB } }
     @Published var generateThumbnails: Bool { didSet { settings.generateThumbnails = generateThumbnails } }
-    @Published var mirrorLiveCanvas: Bool    { didSet { settings.mirrorLiveCanvas = mirrorLiveCanvas } }
     
     init(settings: Settings = Settings()) {
         self.settings = settings
@@ -18,13 +18,13 @@ final class SettingsStore: ObservableObject {
         useCache = settings.useCache
         cacheSizeMB = settings.cacheSizeMB
         generateThumbnails = settings.generateThumbnails
-        mirrorLiveCanvas = settings.mirrorLiveCanvas
     }
 }
 
 struct ContentView: View {
     @StateObject private var store = SettingsStore()
-    
+    @State private var isImportingDocument = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             ScaleRow(store: store)
@@ -43,13 +43,32 @@ struct ContentView: View {
 //            Toggle("Generate thumbnails", isOn: $store.generateThumbnails)
             
             Divider()
-            
+
+            // Opens the document in its own live-view window — also the way to get a
+            // profileable process (Instruments attaches to the app, not to a Quick Look
+            // preview, which is hosted out-of-process).
+            Button {
+                isImportingDocument = true
+            } label: {
+                Label("Open Document…", systemImage: "doc")
+            }
+
             Button(action: SystemSettingsRouter.openQuickLookExtensions) {
                 Label("Extension System Settings…", systemImage: "gear")
             }
         }
         .padding(20)
         .frame(minWidth: 600, idealWidth: 650, maxWidth: 850) // min/default window size
+        .fileImporter(isPresented: $isImportingDocument,
+                      allowedContentTypes: [UTType(filenameExtension: "art") ?? .data]) { result in
+            if case .success(let url) = result { openDocument(url) }
+        }
+        .onOpenURL { url in openDocument(url) }
+    }
+
+    /// macOS 12 replacement for `openWindow(id:value:)`.
+    private func openDocument(_ url: URL) {
+        DocumentWindowCoordinator.shared.open(url: url)
     }
 }
 
@@ -58,10 +77,12 @@ struct LiveViewHelp: View {
     @ObservedObject var store: SettingsStore
 
     private let rows: [(String, String)] = [
-        ("MMB drag", "Pan"),
-        ("MMB + ⌘ drag", "Zoom"),
-        ("MMB + ⇧ drag", "Rotate"),
-        ("0 / P / Z / R", "Reset view / pan / zoom / rotation")
+        ("Drag (LMB or MMB)", "Pan"),
+        ("+ ⇧ drag", "Rotate"),
+        ("+ ⌘ drag", "Zoom"),
+        ("Scroll wheel", "Zoom at the pointer"),
+        ("Right click", "Reset menu"),
+        ("⌃0 / ⌃P / ⌃Z / ⌃R", "Reset view / pan / zoom / rotation")
     ]
     
     var body: some View {
@@ -85,10 +106,6 @@ struct LiveViewHelp: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.top, 4)
 
-            Toggle("Mirror canvas vertically", isOn: $store.mirrorLiveCanvas)
-                .font(.caption)
-                .padding(.top, 6)
-                .help("The live canvas needs mirroring to appear upright on macOS. Only untick if the preview shows the document upside down.")
         }
     }
 }
