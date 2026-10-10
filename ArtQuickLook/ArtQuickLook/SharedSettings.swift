@@ -35,6 +35,7 @@ private enum Keys {
     static let useCache = "useCache"
     static let cacheSizeMB = "cacheSizeMB"
     static let generateThumbnails = "generateThumbnails"
+    static let liveMaxFPS = "liveMaxFPS"
 }
 
 /// Reads/writes the shared suite. This *is* the plist you were going to
@@ -60,6 +61,14 @@ struct Settings {
         get { d.object(forKey: Keys.cacheSizeMB) as? Int ?? 100 }
         set { d.set(newValue, forKey: Keys.cacheSizeMB) }
     }
+    /// Upper bound on live-view frames per second. The display cannot show more than its
+    /// refresh rate, so anything higher only burns GPU (and makes gestures feel worse).
+    /// `0` means "no cap" (what the live view did before this setting existed).
+    var liveMaxFPS: Double {
+        get { d.object(forKey: Keys.liveMaxFPS) as? Double ?? 60 }
+        set { d.set(newValue, forKey: Keys.liveMaxFPS) }
+    }
+
     var generateThumbnails: Bool {
         get { d.object(forKey: Keys.generateThumbnails) as? Bool ?? true }
         set { d.set(newValue, forKey: Keys.generateThumbnails) }

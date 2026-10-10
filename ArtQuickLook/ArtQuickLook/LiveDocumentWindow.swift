@@ -473,8 +473,10 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
             let factor = exp(-(dy / pointScale) * Self.zoomSensitivity)
             commit { $0.zoom(by: factor, anchor: dragAnchor, viewportSize: viewport) }
         case .rotate:
+            // About the view centre, not the pointer — see the extension's LivePreviewView.
             let delta = (dx / pointScale) * Self.rotateSensitivity
-            commit { $0.rotate(by: delta, anchor: dragAnchor, viewportSize: viewport) }
+            let centre = CGPoint(x: viewport.width / 2, y: viewport.height / 2)
+            commit { $0.rotate(by: delta, anchor: centre, viewportSize: viewport) }
         }
     }
 

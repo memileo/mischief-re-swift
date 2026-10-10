@@ -9,6 +9,7 @@ final class SettingsStore: ObservableObject {
     @Published var useCache: Bool           { didSet { settings.useCache = useCache } }
     @Published var cacheSizeMB: Int         { didSet { settings.cacheSizeMB = cacheSizeMB } }
     @Published var generateThumbnails: Bool { didSet { settings.generateThumbnails = generateThumbnails } }
+    @Published var liveMaxFPS: Double        { didSet { settings.liveMaxFPS = liveMaxFPS } }
     
     init(settings: Settings = Settings()) {
         self.settings = settings
@@ -18,6 +19,7 @@ final class SettingsStore: ObservableObject {
         useCache = settings.useCache
         cacheSizeMB = settings.cacheSizeMB
         generateThumbnails = settings.generateThumbnails
+        liveMaxFPS = settings.liveMaxFPS
     }
 }
 
@@ -36,6 +38,7 @@ struct ContentView: View {
             
             if store.renderPath.isLiveView {
                 LiveViewHelp(store: store)
+                FrameRateRow(store: store)
             }
             
 //            CacheRow(store: store)
@@ -69,6 +72,57 @@ struct ContentView: View {
     /// macOS 12 replacement for `openWindow(id:value:)`.
     private func openDocument(_ url: URL) {
         DocumentWindowCoordinator.shared.open(url: url)
+    }
+}
+
+/// Frame-rate cap for the live view: presets plus a free-form value (0 = uncapped).
+///
+/// Rendering faster than the display can show only burns GPU and, with the interactive
+/// path, competes with the render thread for the frame budget.
+struct FrameRateRow: View {
+    @ObservedObject var store: SettingsStore
+
+    /// Non-nil while the user is editing a custom value.
+    @State private var custom: String?
+
+    private let presets: [Double] = [0, 30, 60, 120]
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("Max frames/second")
+                .font(.body)
+
+            Picker("", selection: Binding(
+                get: { custom == nil ? store.liveMaxFPS : -1 },
+                set: { value in
+                    if value >= 0 { custom = nil; store.liveMaxFPS = value }
+                }
+            )) {
+                ForEach(presets, id: \.self) { fps in
+                    Text(fps == 0 ? "Uncapped" : "\(Int(fps))").tag(fps)
+                }
+                Text("Custom").tag(-1.0)
+            }
+            .labelsHidden()
+            .frame(width: 130)
+
+            if custom != nil {
+                TextField("fps", text: Binding(
+                    get: { custom ?? String(Int(store.liveMaxFPS)) },
+                    set: { custom = $0 }
+                ))
+                .frame(width: 70)
+                .onSubmit {
+                    let value = Double(custom ?? "") ?? store.liveMaxFPS
+                    store.liveMaxFPS = max(0, value)
+                    custom = nil
+                }
+            }
+        }
+        .onAppear {
+            custom = presets.contains(store.liveMaxFPS) ? nil : String(Int(store.liveMaxFPS))
+        }
+        .help("The display cannot show more frames than its refresh rate. “Uncapped” is the old behaviour.")
     }
 }
 

@@ -158,6 +158,24 @@ extension MetalRenderer {
     
     // MARK: - Canvas textures
     
+    /// Canvas/background pair `index` (0 or 1).
+    func canvas(at index: Int) -> MTLTexture? {
+        liveCanvasTextures.indices.contains(index) ? liveCanvasTextures[index] : nil
+    }
+
+    func background(at index: Int) -> MTLTexture? {
+        liveBackgroundTextures.indices.contains(index) ? liveBackgroundTextures[index] : nil
+    }
+
+    /// Starts a frame: picks the pair to render into — the one the UI is *not* showing.
+    func beginLiveFrame() {
+        let next = liveCanvasIndex
+        // The installed canvas points at `liveCanvasIndex`; flip so the next frame writes
+        // into the other pair. Two buffers are enough because a present pass is a single
+        // draw and has long retired by the time the frame after next starts.
+        liveCanvasIndex = liveCanvasTextures.isEmpty ? 0 : (next + 1) % liveCanvasTextures.count
+    }
+
     /// (Re)creates the canvas + background textures for a `width` × `height` canvas.
     ///
     /// - Parameters:
@@ -190,13 +208,22 @@ extension MetalRenderer {
             return device.makeTexture(descriptor: desc)
         }
         
-        guard let canvas = makeTexture(), let background = makeTexture() else {
-            throw MetalRendererError.textureCreationFailed
+        // Two pairs, so a frame can be rendered while the previous one is on screen.
+        var canvases: [MTLTexture] = []
+        var backgrounds: [MTLTexture] = []
+        for _ in 0..<2 {
+            guard let canvas = makeTexture(), let background = makeTexture() else {
+                throw MetalRendererError.textureCreationFailed
+            }
+            canvases.append(canvas)
+            backgrounds.append(background)
         }
         
-        liveCanvasTexture = canvas
-        liveBackgroundTexture = background
-        print("Live view: canvas textures \(width)x\(height) (\(mipCount) mip level(s))")
+        liveCanvasTextures = canvases
+        liveBackgroundTextures = backgrounds
+        liveCanvasIndex = 0
+        print("Live view: canvas textures \(width)x\(height) x\(canvases.count)"
+              + " (\(mipCount) mip level(s))")
     }
     
     static func mipLevelCount(width: Int, height: Int) -> Int {
@@ -716,6 +743,7 @@ extension MetalRenderer {
         return texture
     }
     
+    /// The pair being rendered into (not necessarily the one on screen).
     var livePresentTextures: (canvas: MTLTexture, background: MTLTexture)? {
         guard let canvas = liveCanvasTexture, let background = liveBackgroundTexture else { return nil }
         return (canvas, background)

@@ -33,6 +33,7 @@
 
 import Cocoa
 import Metal
+import QuartzCore        // CACurrentMediaTime
 import ArtParser
 import ArtRenderLibrary
 
@@ -57,6 +58,8 @@ final class LivePreviewSession {
     /// Frames slower than this log their stage breakdown (bin / encode / gpu / paper), so
     /// "the preview feels sluggish" can be diagnosed without a rebuild.
     private static let slowFrameMilliseconds: Double = 250
+    /// Read once per preview (main thread).
+    private let frameInterval: TimeInterval
     private let canvasSize: CGSize
     private let scale: CGFloat
 
@@ -68,6 +71,8 @@ final class LivePreviewSession {
     // ── Main thread only ──
     private var latestRequest: LiveRenderRequest?
     private var rendering = false
+    /// When the last render finished — the rate limiter measures against this.
+    private var lastFrameFinishedAt: CFTimeInterval = CACurrentMediaTime()
     private var didShowStatus = false
     private var didAnnounceFallback = false
     /// Published from `finish(...)` so the present closure (main thread) never has to
@@ -89,6 +94,10 @@ final class LivePreviewSession {
         }
         self.canvasSize = canvasSize
         self.scale = scale
+        // 0 = uncapped. A display cannot show more than its refresh rate, so anything
+        // above that only burns GPU time.
+        let fps = Settings().liveMaxFPS
+        self.frameInterval = fps > 0 ? 1.0 / fps : 0
         self.art = art
         self.view = LivePreviewView.make(device: device)
 
@@ -129,6 +138,21 @@ final class LivePreviewSession {
 
     private func kick() {
         guard !rendering, let request = latestRequest else { return }
+
+        // Rate limit: a request that arrives too soon waits for the next slot instead of
+        // starting a render the screen cannot show anyway.
+        if frameInterval > 0 {
+            let sinceLastFrame = CACurrentMediaTime() - lastFrameFinishedAt
+            if sinceLastFrame < frameInterval {
+                let delay = frameInterval - sinceLastFrame
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self else { return }
+                    if !self.rendering { self.kick() }
+                }
+                return
+            }
+        }
+
         latestRequest = nil                 // coalesce: only the newest state survives
         rendering = true
         run(request)
@@ -156,6 +180,7 @@ final class LivePreviewSession {
             // A nil canvas with one already on screen is a transient failure: keep the
             // current mode so the next change retries the same way.
             self.rendering = false
+            self.lastFrameFinishedAt = CACurrentMediaTime()
             // A newer request arrived while we were busy: keep going, but only once.
             if self.latestRequest != nil { self.kick() }
         }

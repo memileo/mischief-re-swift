@@ -57,6 +57,7 @@ extension Renderer {
         
         do {
             try mr.makeLiveCanvasTextures(width: width, height: height)
+            mr.beginLiveFrame()
             if let canvasTexture = mr.liveCanvasTexture {
                 try mr.clearTexture(canvasTexture)          // start from transparent
             }
@@ -203,6 +204,10 @@ extension Renderer {
         do {
             try mr.makeLiveCanvasTextures(width: width, height: height,
                                           mipmapped: false, resetPaper: clearPaper)
+            // Render into the pair the UI is not presenting, so clearing this frame's
+            // canvas cannot blank the frame still on screen (it used to: the canvas was
+            // cleared in place and the next present showed an empty texture).
+            mr.beginLiveFrame()
             if let canvasTexture = mr.liveCanvasTexture {
                 try mr.clearTexture(canvasTexture)          // start from transparent
             }

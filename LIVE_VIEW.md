@@ -299,7 +299,8 @@ See §9. Work in this order so each step is independently testable:
   A/B comparison.
 
 ### Stage 8 — Take 4: make it correct, then fast
-See §9.3. Composition order, canvas orientation, the arena growth bug, off-screen
+See §9.3. Followed by take 4b (§9.4/§9.5): the present/gesture orientation, the reset keys,
+the metallib script, and document windows for profiling. Composition order, canvas orientation, the arena growth bug, off-screen
 culling, 32×32 live threadgroups, extra input bindings, per-stage frame timing, and the
 cache build moved to a Metal-free file so it can be tested on Linux.
 **Test:** the checklist at the end of this file, in order.
@@ -316,9 +317,8 @@ cache build moved to a Metal-free file so it can be tested on Linux.
 - **Drag released outside the view** ends the interaction via a `pressedMouseButtons`
   check in the draw loop rather than delivering `…MouseUp`.
 - The middle button is reserved while the live view is up.
-- **Canvas row order is still unexplained.** The live canvas has to be mirrored to appear
-  upright, although the *same* texture is upright in the static path. `LiveCanvasRowOrder`
-  records the observed behaviour rather than the expected one — see §9.2(a).
+- **Canvas row order is settled** (see §9.4): the present matrix is y-down throughout, so
+  there is no mirror and no setting.
 - **Per-stroke dispatches cover the whole canvas.** Correct but wasteful for large
   documents; see §9.2(c) for why the fix is not in yet.
 
@@ -413,6 +413,7 @@ The single-raster mode stays as the fallback and as the reference for `--live`.
 ### Follow-ups (only if something misbehaves on macOS)
 - Dispatch only the tiles a stroke touches (needs a pixel origin in the shared `Params`
   struct — a Swift/MSL layout mismatch there would silently corrupt every segment).
+  With the arena fixed, the GPU dispatches are the whole remaining frame cost (§9.2c).
 - Higher-resolution document raster for zoomed-in views.
 - HUD text in Metal instead of a CoreGraphics overlay.
 - Embedded images on the GPU (currently matched to the GPU segment path).
@@ -771,3 +772,133 @@ cheaper.
 > `Package.swift` did list. Anything the live path needs therefore goes **into a file that
 > is already compiled** (`LiveRenderCache.swift`), so the project never has to learn about
 > it.
+
+### Take 4b — orientation, keys, metallib script, profiling harness (2026-10-09)
+
+Reported after the take-4 build:
+
+1. The metallib script does not work, `--from-xcode` included (building in Xcode does).
+2. `--live` looks correct — orientation fixed.
+3. The 25 s frames are gone: **433 ms total (bin 59, encode 19, gpu 333, paper 1)** for
+   321 611 segments / 2 214 strokes, cache built in 170 ms. So the remaining cost is the
+   GPU dispatches, exactly as §9.2(c) predicted.
+4. Pasted content stays registered — the composition-order fix holds.
+5. Keyboard shortcuts do not work, and the canvas mirror inverts vertical panning and the
+   zoom-to-the-pointer anchor.
+
+#### 9.4 The orientation was the mirror, not the data
+
+The mirror added in §9.3 made the image right and the *gestures* wrong, which is the
+signature of a flip applied **outside** the mapping the gestures are expressed in:
+panning runs along the y axis, so a mirrored display reverses it, and a zoom anchor is a
+view-pixel point, so it lands on the mirrored point. Both symptoms, one cause.
+
+The fix is one sign. `LiveViewTransform.clipMatrix` assumed "clip +1 is the top of the
+drawable"; the drawable this presents into wants clip −1 at the top for a y-down canvas, so
+`ndc.y = viewY / viewH * 2 - 1` replaces `1 - viewY / viewH * 2`. Now:
+
+* the present matrix **is** the gesture mapping (`matrix` and `clipMatrix` agree), and
+* canvas row 0 → clip −1 → the top of the screen, i.e. the document comes out upright with
+  no mirroring at all.
+
+So `LiveCanvasRowOrder`, the app setting, and `--flip-y`/`--no-flip-y` are all gone — the
+orientation lives in exactly one matrix, and
+`LiveViewTransformTests.testClipMatrixAgreesWithGestureOrientation` pins the convention
+(canvas row 0 → clip −1 when the canvas fills the viewport, and increasing y increases
+clip y).
+
+`--flip-y`/`--no-flip-y` are still *accepted* by art2png, printing a deprecation warning,
+so old command lines do not fail.
+
+#### 9.5 Other take-4b changes
+
+- **Keys**: ⌘-based shortcuts can never reach a Quick Look extension (⌘O/⌘P/⌘Z/⌘R belong
+  to the system and Finder), so the resets moved to **⌃0 / ⌃P / ⌃Z / ⌃R** (bare keys still
+  accepted). The right-click menu remains the guaranteed path.
+- **"One frame, then the gesture stops"**: the drag-cancel check trusted a single frame with
+  an empty `pressedMouseButtons`. Inside the Quick Look host that reading can be empty while
+  the user is still dragging (the host can swallow the button-down), so the gesture was
+  cancelled after its first frame. The check is now gated by a 0.35 s quiet period since the
+  last drag event.
+- **Metallib script**: rewritten around what actually failed — it now asks
+  `xcodebuild -showBuildSettings` for `BUILT_PRODUCTS_DIR` (with a DerivedData search as a
+  fallback), verifies kernel names as substrings (metallibs store them with suffixes
+  depending on the compiler), and gained `--install <path>` and `--force`.
+  `xcrun metal` is now invoked without `-c`, which was producing an AIR object rather than
+  a linkable metallib.
+- **Profiling harness / document windows** (`ArtQuickLook/ArtQuickLook/LiveDocumentWindow.swift`,
+  added to the app target by hand — see `ADD_TO_XCODE.txt`): `ArtQuickLook` can open an
+  `.art` file in its own live-view window. Settings became a singleton `Window`, documents
+  a `WindowGroup(for: URL.self)`, and `ContentView` got an *Open Document…* button plus
+  `.onOpenURL`. The point is profiling: a Quick Look preview runs out-of-process, an app
+  window does not, so Instruments (Metal System Trace / GPU Frame Debugger) can attach to
+  it. The window also prints the live frame breakdown while you interact.
+
+### Take 4c — orientation settled, flicker, FPS cap (2026-10-09)
+
+From the take-4b run: continuous camera operation now works; the metallib script is
+unnecessary (Xcode builds it); Instruments runs against the app's document window
+(`performance-profiling/`); vertical pan/zoom was *still* y-flipped; frames blinked; the
+frame rate was soft-capped around 120; rotate-around-pointer was unwanted; and the app must
+stay macOS 12 compatible.
+
+#### 9.6 The orientation, second attempt — what I got wrong
+
+§9.4 "fixed" the orientation by flipping the sign in `clipMatrix` and removing the mirror.
+It did not change anything: the old code was `clipOld(flipY(canvas))` and the new code was
+`clipNew(canvas)`, and with `clipOld(y) = 1 - 2y/H` those are *the same function*:
+
+    clipOld(H - y) = 1 - 2(H - y)/H = 2y/H - 1 = clipNew(y)
+
+So the rendered image was identical, and the gesture/display mismatch survived — exactly
+what the follow-up run reported ("still Y-flipped"). The mistake was treating the mirror as
+cosmetic; it was the only reason the sign looked wrong, and removing one without replacing
+the other cancelled out.
+
+What is actually needed is the combination nobody had: **no mirror** *and* the original
+sign, `ndc.y = 1 - viewY/viewH * 2`. The canvas' own orientation then survives to the
+screen: row 0 at the top, increasing y going down — the same direction the gestures move
+it.
+
+To stop guessing about conventions, the canvas orientation is now *measured* rather than
+assumed (`tmp/canvas_row_probe.py`, see §9.7): the art file's view matrix is the identity for
+the sample documents, so canvas row index == document y, and probing where the ink of each
+document point lands pins down which end row 0 is.
+
+#### 9.7 Blinking between frames
+
+`renderLive(cache:…)` starts every frame with `clearTexture(canvas)` — on the *same*
+texture the UI is still presenting. Between the clear and the layer composite the next
+present showed an empty canvas, so the strokes blinked. The paper/background texture is
+only written at the very end of the frame, which is why the background did not blink — the
+symptom matched exactly that asymmetry.
+
+Fixed by double buffering: `MetalRenderer.liveCanvasTextures` / `liveBackgroundTextures`
+hold two pairs, `beginLiveFrame()` flips to the pair the UI is not showing, and
+`LiveRenderedCanvas` carries the pair it was rendered into (it already did, so the present
+pass needed no change).
+
+#### 9.8 Other take-4c changes
+
+- **Rotation is about the view centre**, not the pointer (both the extension and the document
+  window) — rotating from an edge then moves a lot, near the centre barely at all.
+- **Frame-rate cap** (`Settings.liveMaxFPS`, default 60, presets Uncapped/30/60/120 plus a
+  custom field). `LivePreviewSession.kick()` defers a request that arrives before the next
+  slot instead of rendering a frame the display cannot show.
+- **File ▸ Open .art-file…** in the app menu (NSOpenPanel; SwiftUI's `.fileImporter` has no
+  menu-command equivalent), wired to the user's `DocumentWindowCoordinator`.
+- **Single settings window on macOS 12**: `Window` is macOS 13+, so the answer for 12 is
+  `applicationShouldHandleReopen` returning true — a reopen activates the running window
+  instead of creating a second one (the user had already gone the "remove File ▸ New" route
+  as well; both are in).
+- `tmp/` added to `.gitignore` for orientation probes.
+
+#### 9.9 Next task
+
+`LIVE-VIEW-Performance-optimizations.md` — the per-stroke tile-range dispatch (dispatch each
+stroke only over the tiles it covers), written for a fresh agent, with the measurements, the
+kernel sketch, the layout/SDK constraints that have bitten this code, and an explicit list of
+the options that were considered and rejected. Deferred on purpose: half-resolution
+interacting frames, 32 px tiles, GPU tile binning, SDF caching, and incremental edge-tile
+rendering (with the reasoning for why the last one is unnecessary once tile-range dispatch
+lands).

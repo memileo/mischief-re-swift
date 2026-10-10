@@ -423,9 +423,13 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
                     viewTransform.zoom(by: factor, anchor: dragAnchor, viewportSize: viewport)
                 }
             case .rotate:
+                // Rotation is about the middle of the view, not the pointer: rotating from
+                // an edge then moves a lot, rotating near the centre almost not at all,
+                // which makes it far easier to line a shape up.
                 let delta = (dx / pointScale) * Self.rotateSensitivity
+                let centre = CGPoint(x: viewport.width / 2, y: viewport.height / 2)
                 commitTransform(mode: .rotate) { viewTransform in
-                    viewTransform.rotate(by: delta, anchor: dragAnchor, viewportSize: viewport)
+                    viewTransform.rotate(by: delta, anchor: centre, viewportSize: viewport)
                 }
             case .idle:
                 break

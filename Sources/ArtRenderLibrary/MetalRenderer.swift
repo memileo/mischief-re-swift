@@ -117,8 +117,17 @@ class MetalRenderer {
     internal var livePaperBackgroundPipeline: MTLComputePipelineState?
     internal var livePresentPipeline: MTLRenderPipelineState?
     internal var livePresentPipelineRGBA: MTLRenderPipelineState?
-    internal var liveCanvasTexture: MTLTexture?          // premultiplied, mipmapped
-    internal var liveBackgroundTexture: MTLTexture?      // opaque, mipmapped
+    /// Canvas/background pairs, double buffered. The interactive path renders into
+    /// `liveCanvasIndex` while the UI keeps presenting the *other* pair — otherwise the
+    /// `clearTexture` at the top of every frame wipes the very texture that is on screen
+    /// (which showed up as blinking between frames). `LiveRenderedCanvas` carries its own
+    /// pair, so the present pass needs no knowledge of this.
+    internal var liveCanvasTextures: [MTLTexture] = []   // premultiplied, optionally mipmapped
+    internal var liveBackgroundTextures: [MTLTexture] = []
+    internal var liveCanvasIndex = 0
+    /// The pair currently being rendered into.
+    internal var liveCanvasTexture: MTLTexture? { canvas(at: liveCanvasIndex) }
+    internal var liveBackgroundTexture: MTLTexture? { background(at: liveCanvasIndex) }
     internal var livePaperTexture: MTLTexture?           // art's paper JPEG
     /// 1×1 stand-in bound when a document has no paper texture.
     internal static var placeholderTexture: MTLTexture?
