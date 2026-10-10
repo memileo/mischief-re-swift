@@ -83,6 +83,59 @@ public struct LiveViewMatrix: Equatable {
     }
 }
 
+// MARK: - Screen ↔ view space
+
+/// The live view's coordinate conversions, in one tested place.
+///
+/// `clipMatrix` maps canvas pixels to the drawable with `ndc.y = viewY / viewH * 2 - 1`,
+/// and the drawable shows clip `-1` at the top — so **view pixels are y-up** while AppKit
+/// reports mouse locations y-down. The gestures therefore convert at the boundary:
+///
+///   - an *anchor* (a point on screen) is mirrored about the viewport height,
+///   - a *delta* (a movement) only has its y negated.
+///
+/// Rotation needs no sign flip: the same mirror that makes view space y-up also makes a
+/// positive rotation appear clockwise on screen, so dragging right still rotates clockwise.
+public enum LiveViewSpace {
+    /// Screen point (y-down, view pixels) → this transform's view space (y-up).
+    public static func point(_ screenPoint: CGPoint, viewportHeight: CGFloat) -> CGPoint {
+        CGPoint(x: screenPoint.x, y: viewportHeight - screenPoint.y)
+    }
+
+    /// Screen movement (y-down) → view-space movement (y-up).
+    public static func delta(_ screenDelta: CGPoint) -> CGPoint {
+        CGPoint(x: screenDelta.x, y: -screenDelta.y)
+    }
+
+    /// Viewport centre — its own mirror, so it is the same point in both spaces, but
+    /// routing it through here keeps the call sites honest.
+    public static func centre(viewportSize: CGSize) -> CGPoint {
+        CGPoint(x: viewportSize.width / 2, y: viewportSize.height / 2)
+    }
+}
+
+/// Rate limiter for the interactive path, shared by the Quick Look preview and the app's
+/// document windows: a request that arrives before the next slot waits instead of
+/// rendering a frame the display cannot show.
+public struct LiveFrameThrottle {
+    /// 0 means uncapped.
+    public let interval: TimeInterval
+
+    public init(maxFPS: Double) {
+        interval = maxFPS > 0 ? 1.0 / maxFPS : 0
+    }
+
+    public var isUncapped: Bool { interval <= 0 }
+
+    /// How long `now` must wait before a render may start, given the last one finished at
+    /// `lastFinished`. 0 means "go now".
+    public func waitTime(now: TimeInterval, lastFinished: TimeInterval) -> TimeInterval {
+        guard !isUncapped else { return 0 }
+        let remaining = interval - (now - lastFinished)
+        return remaining > 0 ? remaining : 0
+    }
+}
+
 // MARK: - Transform
 
 /// User-controlled view transform for the live preview. Value type: every gesture
@@ -220,31 +273,38 @@ public struct LiveViewTransform: Equatable {
 
     /// Canvas pixels → Metal clip space.
 ///
-/// Composes `matrix(canvasPixelSize:viewportSize:)` with the view-pixels → clip-space
-/// step. Clip space is y-up, view pixels are y-down (row 0 = top of the canvas), so
+/// Composes `matrix(canvasPixelSize:viewportSize:)` with the view-pixels → clip-space step.
 ///
-///     ndc.x =  viewX / viewW * 2 - 1
-///     ndc.y = 1 - viewY / viewH * 2
+///     ndc.x = viewX / viewW * 2 - 1
+///     ndc.y = viewY / viewH * 2 - 1
 ///
-/// which keeps the canvas' own orientation on screen: row 0 lands at the top and
-/// increasing y goes *down*, the same way the gestures move it.
+/// **Conventions, all verified on macOS — do not "simplify" either half away.**
 ///
-/// The art file's view matrix is the identity for most documents, so canvas row 0 is the
-/// document's top row — verified empirically, see LIVE_VIEW.md §9.6.
+/// * Canvas row 0 is the document's *top* row. The art file's view matrix is the identity
+///   for most documents, so canvas row index == document y, and the CPU path (which has no
+///   context flip) matches the Mischief-exported references non-flipped.
+/// * The drawable this presents into shows clip `-1` at the top, so canvas row 0 lands at
+///   ndc -1 and the document comes out upright. That mapping is the one confirmed visually;
+///   a mirror composed on top of it (take 4b) or the opposite sign (take 4c) both render
+///   upside down.
+/// * Because the drawable's axis is opposite to the canvas' own, *view* pixels are y-**up**
+///   while AppKit hands out y-**down** points. That conversion is
+///   `LiveViewTransform.viewSpacePoint(_:viewportHeight:)` / `viewSpaceDelta(_:)`, and every
+///   gesture goes through it. Skipping it leaves a still frame looking correct while
+///   vertical panning runs backwards and zoom-to-the-pointer anchors at the mirrored spot
+///   (LIVE_VIEW.md §9.4/§9.6).
     public func clipMatrix(canvasPixelSize: CGSize, viewportSize: CGSize) -> LiveViewMatrix {
         let view = matrix(canvasPixelSize: canvasPixelSize, viewportSize: viewportSize)
         let sx = 2.0 / max(viewportSize.width, 1)
-        let sy = -2.0 / max(viewportSize.height, 1)
-        // [sx 0 -1; 0 sy 1] · view
+        let sy = 2.0 / max(viewportSize.height, 1)
+        // [sx 0 -1; 0 sy -1] · view
         //
-        // - Note the **negative** sy: clip space is y-up, view pixels are y-down, and the
-        //   drawable shows clip +1 at the top. Flipping this sign is *not* the same as
-        //   mirroring the present pass — the two cancel out in the rendered image while
-        //   leaving the display mirrored relative to the gesture maths, which is what made
-        //   vertical panning and zoom-to-the-pointer run backwards (§9.4/§9.6).
+        // - Note the positive sy and the -1 offset: the drawable shows clip -1 at the top,
+        //   which is what puts canvas row 0 (the document's top) at the top of the screen.
+        //   `matrix` above is y-up in view pixels — see the orientation notes on this method.
         return LiveViewMatrix(a: sx * view.a, b: sy * view.b,
                               c: sx * view.c, d: sy * view.d,
                               tx: sx * view.tx - 1.0,
-                              ty: sy * view.ty + 1.0)
+                              ty: sy * view.ty - 1.0)
     }
 }

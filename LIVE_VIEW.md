@@ -842,28 +842,47 @@ unnecessary (Xcode builds it); Instruments runs against the app's document windo
 frame rate was soft-capped around 120; rotate-around-pointer was unwanted; and the app must
 stay macOS 12 compatible.
 
-#### 9.6 The orientation, second attempt — what I got wrong
+#### 9.6 The orientation, settled (three attempts)
 
-§9.4 "fixed" the orientation by flipping the sign in `clipMatrix` and removing the mirror.
-It did not change anything: the old code was `clipOld(flipY(canvas))` and the new code was
-`clipNew(canvas)`, and with `clipOld(y) = 1 - 2y/H` those are *the same function*:
+The three states that were actually observed on macOS:
 
-    clipOld(H - y) = 1 - 2(H - y)/H = 2y/H - 1 = clipNew(y)
+| present | image | gestures |
+|---|---|---|
+| mirror + `ndc.y = 1 - 2y/H` (take 4a) | correct | pan/zoom y-flipped |
+| no mirror + `ndc.y = 2y/H - 1` (take 4b) | correct | pan/zoom y-flipped |
+| no mirror + `ndc.y = 1 - 2y/H` (take 4c) | **upside down** | — |
 
-So the rendered image was identical, and the gesture/display mismatch survived — exactly
-what the follow-up run reported ("still Y-flipped"). The mistake was treating the mirror as
-cosmetic; it was the only reason the sign looked wrong, and removing one without replacing
-the other cancelled out.
+The first two are the same function, so 4a and 4b are the same state — which is why 4b
+"changed nothing". And 4c, the sign I thought had to be right because the canvas' own axis
+then lines up with view pixels, renders upside down. Two facts settle it:
 
-What is actually needed is the combination nobody had: **no mirror** *and* the original
-sign, `ndc.y = 1 - viewY/viewH * 2`. The canvas' own orientation then survives to the
-screen: row 0 at the top, increasing y going down — the same direction the gestures move
-it.
+* **Canvas row 0 is the document's top row.** Measured, not assumed: `tmp/reference_probe.py`
+  renders five sample documents with the CPU path — which has *no* CoreGraphics context flip
+  (`Renderer.render` guards the flip with `#if os(macOS)`) — and compares them with the
+  Mischief exports in `art/_ref/`. Plain difference is far smaller than the
+  difference-after-vertical-flip for every sample (e.g. 10 k vs 539 k for `layer-flip`),
+  so the un-flipped render is the upright one, and canvas row index == document y with y
+  growing downwards.
+* **The drawable this presents into shows clip `-1` at the top.** With row 0 at the document's
+  top, only `ndc.y = 2·viewY/viewH − 1` puts row 0 at the top of the screen — exactly the
+  mapping confirmed upright in 4a/4b.
 
-To stop guessing about conventions, the canvas orientation is now *measured* rather than
-assumed (`tmp/canvas_row_probe.py`, see §9.7): the art file's view matrix is the identity for
-the sample documents, so canvas row index == document y, and probing where the ink of each
-document point lands pins down which end row 0 is.
+So the present keeps `ndc.y = 2·viewY/viewH − 1` with no mirror, and because the drawable's
+axis runs opposite to the canvas', **view pixels are y-up while AppKit reports y-down**. That
+is where the gestures were wrong all along: they were handed screen coordinates and used
+them as view coordinates. Fixed by converting at the boundary, once, in
+`LiveViewSpace.point(_:viewportHeight:)` (anchors mirror about the viewport height) and
+`LiveViewSpace.delta(_)` (deltas negate y); rotation needs no sign flip, because the same
+mirror that makes view space y-up also makes a positive rotation read as clockwise.
+
+Both conversions are unit tested, including the end-to-end one: a 12 px drag downwards must
+move the content 12 view pixels up *and* produce a smaller clip y (§
+`testPanningDownOnScreenMovesContentDownTheScreen`).
+
+The general lesson, recorded because it cost two rounds: a still frame and the gestures can
+look fine while disagreeing, so an orientation bug is not fixable by eyeballing a render.
+Three conventions (canvas rows, screen pixels, view pixels/clip space) have to be pinned
+down and asserted — the test file header now names all three.
 
 #### 9.7 Blinking between frames
 
@@ -883,10 +902,19 @@ pass needed no change).
 - **Rotation is about the view centre**, not the pointer (both the extension and the document
   window) — rotating from an edge then moves a lot, near the centre barely at all.
 - **Frame-rate cap** (`Settings.liveMaxFPS`, default 60, presets Uncapped/30/60/120 plus a
-  custom field). `LivePreviewSession.kick()` defers a request that arrives before the next
-  slot instead of rendering a frame the display cannot show.
-- **File ▸ Open .art-file…** in the app menu (NSOpenPanel; SwiftUI's `.fileImporter` has no
-  menu-command equivalent), wired to the user's `DocumentWindowCoordinator`.
+  custom field). The limiter itself is `LiveFrameThrottle` in the library — unit tested, and
+  used by *both* the Quick Look session and the app's document windows (the app had none,
+  which is why the cap appeared not to work there).
+- **Menus**: File ▸ Open .art-file… goes into the *existing* File menu via
+  `CommandGroup(replacing: .newItem)` — declaring a `CommandMenu("File")` had added a second
+  File menu next to the system one. The four resets moved into the View menu
+  (`⌃0/⌃P/⌃Z/⌃R`, enabled only when a document window is focused, resolved through
+  `NSApp.keyWindow`'s content view), and the app-name menu got Preferences… (⌘,) which
+  activates the settings window rather than opening a second one.
+- **Finder drops / Open With…** no longer spawn an extra settings window: the
+  `applicationShouldHandleReopen(_:hasVisibleWindows:fileURLs:)` overload opens the dropped
+  documents and returns false, while the plain reopen overload still activates the existing
+  window (the macOS 12 singleton trick).
 - **Single settings window on macOS 12**: `Window` is macOS 13+, so the answer for 12 is
   `applicationShouldHandleReopen` returning true — a reopen activates the running window
   instead of creating a second one (the user had already gone the "remove File ▸ New" route

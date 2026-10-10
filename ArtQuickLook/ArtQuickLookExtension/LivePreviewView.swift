@@ -292,17 +292,26 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         max(window?.backingScaleFactor ?? 1, 1)
     }
 
-    /// Event location → **view pixels, y down**.
+    /// Event location → **screen pixels, y down** (view pixel scale applied).
     ///
-    /// The transform maths (and the canvas texture row order) is y-down top-left. AppKit
-    /// event coordinates are y-up for a non-flipped view, so the y axis is mirrored —
-    /// but only when the receiver is actually not flipped (`MTKView`'s flippedness
+    /// This is still AppKit's y-down space. Turning it into the transform's y-up view space
+    /// is `LiveViewSpace.point(_:viewportHeight:)`, done by the gesture code below — that
+    /// split is deliberate, because the conversion belongs next to the gesture maths it
+    /// feeds (`LiveViewTransform.clipMatrix` maps view pixels y-up to the drawable).
+    ///
+    /// AppKit event coordinates are y-up for a non-flipped view, so the y axis is mirrored
+    /// here — but only when the receiver is actually not flipped (`MTKView`'s flippedness
     /// differs between OS/SDK versions, so ask instead of assuming).
     private func pixelLocation(of event: NSEvent) -> CGPoint {
         let point = convert(event.locationInWindow, from: nil)
         let scale = pixelScale
         let y = isFlipped ? point.y : (bounds.maxY - point.y)
         return CGPoint(x: point.x * scale, y: y * scale)
+    }
+
+    /// Screen point → the transform's view space (see `LiveViewSpace`).
+    private func viewSpacePoint(_ screenPoint: CGPoint) -> CGPoint {
+        LiveViewSpace.point(screenPoint, viewportHeight: viewportSize.height)
     }
 
     /// Modifiers pick the mode; cmd wins over shift.
@@ -364,12 +373,11 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
             super.scrollWheel(with: event)
             return
         }
-        // Scrolling up zooms in.
+        // Scrolling up zooms in, anchored at the pointer (converted to view space).
         let factor = exp(delta * Self.scrollZoomSensitivity)
+        let anchor = viewSpacePoint(pixelLocation(of: event))
         commitTransform(mode: .zoom) { viewTransform in
-            viewTransform.zoom(by: factor,
-                               anchor: pixelLocation(of: event),
-                               viewportSize: viewportSize)
+            viewTransform.zoom(by: factor, anchor: anchor, viewportSize: viewportSize)
         }
     }
 
@@ -414,20 +422,24 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         let pointScale = pixelScale
         switch dragMode {
             case .pan:
+                // y is negated: dragging down on screen must move content down, and view
+                // space is y-up (LiveViewSpace).
                 commitTransform(mode: .pan) { viewTransform in
-                    viewTransform.pan(by: CGPoint(x: dx, y: dy))
+                    viewTransform.pan(by: LiveViewSpace.delta(CGPoint(x: dx, y: dy)))
                 }
             case .zoom:
                 let factor = exp(-(dy / pointScale) * Self.zoomSensitivity)
+                let anchor = viewSpacePoint(dragAnchor)
                 commitTransform(mode: .zoom) { viewTransform in
-                    viewTransform.zoom(by: factor, anchor: dragAnchor, viewportSize: viewport)
+                    viewTransform.zoom(by: factor, anchor: anchor, viewportSize: viewport)
                 }
             case .rotate:
                 // Rotation is about the middle of the view, not the pointer: rotating from
                 // an edge then moves a lot, rotating near the centre almost not at all,
-                // which makes it far easier to line a shape up.
+                // which makes it far easier to line a shape up. No y sign flip needed here —
+                // see LiveViewSpace.
                 let delta = (dx / pointScale) * Self.rotateSensitivity
-                let centre = CGPoint(x: viewport.width / 2, y: viewport.height / 2)
+                let centre = LiveViewSpace.centre(viewportSize: viewport)
                 commitTransform(mode: .rotate) { viewTransform in
                     viewTransform.rotate(by: delta, anchor: centre, viewportSize: viewport)
                 }

@@ -10,7 +10,12 @@ import CoreGraphics
 /// The live view's transform maths is the one piece of the interactive preview that can
 /// be verified without a GPU or a window, so it is pinned down here.
 ///
-/// Coordinates: canvas/view pixels are y-down (AppKit + texture row order), NDC is y-up.
+/// Coordinates, all three of them, because getting one wrong is exactly the bug this file
+/// exists to prevent:
+///   * canvas pixels — y-**down**, row 0 is the document's *top* row (texture row order)
+///   * screen pixels — y-**down** (AppKit mouse locations)
+///   * view pixels / NDC — y-**up** (the drawable shows clip -1 at the top)
+/// `LiveViewSpace` converts screen → view, and every gesture goes through it.
 final class LiveViewTransformTests: XCTestCase {
 
     private let canvas = CGSize(width: 2000, height: 1000)
@@ -57,14 +62,14 @@ final class LiveViewTransformTests: XCTestCase {
 
     // MARK: - Clip space
 
-    func testClipMatrixKeepsCanvasYDownAndFitsNDC() {
+    func testClipMatrixFitsNDCWithViewYUp() {
         let clip = LiveViewTransform().clipMatrix(canvasPixelSize: canvas, viewportSize: viewport)
-        // canvas top-left → view (0, 100) → ndc (-1, 1 - 100/600*2)
+        // Canvas top-left → view (0, 100) → ndc (-1, 100/600*2 - 1)
         assertPoint(clip.applying(CGPoint(x: 0, y: 0)),
-                    CGPoint(x: -1, y: 1 - 200.0 / 600.0))
-        // canvas bottom-right → view (800, 500) → ndc (1, 1 - 500/600*2)
+                    CGPoint(x: -1, y: 200.0 / 600.0 - 1))
+        // Canvas bottom-right → view (800, 500) → ndc (1, 500/600*2 - 1)
         assertPoint(clip.applying(CGPoint(x: 2000, y: 1000)),
-                    CGPoint(x: 1, y: 1 - 1000.0 / 600.0))
+                    CGPoint(x: 1, y: 1000.0 / 600.0 - 1))
     }
 
     /// The whole chain, end to end: the art file's view matrix is the identity, so canvas
@@ -78,24 +83,102 @@ final class LiveViewTransformTests: XCTestCase {
     /// runs the wrong way and zoom-to-the-pointer anchors at the mirrored spot.
     func testPresentAndGestureOrientationAgree() {
         // Canvas filling the viewport exactly, so the mapping is not letterboxed.
+        //
+        // Confirmed on macOS: canvas row 0 is the document's *top* row and the drawable
+        // shows clip -1 at the top, so row 0 must land at clip -1. The opposite sign, or a
+        // mirror composed on top of this matrix, renders the document upside down.
         let exact = LiveViewTransform().clipMatrix(canvasPixelSize: viewport, viewportSize: viewport)
-        XCTAssertEqual(exact.applying(CGPoint(x: 0, y: 0)).y, 1, accuracy: 1e-6,
+        XCTAssertEqual(exact.applying(CGPoint(x: 0, y: 0)).y, -1, accuracy: 1e-6,
                        "canvas row 0 must land at the top of the drawable")
-        XCTAssertEqual(exact.applying(CGPoint(x: 0, y: viewport.height)).y, -1, accuracy: 1e-6)
+        XCTAssertEqual(exact.applying(CGPoint(x: 0, y: viewport.height)).y, 1, accuracy: 1e-6)
 
-        // Clip space is y-up, so increasing canvas y must *decrease* clip y…
+        // That means view pixels grow *upward* towards the top of the screen, which is why
+        // the gesture layer has to convert (LiveViewSpace) — see below.
         let clip = LiveViewTransform().clipMatrix(canvasPixelSize: canvas, viewportSize: viewport)
         let top = clip.applying(CGPoint(x: 0, y: 0))
         let bottom = clip.applying(CGPoint(x: 0, y: canvas.height))
-        XCTAssertLessThan(bottom.y, top.y)
+        XCTAssertGreaterThan(bottom.y, top.y)
+    }
 
-        // …and `matrix`, which the pan/zoom/rotate maths is expressed in, is y-down.
-        var transform = LiveViewTransform()
-        transform.pan(by: CGPoint(x: 0, y: 10))
-        let view = transform.matrix(canvasPixelSize: canvas, viewportSize: viewport)
-        let above = view.applying(CGPoint(x: 500, y: 100))
-        let below = view.applying(CGPoint(x: 500, y: 200))
-        XCTAssertGreaterThan(below.y, above.y, "panning down must move content down")
+    // MARK: - Screen ↔ view space
+
+    /// A screen point maps into view space by mirroring about the viewport height — this is
+    /// what keeps zoom-to-the-pointer on the pixel under the cursor.
+    func testViewSpacePointMirrorsTheViewport() {
+        let converted = LiveViewSpace.point(CGPoint(x: 100, y: 0), viewportHeight: 600)
+        assertPoint(converted, CGPoint(x: 100, y: 600))
+        let middle = LiveViewSpace.point(CGPoint(x: 10, y: 300), viewportHeight: 600)
+        assertPoint(middle, CGPoint(x: 10, y: 300))
+    }
+
+    /// A screen movement only has its y negated. Combined with the clip matrix above this
+    /// is what makes dragging down move content *down*.
+    func testViewSpaceDeltaNegatesY() {
+        assertPoint(LiveViewSpace.delta(CGPoint(x: 5, y: 7)), CGPoint(x: 5, y: -7))
+        assertPoint(LiveViewSpace.delta(CGPoint(x: -3, y: -7)), CGPoint(x: -3, y: 7))
+    }
+
+    /// End to end: a drag of `d` screen pixels downwards must move the content `d` screen
+    /// pixels down. Stated in view pixels (a pure translation, so it is exact at any zoom)
+    /// and in clip space (where "down the screen" is a *decreasing* clip y).
+    func testPanningDownOnScreenMovesContentDownTheScreen() {
+        let drag: CGFloat = 12
+
+        var panned = LiveViewTransform()
+        panned.pan(by: LiveViewSpace.delta(CGPoint(x: 0, y: drag)))
+
+        let point = CGPoint(x: 500, y: 300)
+        let neutral = LiveViewTransform()
+        let viewBefore = neutral.matrix(canvasPixelSize: canvas, viewportSize: viewport)
+        let viewAfter = panned.matrix(canvasPixelSize: canvas, viewportSize: viewport)
+
+        // In view space the content moved up by exactly the drag distance…
+        let before = viewBefore.applying(point)
+        let after = viewAfter.applying(point)
+        assertPoint(after, CGPoint(x: before.x, y: before.y - drag),
+                    "panning must be a pure translation of `drag` view pixels")
+
+        // …and because the drawable shows clip -1 at the top, a smaller clip y *is* further
+        // down the screen.
+        let clipBefore = neutral.clipMatrix(canvasPixelSize: canvas, viewportSize: viewport)
+        let clipAfter = panned.clipMatrix(canvasPixelSize: canvas, viewportSize: viewport)
+        // (The clip matrix maps *canvas* -> NDC, so it takes the canvas point; the
+        // view-space points above are what it feeds on internally.)
+        let clipYBefore = clipBefore.applying(point).y
+        let clipYAfter = clipAfter.applying(point).y
+        XCTAssertLessThan(clipYAfter, clipYBefore, "content must move down the screen")
+        XCTAssertEqual(clipYBefore - clipYAfter, 2.0 * Double(drag) / Double(viewport.height),
+                       accuracy: 1e-9)
+    }
+
+    func testViewportCentreIsItsOwnMirror() {
+        let centre = LiveViewSpace.centre(viewportSize: viewport)
+        assertPoint(LiveViewSpace.point(centre, viewportHeight: viewport.height), centre)
+    }
+
+    // MARK: - Frame throttle
+
+    func testFrameThrottleCapsRate() {
+        let sixtyFps = LiveFrameThrottle(maxFPS: 60)
+        XCTAssertEqual(sixtyFps.interval, 1.0 / 60.0, accuracy: 1e-9)
+        // Right after a frame: wait out the rest of the interval.
+        XCTAssertEqual(sixtyFps.waitTime(now: 10.000, lastFinished: 10.000),
+                       1.0 / 60.0, accuracy: 1e-9)
+        // Halfway through: half of it.
+        XCTAssertEqual(sixtyFps.waitTime(now: 10.000 + 1.0 / 120.0,
+                                         lastFinished: 10.000),
+                       1.0 / 120.0, accuracy: 1e-9)
+        // Longer than the interval: go now, never a negative wait.
+        XCTAssertEqual(sixtyFps.waitTime(now: 11.0, lastFinished: 10.0), 0, accuracy: 1e-9)
+    }
+
+    func testFrameThrottleUncapped() {
+        let uncapped = LiveFrameThrottle(maxFPS: 0)
+        XCTAssertTrue(uncapped.isUncapped)
+        XCTAssertEqual(uncapped.waitTime(now: 10.0, lastFinished: 10.0), 0)
+
+        let negative = LiveFrameThrottle(maxFPS: -30)
+        XCTAssertTrue(negative.isUncapped)
     }
 
     // MARK: - Pan

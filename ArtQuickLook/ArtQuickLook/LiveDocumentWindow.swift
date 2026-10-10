@@ -94,6 +94,8 @@ final class LiveDocumentSession {
     // ── main thread only ──
     private var latestRequest: Request?
     private var rendering = false
+    private let throttle: LiveFrameThrottle
+    private var lastFrameFinishedAt: CFTimeInterval = CACurrentMediaTime()
 
     struct Request {
         let transform: LiveViewTransform
@@ -120,6 +122,8 @@ final class LiveDocumentSession {
         let settings = Settings()
         self.scale = CGFloat(max(settings.previewScale, 0.25))
         self.canvasSize = CGSize(width: 1920, height: 1080)
+        // Same cap the Quick Look preview honours (0 = uncapped).
+        self.throttle = LiveFrameThrottle(maxFPS: settings.liveMaxFPS)
     }
 
     // MARK: Requests (main thread)
@@ -193,6 +197,7 @@ final class LiveDocumentSession {
                                       timing.encodeMilliseconds, timing.gpuMilliseconds,
                                       timing.strokes, timing.segments, timing.culledStrokes))
             }
+            self.lastFrameFinishedAt = CACurrentMediaTime()
             self.rendering = false
             if self.latestRequest != nil { self.kick() }
         }
@@ -370,11 +375,17 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
 
     private var pixelScale: CGFloat { max(window?.backingScaleFactor ?? 1, 1) }
 
+    /// Screen pixels, y down. Converted to the transform's y-up view space by
+    /// `viewSpacePoint(_:)` — see `LiveViewSpace`.
     private func pixelLocation(of event: NSEvent) -> CGPoint {
         let point = convert(event.locationInWindow, from: nil)
         let scale = pixelScale
         let y = isFlipped ? point.y : (bounds.maxY - point.y)
         return CGPoint(x: point.x * scale, y: y * scale)
+    }
+
+    private func viewSpacePoint(_ screenPoint: CGPoint) -> CGPoint {
+        LiveViewSpace.point(screenPoint, viewportHeight: viewportSize.height)
     }
 
     private var viewportSize: CGSize {
@@ -425,8 +436,9 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
             return
         }
         let factor = exp(delta * Self.scrollZoomSensitivity)
+        let anchor = viewSpacePoint(pixelLocation(of: event))
         commit { transform in
-            transform.zoom(by: factor, anchor: pixelLocation(of: event), viewportSize: viewportSize)
+            transform.zoom(by: factor, anchor: anchor, viewportSize: viewportSize)
         }
     }
 
@@ -468,14 +480,16 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
         let pointScale = pixelScale
         switch dragMode {
         case .pan:
-            commit { $0.pan(by: CGPoint(x: dx, y: dy)) }
+            // y negated: screen is y-down, view space is y-up (LiveViewSpace).
+            commit { $0.pan(by: LiveViewSpace.delta(CGPoint(x: dx, y: dy))) }
         case .zoom:
             let factor = exp(-(dy / pointScale) * Self.zoomSensitivity)
-            commit { $0.zoom(by: factor, anchor: dragAnchor, viewportSize: viewport) }
+            let anchor = viewSpacePoint(dragAnchor)
+            commit { $0.zoom(by: factor, anchor: anchor, viewportSize: viewport) }
         case .rotate:
             // About the view centre, not the pointer — see the extension's LivePreviewView.
             let delta = (dx / pointScale) * Self.rotateSensitivity
-            let centre = CGPoint(x: viewport.width / 2, y: viewport.height / 2)
+            let centre = LiveViewSpace.centre(viewportSize: viewport)
             commit { $0.rotate(by: delta, anchor: centre, viewportSize: viewport) }
         }
     }
@@ -485,6 +499,44 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
         isDragging = false
         dragButton = []
         NSCursor.arrow.set()
+    }
+
+    // MARK: Menu access
+    //
+    // The View menu drives the focused document window. Going through the responder chain
+    // (`NSApp.keyWindow`'s content view) keeps the menu independent of which window or
+    // coordinator owns the view.
+
+    enum ResetKind { case all, pan, zoom, rotation }
+
+    /// The live view in the key window, if any.
+    static var focusedDocumentView: LiveMTKView? {
+        guard let content = NSApp.keyWindow?.contentView else { return nil }
+        return findLiveMTKView(in: content)
+    }
+
+    static var hasFocusedDocument: Bool { focusedDocumentView != nil }
+
+    static func resetFocused(_ kind: ResetKind) {
+        guard let view = focusedDocumentView else { return }
+        view.performReset(kind)
+    }
+
+    private static func findLiveMTKView(in view: NSView) -> LiveMTKView? {
+        if let live = view as? LiveMTKView { return live }
+        for subview in view.subviews {
+            if let live = findLiveMTKView(in: subview) { return live }
+        }
+        return nil
+    }
+
+    func performReset(_ kind: ResetKind) {
+        switch kind {
+        case .all:      commit { $0.resetAll() }
+        case .pan:      commit { $0.resetPan() }
+        case .zoom:     commit { $0.resetZoom() }
+        case .rotation: commit { $0.resetRotation() }
+        }
     }
 
     /// The one place a transform change turns into a new frame request.

@@ -58,8 +58,8 @@ final class LivePreviewSession {
     /// Frames slower than this log their stage breakdown (bin / encode / gpu / paper), so
     /// "the preview feels sluggish" can be diagnosed without a rebuild.
     private static let slowFrameMilliseconds: Double = 250
-    /// Read once per preview (main thread).
-    private let frameInterval: TimeInterval
+    /// Frame-rate cap, shared with the app's document windows (`LiveFrameThrottle`).
+    private let throttle: LiveFrameThrottle
     private let canvasSize: CGSize
     private let scale: CGFloat
 
@@ -96,8 +96,7 @@ final class LivePreviewSession {
         self.scale = scale
         // 0 = uncapped. A display cannot show more than its refresh rate, so anything
         // above that only burns GPU time.
-        let fps = Settings().liveMaxFPS
-        self.frameInterval = fps > 0 ? 1.0 / fps : 0
+        self.throttle = LiveFrameThrottle(maxFPS: Settings().liveMaxFPS)
         self.art = art
         self.view = LivePreviewView.make(device: device)
 
@@ -140,17 +139,16 @@ final class LivePreviewSession {
         guard !rendering, let request = latestRequest else { return }
 
         // Rate limit: a request that arrives too soon waits for the next slot instead of
-        // starting a render the screen cannot show anyway.
-        if frameInterval > 0 {
-            let sinceLastFrame = CACurrentMediaTime() - lastFrameFinishedAt
-            if sinceLastFrame < frameInterval {
-                let delay = frameInterval - sinceLastFrame
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                    guard let self else { return }
-                    if !self.rendering { self.kick() }
-                }
-                return
+        // starting a render the screen cannot show anyway. The pending request is kept, so
+        // the deferred kick renders the *newest* state rather than a stale one.
+        let wait = throttle.waitTime(now: CACurrentMediaTime(),
+                                     lastFinished: lastFrameFinishedAt)
+        if wait > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
+                guard let self, !self.rendering else { return }
+                self.kick()
             }
+            return
         }
 
         latestRequest = nil                 // coalesce: only the newest state survives

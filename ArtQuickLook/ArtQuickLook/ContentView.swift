@@ -87,21 +87,33 @@ struct FrameRateRow: View {
 
     private let presets: [Double] = [0, 30, 60, 120]
 
+    /// Tag for the "Custom…" entry — negative, so it can never collide with a preset.
+    private static let customTag: Double = -1
+
     var body: some View {
         HStack(spacing: 8) {
             Text("Max frames/second")
                 .font(.body)
 
             Picker("", selection: Binding(
-                get: { custom == nil ? store.liveMaxFPS : -1 },
+                get: { custom == nil ? store.liveMaxFPS : Self.customTag },
                 set: { value in
-                    if value >= 0 { custom = nil; store.liveMaxFPS = value }
+                    if value == Self.customTag {
+                        // Seeding with the current value keeps the field usable; leaving it
+                        // empty is why picking "Custom" used to show nothing at all.
+                        custom = presets.contains(store.liveMaxFPS)
+                            ? String(Int(store.liveMaxFPS))
+                            : String(Int(store.liveMaxFPS))
+                    } else {
+                        custom = nil
+                        store.liveMaxFPS = value
+                    }
                 }
             )) {
                 ForEach(presets, id: \.self) { fps in
                     Text(fps == 0 ? "Uncapped" : "\(Int(fps))").tag(fps)
                 }
-                Text("Custom").tag(-1.0)
+                Text("Custom…").tag(Self.customTag)
             }
             .labelsHidden()
             .frame(width: 130)

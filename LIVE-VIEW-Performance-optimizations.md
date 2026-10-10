@@ -21,7 +21,7 @@ Nothing else in the live path is worth optimising first: the CPU stages together
 
 ---
 
-## 1. Current numbers (reproduce them first)
+## 1. Current numbers (reproduce them first if on macOS)
 
 `art/kaos.art` — 1 layer, 2 214 strokes, 321 611 segments, 19.6 MB of geometry:
 
@@ -228,6 +228,14 @@ corruption or wrong pixels, not compile errors.
 8. **Transform composition order.** `a.concatenating(b)` applies **a first**, then b. The
    `camera ∘ base ∘ layer` ordering in `LiveRenderCache` is load-bearing — reversing it put
    pasted content "on a different depth plane" (§9.2).
+9. **Do not touch the orientation conventions.** Three different spaces are involved and they
+   do not agree: canvas rows are y-down (row 0 = the document's top), AppKit mouse locations
+   are y-down, and view pixels / clip space are y-up. Gestures convert through
+   `LiveViewSpace` (anchors mirror about the viewport height, deltas negate y), and the
+   present matrix is `ndc.y = 2·viewY/viewH − 1` with **no** mirror. Changing any of that
+   renders upside down or silently inverts panning — it cost three rounds to pin down
+   (`LIVE_VIEW.md` §9.6). `tmp/reference_probe.py` reproduces the canvas-orientation
+   measurement against the Mischief exports in `art/_ref/`.
 
 ---
 
