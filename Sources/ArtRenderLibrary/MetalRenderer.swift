@@ -1,6 +1,7 @@
 // Requirements: macOS 12 compatibility - Swift 5.7, Metal 2
 #if os(macOS)
 import Metal
+import Foundation
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
@@ -161,7 +162,7 @@ class MetalRenderer {
     internal let linearSampler: MTLSamplerState?
     
     // Configuration
-    internal let tileSize = 64  // Coarse tile size for spatial indexing
+    internal var tileSize = 32  // Coarse tile size for spatial indexing (override via ART_TILE_SIZE for tuning) 32 faster for live-view, 64 faster for single frame
     
     internal var tileIndicesBuffer: MTLBuffer?
     internal var tileListBuffer: MTLBuffer?
@@ -187,6 +188,16 @@ class MetalRenderer {
         
         guard let device = self.device else {
             throw MetalRendererError.deviceNotAvailable
+        }
+        
+        // Tile size is tunable at runtime (ART_TILE_SIZE) so values can be A/B measured
+        // without recompiling. Caveat baked into the design: the frame's distance-field
+        // evaluation count is ~tile-size-invariant (fewer segments per tile, but
+        // proportionally more tiles), so a smaller tile mostly buys CPU bin time vs.
+        // threadgroup launches — not fewer SDF evaluations. Measure before assuming <64 wins.
+        if let override = ProcessInfo.processInfo.environment["ART_TILE_SIZE"],
+           let value = Int(override), value >= 8 {
+            self.tileSize = value
         }
         
         self.commandQueue = device.makeCommandQueue()
