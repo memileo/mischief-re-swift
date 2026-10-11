@@ -68,6 +68,10 @@ class MetalRenderer {
     //    private var segmentSDFPipeline: MTLComputePipelineState?
     internal var segmentNoiseCompositePipeline: MTLComputePipelineState?
     internal var segmentAACompositePipeline: MTLComputePipelineState?
+    // Live-view-only twins of the segment kernels (tile-range dispatch). Built in
+    // prepareLiveCompositing; when absent the live view falls back to the static path.
+    internal var liveSegmentAACompositePipeline: MTLComputePipelineState?
+    internal var liveSegmentNoiseCompositePipeline: MTLComputePipelineState?
     internal var segmentPasteLayerAACompositePipeline: MTLComputePipelineState?
     internal var segmentPasteLayerNoiseCompositePipeline: MTLComputePipelineState?
     internal var segmentCutCompositePipeline: MTLComputePipelineState?

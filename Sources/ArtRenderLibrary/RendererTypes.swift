@@ -82,6 +82,43 @@ internal struct ResolvedStroke {
     var masks: [StrokeMask] = []     // NEW — shape cases need no edits (default [])
 }
 
+// MARK: - Tile union (platform-independent; unit-tested on Linux)
+
+/// Inclusive bounding box, in tile indices, of the tiles that are actually non-empty.
+///
+/// The interactive (live) path uses this to dispatch one stroke only over the tiles it
+/// covers instead of over the whole canvas: a tile is "non-empty" when its segment count
+/// is non-zero, so the returned box is exactly the union of the per-segment tile ranges
+/// that `MetalRenderer.buildSegmentTileIndices` already computed.
+///
+/// This is deliberately free of any Metal/`TileIndex` type so it can be exercised by a
+/// normal unit test on Linux as well as macOS.
+public enum TileUnion {
+    /// - Parameters:
+    ///   - counts: per-tile segment counts, row-major.
+    ///   - tilesPerRow: number of tile columns in `counts`.
+    /// - Returns: the inclusive `[minX…maxX] × [minY…maxY]` box, or `nil` when nothing maps
+    ///   on-canvas (every count is zero, `counts` is empty, or `tilesPerRow` is 0) — which
+    ///   the caller treats as "nothing to dispatch".
+    public static func boundingBox(counts: [UInt32],
+                                   tilesPerRow: Int)
+        -> (minX: Int, minY: Int, maxX: Int, maxY: Int)?
+    {
+        guard tilesPerRow > 0, !counts.isEmpty else { return nil }
+        var minX = Int.max, minY = Int.max, maxX = -1, maxY = -1
+        for (index, count) in counts.enumerated() where count != 0 {
+            let x = index % tilesPerRow
+            let y = index / tilesPerRow
+            if x < minX { minX = x }
+            if x > maxX { maxX = x }
+            if y < minY { minY = y }
+            if y > maxY { maxY = y }
+        }
+        guard maxX >= 0 else { return nil }
+        return (minX, minY, maxX, maxY)
+    }
+}
+
 // MARK: - GPU and Layer Payloads
 public struct GPUSplineSegment {
     public var p0: SIMD2<Float>    // CR Control Point 0 (Prev tangent)

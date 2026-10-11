@@ -914,3 +914,209 @@ kernel void mergeFlattenCompositeKernel(
     dst.a   = sa + dst.a * (1.0f - sa);
     target.write(dst, gid);
 }
+
+// MARK: - Live-view twins (tile-range dispatch)
+//
+// These are byte-for-byte the same maths as `segmentAACompositeKernel` /
+// `segmentNoiseCompositeKernel`, but they carry the stroke's *tile box* so the live
+// path can dispatch each stroke over only the tiles it covers instead of the whole
+// canvas. The shared kernels above stay untouched — the static path still uses them.
+
+// `flags`: bit0 = isEraser, bit1 = isMarker. Scalars only, laid out to match Swift's
+// `LiveStrokeParams` exactly (a float4/SIMD4 penColor would sit at different offsets in
+// the two languages — see the note above LivePresentUniforms in liveCompositeKernels.metal).
+struct LiveStrokeParams {
+    uint  tileOriginX;
+    uint  tileOriginY;
+    uint  tilesPerRow;
+    uint  tileSize;
+    uint  textureWidth;
+    uint  textureHeight;
+    uint  stampCount;
+    float penColorR;
+    float penColorG;
+    float penColorB;
+    float penColorA;
+    float noiseScale;
+    uint  flags;
+};
+
+// Live twin of `segmentAACompositeKernel`.
+//
+// CRITICAL: a Metal compute grid always starts at (0,0) — there is no grid-origin
+// offset — so the ABSOLUTE canvas pixel (tileOrigin * tileSize + gid) drives the bounds
+// check, the tile lookup, the SDF sample position and the destination write. Using the
+// raw gid for those would rasterise every stroke into the top-left corner.
+kernel void liveSegmentAACompositeKernel(
+                                         const device LiveStrokeParams &params [[buffer(0)]],
+                                         const device GPUSplineSegment *segments [[buffer(1)]],
+                                         const device TileIndex *tileIndices [[buffer(2)]],
+                                         const device uint32_t *tileList [[buffer(3)]],
+                                         texture2d<float, access::read_write> target [[texture(0)]],
+                                         uint2 gid [[thread_position_in_grid]])
+{
+    uint2 originPx = uint2(params.tileOriginX, params.tileOriginY) * params.tileSize;
+    uint2 pixel = originPx + gid;
+    uint w = target.get_width();
+    uint h = target.get_height();
+    if (pixel.x >= w || pixel.y >= h) return;
+
+    uint2 tileID = pixel / params.tileSize;
+    uint tileIndex = tileID.y * params.tilesPerRow + tileID.x;
+    TileIndex tIdx = tileIndices[tileIndex];
+
+    float2 pos = float2(pixel.x, pixel.y) + float2(0.5f, 0.5f);
+
+    bool isMarker = (params.flags & 0x2u) != 0u;
+    bool isEraser = (params.flags & 0x1u) != 0u;
+    const float3 penRGB = float3(params.penColorR, params.penColorG, params.penColorB);
+    const float  penA  = params.penColorA;
+
+    float maxCoverage = 0.0f;
+    for (uint i = 0; i < tIdx.count; ++i) {
+        uint segIdx = tileList[tIdx.start + i];
+        GPUSplineSegment seg = segments[segIdx];
+
+        float signedDist = 1e6f;
+        float t = 0.0f;
+
+        if (isMarker) {
+            if (seg.segmentType == 0) {
+                SDFResult res = sdSlantedMarkerStraight(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
+                signedDist = res.dist; t = res.t;
+            } else {
+                SDFResult res = sdSlantedMarkerSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+                signedDist = res.dist; t = res.t;
+            }
+        } else if (seg.segmentType == 0) {
+            SDFResult res = sdUnevenCapsule(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
+            signedDist = res.dist; t = res.t;
+        } else if (seg.segmentType == 1) {
+            SDFResult res = sdSplineSegment(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+            signedDist = res.dist; t = res.t;
+        } else if (seg.segmentType == 2) {
+            SDFResult res = sdSoftEnvelopeSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+            signedDist = res.dist; t = res.t;
+        }
+
+        float opacity = mix(seg.opacity0, seg.opacity1, t);
+        float edgeWidth = 0.94f;
+        float bias = 0.5f;
+        float adjustedDist = signedDist + bias;
+        float cov = 1.0f - smootherstep(-edgeWidth, edgeWidth, adjustedDist);
+        float stamped = cov * opacity;
+        if (stamped > maxCoverage) { maxCoverage = stamped; }
+    }
+
+    if (maxCoverage < 0.001f) return;
+
+    float finalAlpha = maxCoverage * penA;
+    float4 dst = target.read(pixel);
+    float3 srcPremultiplied = penRGB * finalAlpha;
+
+    if (isEraser) {
+        dst.rgb = dst.rgb * (1.0f - finalAlpha);
+        dst.a = dst.a * (1.0f - finalAlpha);
+    } else {
+        dst.rgb = srcPremultiplied + dst.rgb * (1.0f - finalAlpha);
+        dst.a = finalAlpha + dst.a * (1.0f - finalAlpha);
+    }
+    target.write(dst, pixel);
+}
+
+// Live twin of `segmentNoiseCompositeKernel` (markers always take the AA path, exactly
+// like the static twin — isMarker is intentionally not consulted here).
+kernel void liveSegmentNoiseCompositeKernel(
+                                            const device LiveStrokeParams &params [[buffer(0)]],
+                                            const device GPUSplineSegment *segments [[buffer(1)]],
+                                            const device TileIndex *tileIndices [[buffer(2)]],
+                                            const device uint32_t *tileList [[buffer(3)]],
+                                            texture2d<float, access::read_write> target [[texture(0)]],
+                                            texture2d<float, access::sample> noiseTex [[texture(1)]],
+                                            sampler noiseSampler [[sampler(0)]],
+                                            uint2 gid [[thread_position_in_grid]])
+{
+    uint2 originPx = uint2(params.tileOriginX, params.tileOriginY) * params.tileSize;
+    uint2 pixel = originPx + gid;
+    uint w = target.get_width();
+    uint h = target.get_height();
+    if (pixel.x >= w || pixel.y >= h) return;
+
+    uint2 tileID = pixel / params.tileSize;
+    uint tileIndex = tileID.y * params.tilesPerRow + tileID.x;
+    TileIndex tIdx = tileIndices[tileIndex];
+
+    float2 pos = float2(pixel.x, pixel.y) + float2(0.5f, 0.5f);
+
+    bool isEraser = (params.flags & 0x1u) != 0u;
+    const float3 penRGB = float3(params.penColorR, params.penColorG, params.penColorB);
+    const float  penA  = params.penColorA;
+
+    float maxCoverage = 0.0f;
+    for (uint i = 0; i < tIdx.count; ++i) {
+        uint segIdx = tileList[tIdx.start + i];
+        GPUSplineSegment seg = segments[segIdx];
+
+        float signedDist = 1e6f;
+        float t = 0.0f;
+
+        if (seg.segmentType == 0) {
+            SDFResult res = sdUnevenCapsule(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
+            signedDist = res.dist; t = res.t;
+        } else if (seg.segmentType == 1) {
+            SDFResult res = sdSplineSegment(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+            signedDist = res.dist; t = res.t;
+        } else if (seg.segmentType == 2) {
+            SDFResult res = sdSoftEnvelopeSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+            signedDist = res.dist; t = res.t;
+        }
+
+        float radius = mix(seg.radius0, seg.radius1, t);
+        float opacity = mix(seg.opacity0, seg.opacity1, t);
+
+        float dist = signedDist + radius;
+        float nd = dist / (max(radius, 1.0f) * 1.1f);
+
+        float covPencil = 1.0f;
+        if (nd > 0.08f) {
+            float tSoft = clamp((nd - 0.1f) / 0.9f, 0.0f, 1.0f);
+            float scurve = tSoft * tSoft * (3.0f - 2.0f * tSoft);
+            covPencil = 1.0f - pow(scurve, 0.9f);
+        }
+
+        float tAir = clamp(nd * 0.8f, 0.0f, 1.0f);
+        float covAirbrush = (1.0f - tAir);
+        covAirbrush = covAirbrush * covAirbrush;
+
+        float softness = saturate((radius - 4.0f) / 800.0f);
+        float cov = mix(covPencil, covAirbrush, softness);
+        float stamped = cov * opacity;
+        if (stamped > maxCoverage) { maxCoverage = stamped; }
+    }
+
+    if (maxCoverage < 0.001f) return;
+
+    float noiseVal = 1.0f;
+    if (noiseTex.get_width() > 0) {
+        float2 noiseUV = fract(float2(pixel) / (float(noiseTex.get_width()) * params.noiseScale));
+        noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
+    }
+
+    float inverted = 1.0f - maxCoverage;
+    float noiseAdd = (maxCoverage * 0.94f) + noiseVal;
+    float finalAlpha = 1.0f - saturate(inverted / noiseAdd);
+    finalAlpha *= penA;
+
+    if (finalAlpha > 0.0001f) {
+        float4 dst = target.read(pixel);
+        float3 srcPremultiplied = penRGB * finalAlpha;
+        if (isEraser) {
+            dst.rgb = dst.rgb * (1.0f - finalAlpha);
+            dst.a = dst.a * (1.0f - finalAlpha);
+        } else {
+            dst.rgb = srcPremultiplied + dst.rgb * (1.0f - finalAlpha);
+            dst.a = finalAlpha + dst.a * (1.0f - finalAlpha);
+        }
+        target.write(dst, pixel);
+    }
+}

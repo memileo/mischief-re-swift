@@ -55,6 +55,8 @@ LIVE_KERNELS=(
     livePaperBackgroundKernel
     livePresentVertexShader
     livePresentFragmentShader
+    liveSegmentAACompositeKernel
+    liveSegmentNoiseCompositeKernel
 )
 REQUIRED_KERNELS=(
     clearKernel

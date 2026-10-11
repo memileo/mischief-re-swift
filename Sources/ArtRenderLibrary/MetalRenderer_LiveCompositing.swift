@@ -43,6 +43,25 @@ struct LivePaperParams {
     var m10: Float, m11: Float, m12: Float
 }
 
+// Must match `LiveStrokeParams` in segmentKernels.metal byte for byte. Scalars only: an
+// SIMD4 penColor would land at a different offset than the shader's equivalent (see the
+// note above LivePresentUniforms). `flags`: bit0 = isEraser, bit1 = isMarker.
+struct LiveStrokeParams {
+    var tileOriginX: UInt32
+    var tileOriginY: UInt32
+    var tilesPerRow: UInt32
+    var tileSize: UInt32
+    var textureWidth: UInt32
+    var textureHeight: UInt32
+    var stampCount: UInt32
+    var penColorR: Float
+    var penColorG: Float
+    var penColorB: Float
+    var penColorA: Float
+    var noiseScale: Float
+    var flags: UInt32
+}
+
 extension MetalRenderer {
     
     // MARK: - Pipeline preparation
@@ -81,7 +100,32 @@ extension MetalRenderer {
         } else {
             failures.append("livePaperBackgroundKernel: not found in the metallib")
         }
-        
+
+        // Live-only segment kernels: a byte-for-byte copy of segment{AA,Noise}CompositeKernel
+        // that dispatches each stroke over its own tile box (see encode(stroke:)). Built
+        // here so a pre-existing metallib without them disables the live view cleanly
+        // instead of mis-rendering.
+        if let fn = library.makeFunction(name: "liveSegmentAACompositeKernel") {
+            do {
+                liveSegmentAACompositePipeline = try device.makeComputePipelineState(function: fn)
+            } catch {
+                failures.append("liveSegmentAACompositeKernel: \(error)")
+                liveSegmentAACompositePipeline = nil
+            }
+        } else {
+            failures.append("liveSegmentAACompositeKernel: not found in the metallib")
+        }
+        if let fn = library.makeFunction(name: "liveSegmentNoiseCompositeKernel") {
+            do {
+                liveSegmentNoiseCompositePipeline = try device.makeComputePipelineState(function: fn)
+            } catch {
+                failures.append("liveSegmentNoiseCompositeKernel: \(error)")
+                liveSegmentNoiseCompositePipeline = nil
+            }
+        } else {
+            failures.append("liveSegmentNoiseCompositeKernel: not found in the metallib")
+        }
+
         // Present render pipeline (drawables are BGRA, offscreen readback is RGBA)
         if let vs = library.makeFunction(name: "livePresentVertexShader"),
            let fs = library.makeFunction(name: "livePresentFragmentShader") {
@@ -113,6 +157,8 @@ extension MetalRenderer {
         
         guard liveCompositeLayerPipeline != nil,
               livePaperBackgroundPipeline != nil,
+              liveSegmentAACompositePipeline != nil,
+              liveSegmentNoiseCompositePipeline != nil,
               livePresentPipeline != nil else {
             // Two very different causes: a metallib that predates the live kernels
             // (rebuild it), or a device that cannot build these pipelines. Print both
@@ -265,6 +311,9 @@ extension MetalRenderer {
         var isEraser = false
         var isMarker = false
         var hasNoise = false
+        // Inclusive tile box this stroke covers (union of its per-segment ranges). The
+        // live dispatch covers exactly this box instead of the whole canvas.
+        var minTileX = 0, minTileY = 0, maxTileX = 0, maxTileY = 0
     }
     
     /// The layer's ops in their original order — a `cut` erases what was drawn *below*
@@ -399,12 +448,30 @@ extension MetalRenderer {
                         continue
                     }
                     
+                    // Tile box this stroke covers = the union of its per-segment tile ranges
+                    // (a tile is on-canvas iff its count > 0). `TileUnion` returns nil only
+                    // when nothing maps on-canvas — already handled by the empty-tile-list
+                    // cull above — so this guard is a defensive net, not the real gate.
+                    let tilesPerRow = (width + tileSize - 1) / tileSize
+                    guard let tileBox = TileUnion.boundingBox(
+                        counts: tileIndicesData.map { $0.count },
+                        tilesPerRow: tilesPerRow) else {
+                        liveTiming.culledStrokes += 1
+                        liveTiming.strokes -= 1
+                        liveTiming.segments -= segments.count
+                        continue
+                    }
+
                     var bin = LiveStrokeBin()
                     bin.segmentCount = segments.count
                     bin.color = color
                     bin.isEraser = isEraser
                     bin.isMarker = isMarker
                     bin.hasNoise = segments.contains { $0.noiseSeed != 0 }
+                    bin.minTileX = tileBox.minX
+                    bin.minTileY = tileBox.minY
+                    bin.maxTileX = tileBox.maxX
+                    bin.maxTileY = tileBox.maxY
                     
                     // Layout: segments, tile indices, tile list — each 256-aligned so it
                     // can be bound as an MTLBuffer offset.
@@ -496,35 +563,49 @@ extension MetalRenderer {
         guard let arena = liveArena else { throw MetalRendererError.bufferCreationFailed }
         
         // One dispatch = one kernel, so noise segments never share a dispatch with clean
-        // ones (mirrors `MetalRenderer_Dispatch.dispatchStrokeToGPU`).
+        // ones (mirrors `MetalRenderer_Dispatch.dispatchStrokeToGPU`). The live twins take
+        // the stroke's tile box (bin.min/maxTile) so the dispatch covers only the tiles the
+        // stroke actually reaches — see `bin` and `liveSegment*CompositeKernel`.
         var pipeline: MTLComputePipelineState?
-        if bin.hasNoise, let p = segmentNoiseCompositePipeline, let noise = noiseTexture {
+        if bin.hasNoise, let p = liveSegmentNoiseCompositePipeline, let noise = noiseTexture {
             pipeline = p
             encoder.setTexture(noise, index: 1)
             if let sampler = linearSampler { encoder.setSamplerState(sampler, index: 0) }
         } else {
-            pipeline = segmentAACompositePipeline
+            pipeline = liveSegmentAACompositePipeline
         }
         guard let pipeline = pipeline else {
-            throw MetalRendererError.pipelineMissing("segmentAACompositeKernel")
+            throw MetalRendererError.pipelineMissing("liveSegmentAACompositeKernel")
         }
         
-        var params = Params(
-            textureWidth: UInt32(width), textureHeight: UInt32(height),
+        var flags: UInt32 = 0
+        if bin.isEraser { flags |= 1 }
+        if bin.isMarker { flags |= 2 }
+        var params = LiveStrokeParams(
+            tileOriginX: UInt32(bin.minTileX), tileOriginY: UInt32(bin.minTileY),
+            tilesPerRow: UInt32((width + tileSize - 1) / tileSize),
             tileSize: UInt32(tileSize),
-            tilesPerRow: (UInt32(width) + UInt32(tileSize) - 1) / UInt32(tileSize),
+            textureWidth: UInt32(width), textureHeight: UInt32(height),
             stampCount: UInt32(bin.segmentCount),
-            penColor: bin.color, noiseScale: 0.4,
-            isEraser: bin.isEraser, isMarker: bin.isMarker)
+            penColorR: bin.color.x, penColorG: bin.color.y,
+            penColorB: bin.color.z, penColorA: bin.color.w,
+            noiseScale: 0.4,
+            flags: flags)
         
         encoder.setComputePipelineState(pipeline)
-        encoder.setBytes(&params, length: MemoryLayout<Params>.stride, index: 0)
+        encoder.setBytes(&params, length: MemoryLayout<LiveStrokeParams>.stride, index: 0)
         encoder.setBuffer(arena, offset: bin.segmentOffset, index: 1)
         encoder.setBuffer(arena, offset: bin.tileIndexOffset, index: 2)
         encoder.setBuffer(arena, offset: bin.tileListOffset, index: 3)
         encoder.setTexture(gpuRenderTarget, index: 0)
-        encoder.dispatchThreadgroups(Self.liveGroups(width: width, height: height),
-                                     threadsPerThreadgroup: Self.liveThreads)
+        // Dispatch only the stroke's tile box: ceil(tileSize / threadDim) threadgroups per
+        // tile, over [minTile…maxTile]. A single-tile stroke yields 1 (never 0).
+        let groupsPerTileX = (tileSize + Int(Self.liveThreads.width) - 1) / Int(Self.liveThreads.width)
+        let groupsPerTileY = (tileSize + Int(Self.liveThreads.height) - 1) / Int(Self.liveThreads.height)
+        let groups = MTLSize(width: (bin.maxTileX - bin.minTileX + 1) * groupsPerTileX,
+                             height: (bin.maxTileY - bin.minTileY + 1) * groupsPerTileY,
+                             depth: 1)
+        encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: Self.liveThreads)
     }
     
     /// Cut dispatch into a caller-supplied encoder.
