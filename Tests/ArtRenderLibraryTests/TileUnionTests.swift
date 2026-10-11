@@ -1,5 +1,10 @@
 import Foundation
 import XCTest
+#if os(Linux)
+import Silica
+#else
+import CoreGraphics
+#endif
 @testable import ArtRenderLibrary
 
 /// `TileUnion.boundingBox` is the whole CPU-side decision behind the live path's
@@ -178,5 +183,38 @@ final class SegmentPruneTests: XCTestCase {
         XCTAssertLessThan(5.0, Double(radius))            // edge pixel kept
         // A pixel 20px away (well clear of the ink) IS pruned.
         XCTAssertGreaterThan(20.0, Double(radius))
+    }
+}
+
+/// Regression: the per-pixel prune radius (`padding1`, a distance) must be rescaled with the
+/// camera in `LiveRenderCache.remap`, exactly like the radii — it is baked in the segment's
+/// own space and compared against canvas-space distances in the kernel. Without the rescale,
+/// zooming in over-prunes (strokes clip, AA edges vanish) and zooming out under-prunes.
+final class LiveRemapPruneScaleTests: XCTestCase {
+    func testRemapScalesPruneRadiusAndRadii() {
+        var seg = GPUSplineSegment(p0: SIMD2(0, 0), p1: SIMD2(0, 0),
+                                   p2: SIMD2(100, 0), p3: SIMD2(100, 0),
+                                   radius0: 5, radius1: 5,
+                                   opacity0: 1, opacity1: 1, segmentType: 0, noiseSeed: 0)
+        seg.padding1 = Float(10).bitPattern           // pretend prune radius 10 (document units)
+
+        let out = LiveRenderCache.remap([seg],
+                                        camera: CGAffineTransform(a: 2, b: 0, c: 0, d: 2, tx: 0, ty: 0),
+                                        radiusFactor: 2.0)
+        XCTAssertEqual(out.count, 1)
+        XCTAssertEqual(out[0].radius0, 10, accuracy: 1e-4)                 // 5 × 2
+        XCTAssertEqual(Float(bitPattern: out[0].padding1), 20, accuracy: 1e-4) // 10 × 2
+    }
+
+    func testRemapLeavesPruneRadiusAtUnitScale() {
+        var seg = GPUSplineSegment(p0: SIMD2(0, 0), p1: SIMD2(0, 0),
+                                   p2: SIMD2(50, 0), p3: SIMD2(50, 0),
+                                   radius0: 3, radius1: 3,
+                                   opacity0: 1, opacity1: 1, segmentType: 1, noiseSeed: 0)
+        seg.padding1 = Float(12.5).bitPattern
+        let out = LiveRenderCache.remap([seg],
+                                        camera: CGAffineTransform(a: 1, b: 0, c: 0, d: 1, tx: 7, ty: 9),
+                                        radiusFactor: 1.0)
+        XCTAssertEqual(Float(bitPattern: out[0].padding1), 12.5, accuracy: 1e-4)  // unchanged
     }
 }

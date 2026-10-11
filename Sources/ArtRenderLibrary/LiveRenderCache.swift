@@ -371,6 +371,13 @@ extension LiveRenderCache {
             if !noRadiusChange {
                 s.radius0 *= radiusFactor
                 s.radius1 *= radiusFactor
+                // `padding1` holds a per-pixel prune radius (a distance, in the segment's own
+                // space at flatten time). Distances scale with the camera, so it must be
+                // rescaled into canvas space here just like the radii — otherwise the kernel
+                // compares a document-space radius against canvas-space distances: too small
+                // when zoomed in (over-prune → strokes clip, lose their AA falloff) and too
+                // big when zoomed out (under-prune → full SDF cost). 0 = unset, stays 0.
+                s.padding1 = (Float(bitPattern: s.padding1) * radiusFactor).bitPattern
             }
             out.append(s)
         }
