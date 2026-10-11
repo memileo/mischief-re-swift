@@ -941,6 +941,15 @@ struct LiveStrokeParams {
     uint  flags;
 };
 
+// Distance from p to segment a-b (0 when inside the a/b clamp). The per-pixel prune gate
+// below uses this against the chord p1→p2 — one sqrt, versus the multi-sample spline SDF.
+static inline float liveSegDist(float2 p, float2 a, float2 b) {
+    float2 pa = p - a;
+    float2 ba = b - a;
+    float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-7f), 0.0f, 1.0f);
+    return length(pa - ba * h);
+}
+
 // Live twin of `segmentAACompositeKernel`.
 //
 // CRITICAL: a Metal compute grid always starts at (0,0) — there is no grid-origin
@@ -976,6 +985,12 @@ kernel void liveSegmentAACompositeKernel(
     for (uint i = 0; i < tIdx.count; ++i) {
         uint segIdx = tileList[tIdx.start + i];
         GPUSplineSegment seg = segments[segIdx];
+
+        // Per-pixel prune (see SegmentPrune): a pixel farther than the stored radius from the
+        // chord p1→p2 cannot be covered by this segment, so skip the expensive SDF. 0 = not
+        // set → never prune. Output-identical.
+        float pruneRadius = (seg.padding1 != 0u) ? as_type<float>(seg.padding1) : 3.4e38f;
+        if (liveSegDist(pos, seg.p1, seg.p2) > pruneRadius) continue;
 
         float signedDist = 1e6f;
         float t = 0.0f;
@@ -1056,6 +1071,11 @@ kernel void liveSegmentNoiseCompositeKernel(
     for (uint i = 0; i < tIdx.count; ++i) {
         uint segIdx = tileList[tIdx.start + i];
         GPUSplineSegment seg = segments[segIdx];
+
+        // Per-pixel prune (see SegmentPrune): skip segments that provably contribute no
+        // coverage to this pixel. 0 = not set → never prune. Output-identical.
+        float pruneRadius = (seg.padding1 != 0u) ? as_type<float>(seg.padding1) : 3.4e38f;
+        if (liveSegDist(pos, seg.p1, seg.p2) > pruneRadius) continue;
 
         float signedDist = 1e6f;
         float t = 0.0f;

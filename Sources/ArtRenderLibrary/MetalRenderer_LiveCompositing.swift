@@ -472,6 +472,14 @@ extension MetalRenderer {
                     bin.minTileY = tileBox.minY
                     bin.maxTileX = tileBox.maxX
                     bin.maxTileY = tileBox.maxY
+
+                    // Debug counters (pure CPU arithmetic, no GPU sync): dispatched tiles =
+                    // the stroke's box; ink tiles = tiles that actually hold a segment; sdf
+                    // evaluations = the exact number of distance-field lookups the kernel does.
+                    liveTiming.dispatchedTiles += (tileBox.maxX - tileBox.minX + 1)
+                                                * (tileBox.maxY - tileBox.minY + 1)
+                    liveTiming.inkedTiles += tileIndicesData.reduce(0) { $0 + ($1.count > 0 ? 1 : 0) }
+                    liveTiming.sdfEvaluations += tileListData.count * (tileSize * tileSize)
                     
                     // Layout: segments, tile indices, tile list — each 256-aligned so it
                     // can be bound as an MTLBuffer offset.

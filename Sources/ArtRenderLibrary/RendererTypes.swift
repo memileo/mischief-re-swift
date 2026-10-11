@@ -119,6 +119,58 @@ public enum TileUnion {
     }
 }
 
+// MARK: - Per-segment prune radius (platform-independent; unit-tested on Linux)
+
+/// A conservative upper bound on how far a segment's ink can sit from its chord p1→p2,
+/// used by the live kernels to skip a candidate segment for a given pixel (see the gate in
+/// `segmentKernels.metal`). A pixel whose distance to the chord exceeds this radius cannot
+/// receive any coverage from the segment, so the expensive SDF is skipped with identical
+/// output.
+///
+/// Bounds it relies on:
+///   * a straight capsule (segmentType 0) draws only p1→p2 + radius, so its ink never
+///     leaves the chord;
+///   * a spline (type 1 / 2) sweeps the Catmull-Rom curve, which stays inside the convex
+///     hull of the four control points; the hull's farthest point from the chord p1→p2 is
+///     p0 or p3 (p1, p2 are on the chord);
+///   * a chisel marker sweeps a capsule reaching ~4·radius (3r along the 45° axis + r).
+/// The margin is at least 0.75 px (the AA kernel's coverage is 0 past ~0.44 px) and at
+/// least 0.375·rMax (the noise kernel's coverage tail) — the larger of the two keeps the
+/// single stored value valid for both kernels.
+public enum SegmentPrune {
+    /// Squared distance from point (px,py) to segment a–b.
+    static func segmentDistanceSq(ax: Float, ay: Float, bx: Float, by: Float,
+                                  px: Float, py: Float) -> Float {
+        let ex = bx - ax, ey = by - ay
+        let denom = ex * ex + ey * ey
+        var t: Float = 0
+        if denom > 1e-12 {
+            let u = ((px - ax) * ex + (py - ay) * ey) / denom
+            t = u < 0 ? 0 : (u > 1 ? 1 : u)
+        }
+        let cx = ax + ex * t, cy = ay + ey * t
+        let dx = px - cx, dy = py - cy
+        return dx * dx + dy * dy
+    }
+
+    public static func radius(p0: SIMD2<Float>, p1: SIMD2<Float>, p2: SIMD2<Float>, p3: SIMD2<Float>,
+                              radius0: Float, radius1: Float,
+                              segmentType: UInt32, isMarker: Bool) -> Float {
+        let rMax = max(radius0, radius1)
+        let farOffChord: Float
+        if segmentType == 0 {
+            farOffChord = 0
+        } else {
+            farOffChord = max(
+                segmentDistanceSq(ax: p1.x, ay: p1.y, bx: p2.x, by: p2.y, px: p0.x, py: p0.y).squareRoot(),
+                segmentDistanceSq(ax: p1.x, ay: p1.y, bx: p2.x, by: p2.y, px: p3.x, py: p3.y).squareRoot())
+        }
+        let reach: Float = isMarker ? (4.0 * rMax) : rMax
+        let margin: Float = max(0.75, 0.375 * rMax)
+        return farOffChord + reach + margin
+    }
+}
+
 // MARK: - GPU and Layer Payloads
 public struct GPUSplineSegment {
     public var p0: SIMD2<Float>    // CR Control Point 0 (Prev tangent)

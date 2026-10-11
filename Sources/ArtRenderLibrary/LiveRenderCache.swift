@@ -182,6 +182,14 @@ public struct LiveFrameTiming {
     /// Segments handed to the GPU.
     public var segments = 0
 
+    // Debug / analysis counters for the per-stroke tile-box dispatch (filled in `bin`).
+    /// Tiles inside the strokes' bounding boxes (dispatched; ×threadgroups per tile = tg count).
+    public var dispatchedTiles = 0
+    /// Tiles that actually contain a segment (the real work).
+    public var inkedTiles = 0
+    /// Distance-field lookups the kernels will perform this frame (segment incidences × tile px).
+    public var sdfEvaluations = 0
+
     public var binMilliseconds = 0.0
     public var encodeMilliseconds = 0.0
     /// Time spent inside `waitUntilCompleted`, i.e. GPU execution (plus any stall).
@@ -193,9 +201,11 @@ public struct LiveFrameTiming {
 
     public var summary: String {
         String(format: "%.0f ms total (bin %.0f, encode %.0f, gpu %.0f, paper %.0f) — "
-                       + "%d strokes / %d segments, %d layers cached, %d rebuilt, %d culled",
+                       + "%d strokes / %d segments, %d layers cached, %d rebuilt, %d culled "
+                       + "| %d box tiles, %d ink tiles, %lld sdf",
                totalMilliseconds, binMilliseconds, encodeMilliseconds, gpuMilliseconds,
-               paperMilliseconds, strokes, segments, cachedLayers, rebuiltLayers, culledStrokes)
+               paperMilliseconds, strokes, segments, cachedLayers, rebuiltLayers, culledStrokes,
+               dispatchedTiles, inkedTiles, sdfEvaluations)
     }
 }
 

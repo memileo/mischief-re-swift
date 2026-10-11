@@ -125,3 +125,58 @@ final class TileUnionTests: XCTestCase {
     }
     #endif
 }
+
+/// `SegmentPrune.radius` is the bound the live kernels use to skip a segment per pixel;
+/// it must never be smaller than the true ink extent (or a pixel would be wrongly pruned)
+/// and should stay tight enough to be useful. Pure maths, so it runs on Linux too.
+final class SegmentPruneTests: XCTestCase {
+
+    private func f(_ v: Float) -> Double { Double(v) }
+
+    func testStraightCapsuleIgnoresTangentHints() {
+        // type 0 draws only p1→p2 + radius; p0/p3 are irrelevant, even for a polyline where
+        // p0/p3 are extrapolated far beyond the chord.
+        let r = SegmentPrune.radius(p0: SIMD2(-100, 0), p1: SIMD2(0, 0),
+                                    p2: SIMD2(100, 0), p3: SIMD2(200, 0),
+                                    radius0: 5, radius1: 5, segmentType: 0, isMarker: false)
+        // offChord(0) + rMax(5) + margin(max(0.75, 0.375*5)=1.875) = 6.875
+        XCTAssertEqual(f(r), 6.875, accuracy: 1e-4)
+    }
+
+    func testStraightCapsuleTinyRadiusUsesAbsoluteMarginFloor() {
+        let r = SegmentPrune.radius(p0: SIMD2(0, 0), p1: SIMD2(0, 0),
+                                    p2: SIMD2(50, 0), p3: SIMD2(50, 0),
+                                    radius0: 0.5, radius1: 0.5, segmentType: 0, isMarker: false)
+        // 0 + 0.5 + max(0.75, 0.1875)=0.75 → 1.25
+        XCTAssertEqual(f(r), 1.25, accuracy: 1e-4)
+    }
+
+    func testSplineRadiusIncludesControlPointBulge() {
+        let r = SegmentPrune.radius(p0: SIMD2(0, 50), p1: SIMD2(0, 0),
+                                    p2: SIMD2(100, 0), p3: SIMD2(100, 50),
+                                    radius0: 3, radius1: 3, segmentType: 1, isMarker: false)
+        // offChord = max(distance p0..chord, p3..chord) = 50; reach 3; margin 1.125 → 54.125
+        XCTAssertEqual(f(r), 54.125, accuracy: 1e-3)
+    }
+
+    func testMarkerRadiusUsesLargerReach() {
+        let r = SegmentPrune.radius(p0: SIMD2(0, 50), p1: SIMD2(0, 0),
+                                    p2: SIMD2(100, 0), p3: SIMD2(100, 50),
+                                    radius0: 3, radius1: 3, segmentType: 1, isMarker: true)
+        // 50 + 4*3 + 1.125 = 63.125
+        XCTAssertEqual(f(r), 63.125, accuracy: 1e-3)
+    }
+
+    func testNeverPrunesPixelActuallyOnTheInk() {
+        // For a straight capsule along y=0 at x∈[0,100], radius 5, the farthest ink is at
+        // y=±5. The prune radius (6.875) must exceed the distance from any *in-boundary*
+        // pixel to the chord, else we'd drop real coverage. Simulate the kernel's check.
+        let radius = SegmentPrune.radius(p0: SIMD2(0, 0), p1: SIMD2(0, 0),
+                                         p2: SIMD2(100, 0), p3: SIMD2(100, 0),
+                                         radius0: 5, radius1: 5, segmentType: 0, isMarker: false)
+        // A pixel sitting exactly on the outer edge of the ink (y=5) must NOT be pruned.
+        XCTAssertLessThan(5.0, Double(radius))            // edge pixel kept
+        // A pixel 20px away (well clear of the ink) IS pruned.
+        XCTAssertGreaterThan(20.0, Double(radius))
+    }
+}

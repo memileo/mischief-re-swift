@@ -463,8 +463,9 @@ internal func flattenAndBuild(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRS
             segmentType = 1
         }
         
-        // Append the final GPU struct directly
-        segments.append(GPUSplineSegment(
+        // Append the final GPU struct directly. `padding1` carries a conservative per-pixel
+        // prune radius (see SegmentPrune); the static kernels never read it.
+        var seg = GPUSplineSegment(
             p0: SIMD2<Float>(Float(p0.x), Float(p0.y)),
             p1: SIMD2<Float>(Float(p1.x), Float(p1.y)),
             p2: SIMD2<Float>(Float(p2.x), Float(p2.y)),
@@ -473,7 +474,11 @@ internal func flattenAndBuild(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRS
             opacity0: Float(o1), opacity1: Float(o2),
             segmentType: segmentType,
             noiseSeed: seed
-        ))
+        )
+        seg.padding1 = SegmentPrune.radius(p0: seg.p0, p1: seg.p1, p2: seg.p2, p3: seg.p3,
+                                           radius0: seg.radius0, radius1: seg.radius1,
+                                           segmentType: seg.segmentType, isMarker: isMarker).bitPattern
+        segments.append(seg)
         return
     }
     
@@ -528,7 +533,7 @@ func flattenPolyline(
         let o0 = oSpan.s1 + (oSpan.s2 - oSpan.s1) * t0
         let o1 = oSpan.s1 + (oSpan.s2 - oSpan.s1) * t1
         
-        segments.append(GPUSplineSegment(
+        var seg = GPUSplineSegment(
             p0: SIMD2<Float>(Float(a0.x), Float(a0.y)),
             p1: SIMD2<Float>(Float(a.x),  Float(a.y)),
             p2: SIMD2<Float>(Float(b.x),  Float(b.y)),
@@ -537,7 +542,11 @@ func flattenPolyline(
             opacity0: Float(o0), opacity1: Float(o1),
             segmentType: 0,
             noiseSeed: seed
-        ))
+        )
+        seg.padding1 = SegmentPrune.radius(p0: seg.p0, p1: seg.p1, p2: seg.p2, p3: seg.p3,
+                                           radius0: seg.radius0, radius1: seg.radius1,
+                                           segmentType: 0, isMarker: false).bitPattern
+        segments.append(seg)
     }
 }
 
