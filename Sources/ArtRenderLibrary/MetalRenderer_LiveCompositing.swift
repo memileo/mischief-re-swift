@@ -49,7 +49,7 @@ struct LivePaperParams {
 struct LiveStrokeParams {
     var tileOriginX: UInt32
     var tileOriginY: UInt32
-    var tilesPerRow: UInt32
+    var boxTilesPerRow: UInt32
     var tileSize: UInt32
     var textureWidth: UInt32
     var textureHeight: UInt32
@@ -314,6 +314,9 @@ extension MetalRenderer {
         // Inclusive tile box this stroke covers (union of its per-segment ranges). The
         // live dispatch covers exactly this box instead of the whole canvas.
         var minTileX = 0, minTileY = 0, maxTileX = 0, maxTileY = 0
+        // Tiles per row *inside* the box — the kernel's stride for box-local tile indexing.
+        // Differs from the canvas tilesPerRow because the box spans only minTile…maxTile.
+        var boxTilesPerRow = 0
     }
     
     /// The layer's ops in their original order — a `cut` erases what was drawn *below*
@@ -432,35 +435,25 @@ extension MetalRenderer {
                     guard !segments.isEmpty else { continue }
                     liveTiming.strokes += 1
                     liveTiming.segments += segments.count
-                    let (tileIndicesData, tileListData) = buildSegmentTileIndices(
+                    let boxed = buildSegmentTileIndicesBoxed(
                         segments: segments,
                         textureWidth: width,
                         textureHeight: height,
                         tileSize: tileSize,
                         isMarker: isMarker,
                         transform: nil)
-                    // Nothing of this stroke lands in the target, so nothing is lost by
+                    // Nothing of this stroke lands on-canvas, so nothing is lost by
                     // skipping it entirely (the same test the segment binner applies).
-                    if tileListData.isEmpty {
+                    if boxed.tileList.isEmpty {
                         liveTiming.culledStrokes += 1
                         liveTiming.strokes -= 1
                         liveTiming.segments -= segments.count
                         continue
                     }
-                    
-                    // Tile box this stroke covers = the union of its per-segment tile ranges
-                    // (a tile is on-canvas iff its count > 0). `TileUnion` returns nil only
-                    // when nothing maps on-canvas — already handled by the empty-tile-list
-                    // cull above — so this guard is a defensive net, not the real gate.
-                    let tilesPerRow = (width + tileSize - 1) / tileSize
-                    guard let tileBox = TileUnion.boundingBox(
-                        counts: tileIndicesData.map { $0.count },
-                        tilesPerRow: tilesPerRow) else {
-                        liveTiming.culledStrokes += 1
-                        liveTiming.strokes -= 1
-                        liveTiming.segments -= segments.count
-                        continue
-                    }
+                    // Box-local tile structures for the arena — the whole canvas is never
+                    // materialised, only this stroke's tile box.
+                    let tileIndicesData = boxed.tileIndices
+                    let tileListData = boxed.tileList
 
                     var bin = LiveStrokeBin()
                     bin.segmentCount = segments.count
@@ -468,16 +461,16 @@ extension MetalRenderer {
                     bin.isEraser = isEraser
                     bin.isMarker = isMarker
                     bin.hasNoise = segments.contains { $0.noiseSeed != 0 }
-                    bin.minTileX = tileBox.minX
-                    bin.minTileY = tileBox.minY
-                    bin.maxTileX = tileBox.maxX
-                    bin.maxTileY = tileBox.maxY
+                    bin.minTileX = boxed.minTileX
+                    bin.minTileY = boxed.minTileY
+                    bin.maxTileX = boxed.minTileX + boxed.boxWidth - 1
+                    bin.maxTileY = boxed.minTileY + boxed.boxHeight - 1
+                    bin.boxTilesPerRow = boxed.boxWidth
 
                     // Debug counters (pure CPU arithmetic, no GPU sync): dispatched tiles =
                     // the stroke's box; ink tiles = tiles that actually hold a segment; sdf
-                    // evaluations = the exact number of distance-field lookups the kernel does.
-                    liveTiming.dispatchedTiles += (tileBox.maxX - tileBox.minX + 1)
-                                                * (tileBox.maxY - tileBox.minY + 1)
+                    // evaluations = candidate distance-field lookups the kernel is asked to do.
+                    liveTiming.dispatchedTiles += boxed.boxWidth * boxed.boxHeight
                     liveTiming.inkedTiles += tileIndicesData.reduce(0) { $0 + ($1.count > 0 ? 1 : 0) }
                     liveTiming.sdfEvaluations += tileListData.count * (tileSize * tileSize)
                     
@@ -591,7 +584,7 @@ extension MetalRenderer {
         if bin.isMarker { flags |= 2 }
         var params = LiveStrokeParams(
             tileOriginX: UInt32(bin.minTileX), tileOriginY: UInt32(bin.minTileY),
-            tilesPerRow: UInt32((width + tileSize - 1) / tileSize),
+            boxTilesPerRow: UInt32(bin.boxTilesPerRow),
             tileSize: UInt32(tileSize),
             textureWidth: UInt32(width), textureHeight: UInt32(height),
             stampCount: UInt32(bin.segmentCount),

@@ -928,7 +928,7 @@ kernel void mergeFlattenCompositeKernel(
 struct LiveStrokeParams {
     uint  tileOriginX;
     uint  tileOriginY;
-    uint  tilesPerRow;
+    uint  boxTilesPerRow;
     uint  tileSize;
     uint  textureWidth;
     uint  textureHeight;
@@ -971,7 +971,8 @@ kernel void liveSegmentAACompositeKernel(
     if (pixel.x >= w || pixel.y >= h) return;
 
     uint2 tileID = pixel / params.tileSize;
-    uint tileIndex = tileID.y * params.tilesPerRow + tileID.x;
+    uint tileIndex = (tileID.y - params.tileOriginY) * params.boxTilesPerRow
+                   + (tileID.x - params.tileOriginX);
     TileIndex tIdx = tileIndices[tileIndex];
 
     float2 pos = float2(pixel.x, pixel.y) + float2(0.5f, 0.5f);
@@ -1058,7 +1059,8 @@ kernel void liveSegmentNoiseCompositeKernel(
     if (pixel.x >= w || pixel.y >= h) return;
 
     uint2 tileID = pixel / params.tileSize;
-    uint tileIndex = tileID.y * params.tilesPerRow + tileID.x;
+    uint tileIndex = (tileID.y - params.tileOriginY) * params.boxTilesPerRow
+                   + (tileID.x - params.tileOriginX);
     TileIndex tIdx = tileIndices[tileIndex];
 
     float2 pos = float2(pixel.x, pixel.y) + float2(0.5f, 0.5f);

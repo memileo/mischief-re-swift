@@ -860,5 +860,76 @@ extension MetalRenderer {
         
         return (tileIndices, tileList)
     }
+
+    /// Box-local variant for the live path. Computes each segment's tile range (same math
+    /// as `buildSegmentTileIndices`), unions them into the stroke's bounding box, then
+    /// prefix-sums and scatters *only within that box* — so the arena stores box-sized tile
+    /// indices instead of a whole-canvas array, and the CPU `bin` scales with the stroke,
+    /// not the canvas (the win that makes small tiles affordable). Returns the box (origin
+    /// + dimensions) so the caller dispatches the kernel over exactly it; the kernel then
+    /// indexes tiles relative to `minTile`.
+    func buildSegmentTileIndicesBoxed(
+        segments: [GPUSplineSegment],
+        textureWidth: Int,
+        textureHeight: Int,
+        tileSize: Int,
+        isMarker: Bool = false,
+        transform: CGAffineTransform? = nil
+    ) -> (tileIndices: [TileIndex], tileList: [UInt32],
+        minTileX: Int, minTileY: Int, boxWidth: Int, boxHeight: Int)
+    {
+        let tilesPerRow = (textureWidth + tileSize - 1) / tileSize
+        let tilesPerCol = (textureHeight + tileSize - 1) / tileSize
+        let fTexW = Float(textureWidth)
+        let fTexH = Float(textureHeight)
+        let invTileSize = 1.0 / Float(tileSize)
+        let paddingScale: Float = isMarker ? (1.0 + 2.0 * sqrt(2.0)) : 1.4
+        let t = transform ?? .identity
+        let hasTransform = transform != nil
+
+        var ranges = [SegTileRange](repeating: .empty, count: segments.count)
+        segments.withUnsafeBufferPointer { segs in
+            ranges.withUnsafeMutableBufferPointer { rp in
+                for i in segs.indices {
+                    let seg = segs[i]
+                    let padding = (max(seg.radius0, seg.radius1) * paddingScale) + 1.0
+                    var minX = min(seg.p1.x, seg.p2.x) - padding
+                    var maxX = max(seg.p1.x, seg.p2.x) + padding
+                    var minY = min(seg.p1.y, seg.p2.y) - padding
+                    var maxY = max(seg.p1.y, seg.p2.y) + padding
+                    if hasTransform {
+                        let c1 = CGPoint(x: CGFloat(minX), y: CGFloat(minY)).applying(t)
+                        let c2 = CGPoint(x: CGFloat(maxX), y: CGFloat(minY)).applying(t)
+                        let c3 = CGPoint(x: CGFloat(minX), y: CGFloat(maxY)).applying(t)
+                        let c4 = CGPoint(x: CGFloat(maxX), y: CGFloat(maxY)).applying(t)
+                        minX = Float(min(c1.x, c2.x, c3.x, c4.x))
+                        maxX = Float(max(c1.x, c2.x, c3.x, c4.x))
+                        minY = Float(min(c1.y, c2.y, c3.y, c4.y))
+                        maxY = Float(max(c1.y, c2.y, c3.y, c4.y))
+                    }
+                    if maxX < 0.0 || minX > fTexW || maxY < 0.0 || minY > fTexH { continue }
+                    let minTileX = max(0, Int(minX * invTileSize))
+                    let maxTileX = min(tilesPerRow - 1, Int(maxX * invTileSize))
+                    let minTileY = max(0, Int(minY * invTileSize))
+                    let maxTileY = min(tilesPerCol - 1, Int(maxY * invTileSize))
+                    guard minTileX <= maxTileX && minTileY <= maxTileY else { continue }
+                    rp[i] = SegTileRange(minTX: Int32(minTileX), minTY: Int32(minTileY),
+                                         maxTX: Int32(maxTileX), maxTY: Int32(maxTileY))
+                }
+            }
+        }
+
+        guard let union = SegmentBinner.unionBox(ranges) else {
+            return ([], [], 0, 0, 0, 0)
+        }
+        let binned = SegmentBinner.bin(ranges, box: union)
+        var tileIndices = [TileIndex]()
+        tileIndices.reserveCapacity(binned.counts.count)
+        for i in 0..<binned.counts.count {
+            tileIndices.append(TileIndex(start: binned.starts[i], count: binned.counts[i]))
+        }
+        return (tileIndices, binned.tileList,
+                Int(union.minX), Int(union.minY), binned.boxWidth, binned.boxHeight)
+    }
 }
 #endif

@@ -82,40 +82,99 @@ internal struct ResolvedStroke {
     var masks: [StrokeMask] = []     // NEW — shape cases need no edits (default [])
 }
 
-// MARK: - Tile union (platform-independent; unit-tested on Linux)
 
-/// Inclusive bounding box, in tile indices, of the tiles that are actually non-empty.
-///
-/// The interactive (live) path uses this to dispatch one stroke only over the tiles it
-/// covers instead of over the whole canvas: a tile is "non-empty" when its segment count
-/// is non-zero, so the returned box is exactly the union of the per-segment tile ranges
-/// that `MetalRenderer.buildSegmentTileIndices` already computed.
-///
-/// This is deliberately free of any Metal/`TileIndex` type so it can be exercised by a
-/// normal unit test on Linux as well as macOS.
-public enum TileUnion {
-    /// - Parameters:
-    ///   - counts: per-tile segment counts, row-major.
-    ///   - tilesPerRow: number of tile columns in `counts`.
-    /// - Returns: the inclusive `[minX…maxX] × [minY…maxY]` box, or `nil` when nothing maps
-    ///   on-canvas (every count is zero, `counts` is empty, or `tilesPerRow` is 0) — which
-    ///   the caller treats as "nothing to dispatch".
-    public static func boundingBox(counts: [UInt32],
-                                   tilesPerRow: Int)
-        -> (minX: Int, minY: Int, maxX: Int, maxY: Int)?
+// MARK: - Box-local tile binning (platform-independent; unit-tested on Linux)
+
+/// One segment's canvas tile range, pre-clamped and transform-applied. `.empty` means
+/// "off-canvas" (`minX > maxX`), and `isValid` distinguishes it.
+public struct SegTileRange {
+    public var minTX: Int32
+    public var minTY: Int32
+    public var maxTX: Int32
+    public var maxTY: Int32
+    public static let empty = SegTileRange(minTX: 1, minTY: 0, maxTX: 0, maxTY: 0)
+    public var isValid: Bool { minTX <= maxTX && minTY <= maxTY }
+}
+
+/// Box-local bin output. `starts`/`counts` are indexed *relative to the box* (`y * boxWidth + x`),
+/// so the render kernel subtracts the box origin. `tileList` buckets segment indices per
+/// box-local tile (row-major). For the non-live path the box is the whole canvas, so
+/// box-local == absolute and nothing changes there.
+public struct TileBinningResult {
+    public var minX: Int32
+    public var minY: Int32
+    public var boxWidth: Int
+    public var boxHeight: Int
+    public var starts: [UInt32]
+    public var counts: [UInt32]
+    public var tileList: [UInt32]
+}
+
+public enum SegmentBinner {
+    /// Inclusive bounding box of all valid ranges, or nil when none are on-canvas.
+    public static func unionBox(_ ranges: [SegTileRange])
+        -> (minX: Int32, minY: Int32, maxX: Int32, maxY: Int32)?
     {
-        guard tilesPerRow > 0, !counts.isEmpty else { return nil }
-        var minX = Int.max, minY = Int.max, maxX = -1, maxY = -1
-        for (index, count) in counts.enumerated() where count != 0 {
-            let x = index % tilesPerRow
-            let y = index / tilesPerRow
-            if x < minX { minX = x }
-            if x > maxX { maxX = x }
-            if y < minY { minY = y }
-            if y > maxY { maxY = y }
+        var minX = Int32.max, minY = Int32.max, maxX = Int32.min, maxY = Int32.min
+        for r in ranges where r.isValid {
+            if r.minTX < minX { minX = r.minTX }
+            if r.minTY < minY { minY = r.minTY }
+            if r.maxTX > maxX { maxX = r.maxTX }
+            if r.maxTY > maxY { maxY = r.maxTY }
         }
-        guard maxX >= 0 else { return nil }
+        if maxX == Int32.min { return nil }
         return (minX, minY, maxX, maxY)
+    }
+
+    /// Bin every valid segment into the given tile box, prefix-summing and scattering only
+    /// within that box (the whole point: a stroke's box is far smaller than the canvas, so
+    /// this is much cheaper than the old whole-canvas pass). The box MUST contain every
+    /// valid range — i.e. come from `unionBox`, or be the whole canvas.
+    public static func bin(_ ranges: [SegTileRange],
+                           box: (minX: Int32, minY: Int32, maxX: Int32, maxY: Int32))
+        -> TileBinningResult
+    {
+        let boxW = Int(box.maxX) - Int(box.minX) + 1
+        let boxH = Int(box.maxY) - Int(box.minY) + 1
+        guard boxW > 0, boxH > 0 else {
+            return TileBinningResult(minX: box.minX, minY: box.minY, boxWidth: 0, boxHeight: 0,
+                                     starts: [], counts: [], tileList: [])
+        }
+        let originX = Int(box.minX), originY = Int(box.minY)
+        let tileCount = boxW * boxH
+
+        // Pass 1: per-tile overlap counts within the box.
+        var counts = [UInt32](repeating: 0, count: tileCount)
+        for r in ranges where r.isValid {
+            let spanX = Int(r.maxTX) - Int(r.minTX)
+            var rowBase = (Int(r.minTY) - originY) * boxW + (Int(r.minTX) - originX)
+            for _ in Int(r.minTY)...Int(r.maxTY) {
+                var idx = rowBase
+                for _ in 0...spanX { counts[idx] += 1; idx += 1 }
+                rowBase += boxW
+            }
+        }
+
+        // Prefix sum → per-tile start offsets.
+        var starts = [UInt32](repeating: 0, count: tileCount)
+        var running: UInt32 = 0
+        for i in 0..<tileCount { starts[i] = running; running += counts[i] }
+
+        // Pass 2: scatter each segment's index into its tiles.
+        var tileList = [UInt32](repeating: 0, count: Int(running))
+        var heads = starts
+        for (i, r) in ranges.enumerated() where r.isValid {
+            let spanX = Int(r.maxTX) - Int(r.minTX)
+            let segIdx = UInt32(i)
+            var rowBase = (Int(r.minTY) - originY) * boxW + (Int(r.minTX) - originX)
+            for _ in Int(r.minTY)...Int(r.maxTY) {
+                var idx = rowBase
+                for _ in 0...spanX { tileList[Int(heads[idx])] = segIdx; heads[idx] += 1; idx += 1 }
+                rowBase += boxW
+            }
+        }
+        return TileBinningResult(minX: box.minX, minY: box.minY, boxWidth: boxW, boxHeight: boxH,
+                                 starts: starts, counts: counts, tileList: tileList)
     }
 }
 

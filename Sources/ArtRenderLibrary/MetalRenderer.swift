@@ -162,7 +162,7 @@ class MetalRenderer {
     internal let linearSampler: MTLSamplerState?
     
     // Configuration
-    internal var tileSize = 32  // Coarse tile size for spatial indexing (override via ART_TILE_SIZE for tuning) 32 faster for live-view, 64 faster for single frame
+    internal var tileSize = 32  // Coarse tile size for spatial indexing (override via ART_TILE_SIZE for tuning)
     
     internal var tileIndicesBuffer: MTLBuffer?
     internal var tileListBuffer: MTLBuffer?
