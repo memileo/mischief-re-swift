@@ -41,3 +41,7 @@ __pycache__/
 PressureTests/eval-data/*.*.svg
 
 tmp/
+
+art/complex2.art
+art/kaos.art
+art/logo-sketch-s6d5h46e54h_01.art

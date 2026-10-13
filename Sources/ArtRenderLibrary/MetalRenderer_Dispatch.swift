@@ -760,7 +760,6 @@ extension MetalRenderer {
         let fTexW = Float(textureWidth)
         let fTexH = Float(textureHeight)
         let invTileSize = 1.0 / Float(tileSize)
-        let paddingScale: Float = isMarker ? (1.0 + 2.0 * sqrt(2.0)) : 1.4
         let t = transform ?? .identity
         let hasTransform = transform != nil
         
@@ -774,7 +773,8 @@ extension MetalRenderer {
             ranges.withUnsafeMutableBufferPointer { rp in
                 for i in segs.indices {
                     let seg = segs[i]
-                    let padding = (max(seg.radius0, seg.radius1) * paddingScale) + 1.0
+                    let padding = SegmentPadding.pad(radiusMax: max(seg.radius0, seg.radius1),
+                                                     isMarker: isMarker)
                     
                     var minX = min(seg.p1.x, seg.p2.x) - padding
                     var maxX = max(seg.p1.x, seg.p2.x) + padding
@@ -883,7 +883,6 @@ extension MetalRenderer {
         let fTexW = Float(textureWidth)
         let fTexH = Float(textureHeight)
         let invTileSize = 1.0 / Float(tileSize)
-        let paddingScale: Float = isMarker ? (1.0 + 2.0 * sqrt(2.0)) : 1.4
         let t = transform ?? .identity
         let hasTransform = transform != nil
 
@@ -892,7 +891,8 @@ extension MetalRenderer {
             ranges.withUnsafeMutableBufferPointer { rp in
                 for i in segs.indices {
                     let seg = segs[i]
-                    let padding = (max(seg.radius0, seg.radius1) * paddingScale) + 1.0
+                    let padding = SegmentPadding.pad(radiusMax: max(seg.radius0, seg.radius1),
+                                                     isMarker: isMarker)
                     var minX = min(seg.p1.x, seg.p2.x) - padding
                     var maxX = max(seg.p1.x, seg.p2.x) + padding
                     var minY = min(seg.p1.y, seg.p2.y) - padding

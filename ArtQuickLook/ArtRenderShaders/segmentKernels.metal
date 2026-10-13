@@ -1150,8 +1150,8 @@ kernel void liveSegmentNoiseCompositeKernel(
 // stroke). That is the memory win: the Instruments profile showed the per-stroke kernel is
 // ~98% memory-stall with only ~7 resident SIMD-groups (register-limited occupancy), and a
 // single large dispatch both removes the k× canvas traffic and raises occupancy. It is used
-// only for the simple common case (no cut ops, and every stroke non-marker + non-noise);
-// anything else falls back to the per-stroke path above.
+// for layers without cut ops and without markers (noise included via the noise-capable
+// twin below); anything else falls back to the per-stroke path above.
 
 // Source-over of one stroke's coverage onto the running accumulator. `flagsBit0` = eraser.
 static inline void perTileCompositeStroke(thread float4 &acc, float4 col, uint flagsValue, float a) {
@@ -1162,6 +1162,11 @@ static inline void perTileCompositeStroke(thread float4 &acc, float4 col, uint f
         acc.rgb = col.rgb * a + acc.rgb * (1.0f - a);
         acc.a   = a + acc.a * (1.0f - a);
     }
+    // Match the per-stroke path exactly: it blends onto an RGBA8 canvas between strokes, so
+    // it quantises to 8 bits after each overlap. The per-tile path keeps full-float, which is
+    // *more* accurate but no longer byte-identical to the static render (faint AA rounding).
+    // Quantise the accumulator per stroke so the outputs agree bit-for-bit.
+    acc = round(clamp(acc, 0.0f, 1.0f) * 255.0f) / 255.0f;
 }
 
 struct PerTileParams {
@@ -1237,6 +1242,151 @@ kernel void livePerTileAACompositeKernel(
     if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f) {
         float4 col = strokeColor[curStroke];
         perTileCompositeStroke(acc, col, strokeFlags[curStroke], curMax * col.a);
+    }
+
+    if (acc.a > 0.0001f) target.write(acc, pixel);
+}
+
+// MARK: - Per-tile noise-capable composite (one dispatch per layer, AA + noise)
+//
+// Same one-write-per-pixel structure as `livePerTileAACompositeKernel`, but each stroke
+// group uses its own coverage + final-alpha maths: clean strokes the AA path, noisy
+// strokes the noise path (strokeFlags bit1 = hasNoise, set by the CPU plan builder).
+// That matches the per-stroke path exactly — which picks the noise kernel per stroke —
+// including the per-stroke 8-bit quantisation in `perTileCompositeStroke`.
+//
+// Markers never reach here (the CPU eligibility excludes them); cuts never reach here
+// either (they force the per-stroke path). `noiseScale` is the same 0.4 constant the
+// per-stroke noise twin uses.
+kernel void livePerTileNoiseCompositeKernel(
+    const device PerTileParams &params    [[buffer(0)]],
+    const device GPUSplineSegment *segments [[buffer(1)]],
+    const device uint32_t *strokeOfSegment [[buffer(2)]],
+    const device TileIndex *tileStartCount [[buffer(3)]],
+    const device uint32_t *tileList [[buffer(4)]],
+    const device float4 *strokeColor [[buffer(5)]],
+    const device uint32_t *strokeFlags [[buffer(6)]],   // bit0 = eraser, bit1 = hasNoise
+    texture2d<float, access::read_write> target [[texture(0)]],
+    texture2d<float, access::sample> noiseTex [[texture(1)]],
+    sampler noiseSampler [[sampler(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint w = target.get_width();
+    uint h = target.get_height();
+    uint2 originPx = uint2(params.tileOriginX, params.tileOriginY) * params.tileSize;
+    uint2 pixel = originPx + gid;
+    if (pixel.x >= w || pixel.y >= h) return;
+
+    uint2 tileID = pixel / params.tileSize;
+    uint localTile = (tileID.y - params.tileOriginY) * params.boxTilesPerRow
+                   + (tileID.x - params.tileOriginX);
+    TileIndex tc = tileStartCount[localTile];
+    float2 pos = float2(pixel.x, pixel.y) + float2(0.5f, 0.5f);
+
+    // Same sampling as liveSegmentNoiseCompositeKernel (noiseScale 0.4).
+    float noiseVal = 1.0f;
+    if (noiseTex.get_width() > 0) {
+        float2 noiseUV = fract(float2(pixel) / (float(noiseTex.get_width()) * 0.4f));
+        noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
+    }
+
+    float4 acc = float4(0.0f);
+    uint curStroke = 0xFFFFFFFFu;
+    float curMax = 0.0f;
+    bool curNoisy = false;
+
+    for (uint j = 0; j < tc.count; ++j) {
+        uint segIdx = tileList[tc.start + j];
+        uint sId = strokeOfSegment[segIdx];
+        if (sId != curStroke) {
+            if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f) {
+                float4 col = strokeColor[curStroke];
+                float a;
+                if (curNoisy) {
+                    float inverted = 1.0f - curMax;
+                    float noiseAdd = (curMax * 0.94f) + noiseVal;
+                    a = (1.0f - saturate(inverted / noiseAdd)) * col.a;
+                } else {
+                    a = curMax * col.a;
+                }
+                if (a > 0.0001f || !curNoisy) {
+                    // Match per-stroke: AA strokes composite when curMax >= 0.001;
+                    // noisy strokes when final alpha clears 0.0001.
+                    if (!curNoisy || a > 0.0001f) {
+                        perTileCompositeStroke(acc, col, strokeFlags[curStroke], a);
+                    }
+                }
+            }
+            curStroke = sId;
+            curMax = 0.0f;
+            curNoisy = (strokeFlags[sId] & 0x2u) != 0u;
+        }
+
+        GPUSplineSegment seg = segments[segIdx];
+        float pruneRadius = (seg.padding1 != 0u) ? as_type<float>(seg.padding1) : 3.4e38f;
+        if (liveSegDist(pos, seg.p1, seg.p2) > pruneRadius) continue;
+
+        float stamped = 0.0f;
+        if (curNoisy) {
+            float signedDist = 1e6f;
+            float t = 0.0f;
+            if (seg.segmentType == 0) {
+                SDFResult res = sdUnevenCapsule(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
+                signedDist = res.dist; t = res.t;
+            } else if (seg.segmentType == 1) {
+                SDFResult res = sdSplineSegment(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+                signedDist = res.dist; t = res.t;
+            } else if (seg.segmentType == 2) {
+                SDFResult res = sdSoftEnvelopeSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+                signedDist = res.dist; t = res.t;
+            }
+            float radius = mix(seg.radius0, seg.radius1, t);
+            float opacity = mix(seg.opacity0, seg.opacity1, t);
+            float dist = signedDist + radius;
+            float nd = dist / (max(radius, 1.0f) * 1.1f);
+            float covPencil = 1.0f;
+            if (nd > 0.08f) {
+                float tSoft = clamp((nd - 0.1f) / 0.9f, 0.0f, 1.0f);
+                float scurve = tSoft * tSoft * (3.0f - 2.0f * tSoft);
+                covPencil = 1.0f - pow(scurve, 0.9f);
+            }
+            float tAir = clamp(nd * 0.8f, 0.0f, 1.0f);
+            float covAirbrush = (1.0f - tAir);
+            covAirbrush = covAirbrush * covAirbrush;
+            float softness = saturate((radius - 4.0f) / 800.0f);
+            float cov = mix(covPencil, covAirbrush, softness);
+            stamped = cov * opacity;
+        } else {
+            float signedDist = 1e6f;
+            float t = 0.0f;
+            if (seg.segmentType == 0) {
+                SDFResult res = sdUnevenCapsule(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
+                signedDist = res.dist; t = res.t;
+            } else if (seg.segmentType == 1) {
+                SDFResult res = sdSplineSegment(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+                signedDist = res.dist; t = res.t;
+            } else if (seg.segmentType == 2) {
+                SDFResult res = sdSoftEnvelopeSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+                signedDist = res.dist; t = res.t;
+            }
+            float opacity = mix(seg.opacity0, seg.opacity1, t);
+            float cov = 1.0f - smootherstep(-0.94f, 0.94f, signedDist + 0.5f);
+            stamped = cov * opacity;
+        }
+        if (stamped > curMax) curMax = stamped;
+    }
+    if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f) {
+        float4 col = strokeColor[curStroke];
+        if (curNoisy) {
+            float inverted = 1.0f - curMax;
+            float noiseAdd = (curMax * 0.94f) + noiseVal;
+            float a = (1.0f - saturate(inverted / noiseAdd)) * col.a;
+            if (a > 0.0001f) {
+                perTileCompositeStroke(acc, col, strokeFlags[curStroke], a);
+            }
+        } else {
+            perTileCompositeStroke(acc, col, strokeFlags[curStroke], curMax * col.a);
+        }
     }
 
     if (acc.a > 0.0001f) target.write(acc, pixel);

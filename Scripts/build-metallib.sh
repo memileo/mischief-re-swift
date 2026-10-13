@@ -58,6 +58,7 @@ LIVE_KERNELS=(
     liveSegmentAACompositeKernel
     liveSegmentNoiseCompositeKernel
     livePerTileAACompositeKernel
+    livePerTileNoiseCompositeKernel
 )
 REQUIRED_KERNELS=(
     clearKernel

@@ -139,6 +139,77 @@ final class LiveRemapPruneScaleTests: XCTestCase {
     }
 }
 
+/// Marker binning padding must contain the chisel reach (4·r), or tiles get dropped and
+/// markers clip. Pure maths, runs on Linux.
+final class SegmentPaddingTests: XCTestCase {
+    func testPlainPaddingCoversRadiusPlusAATail() {
+        XCTAssertEqual(Double(SegmentPadding.pad(radiusMax: 5, isMarker: false)), 8.0, accuracy: 1e-6)
+        XCTAssertEqual(Double(SegmentPadding.pad(radiusMax: 0, isMarker: false)), 1.0, accuracy: 1e-6)
+    }
+
+    func testMarkerPaddingCoversFourRadiiPlusMargin() {
+        // r=20: old (1+2√2)·r+1 = 77.6 < needed 4·r+1.44 ≈ 81.4 → clipped. New: 82.
+        XCTAssertEqual(Double(SegmentPadding.pad(radiusMax: 20, isMarker: true)), 82.0, accuracy: 1e-6)
+        XCTAssertGreaterThanOrEqual(Double(SegmentPadding.pad(radiusMax: 20, isMarker: true)),
+                                    Double(4 * 20 + 1.44))
+        // Small markers: AA tail covered too.
+        XCTAssertGreaterThanOrEqual(Double(SegmentPadding.pad(radiusMax: 1, isMarker: true)),
+                                    Double(4 * 1 + 0.44))
+    }
+}
+
+/// Live defaults: per-tile on unless explicitly disabled, live tile size 16 unless
+/// overridden. Pure environment functions, runs on Linux.
+final class LiveConfigTests: XCTestCase {
+    func testPerTileDefaultsOn() {
+        XCTAssertTrue(LiveConfig.perTileEnabled(environment: [:]))
+        XCTAssertTrue(LiveConfig.perTileEnabled(environment: ["ART_LIVE_PERTILE": "1"]))
+        XCTAssertFalse(LiveConfig.perTileEnabled(environment: ["ART_LIVE_PERTILE": "0"]))
+    }
+
+    func testLiveTileSizeDefaultsSixteen() {
+        XCTAssertEqual(LiveConfig.liveTileSize(environment: [:]), 16)
+        XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_TILE_SIZE": "32"]), 32)
+        XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_LIVE_TILE_SIZE": "32"]), 32)
+        XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_TILE_SIZE": "32",
+                                                              "ART_LIVE_TILE_SIZE": "8"]), 8)
+    }
+}
+
+/// Per-tile eligibility: cuts and markers force per-stroke; noise is allowed (handled by
+/// the noise-capable per-tile kernel). Pure, runs on Linux.
+final class LivePerTileEligibilityTests: XCTestCase {
+    private func stroke(noise: Bool = false, marker: Bool = false) -> LiveDeviceOp {
+        let seg = GPUSplineSegment(p0: SIMD2(0, 0), p1: SIMD2(0, 0),
+                                   p2: SIMD2(10, 0), p3: SIMD2(10, 0),
+                                   radius0: 2, radius1: 2,
+                                   opacity0: 1, opacity1: 1,
+                                   segmentType: 0, noiseSeed: noise ? 7 : 0)
+        return .stroke(segments: [seg], color: SIMD4<Float>(0, 0, 0, 1),
+                       isEraser: false, isMarker: marker)
+    }
+
+    func testCleanAndNoisyLayersAreEligible() {
+        XCTAssertTrue(LivePerTileEligibility.isEligible([stroke()]))
+        XCTAssertTrue(LivePerTileEligibility.isEligible([stroke(noise: true)]))
+        XCTAssertTrue(LivePerTileEligibility.isEligible([stroke(), stroke(noise: true)]))
+    }
+
+    func testCutAndMarkerForcePerStroke() {
+        let cut = LiveDeviceOp.cut(meta: CutMeta(inverseAffine: .identity,
+                                                 rect: [0, 0, 10, 10]))
+        XCTAssertFalse(LivePerTileEligibility.isEligible([stroke(), cut]))
+        XCTAssertFalse(LivePerTileEligibility.isEligible([stroke(marker: true)]))
+    }
+
+    func testStrokeFlagsCarryNoiseBit() {
+        XCTAssertEqual(LivePerTileEligibility.strokeFlags(isEraser: false, hasNoise: false), 0)
+        XCTAssertEqual(LivePerTileEligibility.strokeFlags(isEraser: true, hasNoise: false), 1)
+        XCTAssertEqual(LivePerTileEligibility.strokeFlags(isEraser: false, hasNoise: true), 2)
+        XCTAssertEqual(LivePerTileEligibility.strokeFlags(isEraser: true, hasNoise: true), 3)
+    }
+}
+
 /// macOS-only: drive the *real* boxed binner through a `MetalRenderer` and confirm the box
 /// and incidence count match hand-computed tile ranges. (Skipped when no device is around.)
 #if os(macOS)

@@ -75,6 +75,10 @@ class MetalRenderer {
     internal var liveSegmentNoiseCompositePipeline: MTLComputePipelineState?
     // Per-tile live composite (one dispatch per layer; AA-only fast path).
     internal var livePerTileAACompositePipeline: MTLComputePipelineState?
+    // Per-tile live composite for layers containing noise (AA + noise per stroke group).
+    // Optional: noisy layers fall back to per-stroke when the installed metallib
+    // predates this kernel.
+    internal var livePerTileNoiseCompositePipeline: MTLComputePipelineState?
     internal var segmentPasteLayerAACompositePipeline: MTLComputePipelineState?
     internal var segmentPasteLayerNoiseCompositePipeline: MTLComputePipelineState?
     internal var segmentCutCompositePipeline: MTLComputePipelineState?
@@ -165,6 +169,10 @@ class MetalRenderer {
     
     // Configuration
     internal var tileSize = 32  // Coarse tile size for spatial indexing (override via ART_TILE_SIZE for tuning)
+    /// Tile size used by the *live* binning/dispatch only (default 16; see LiveConfig).
+    /// The static path keeps using `tileSize` above, so changing the live default
+    /// cannot regress the static renders.
+    internal var liveTileSize = 16
     
     internal var tileIndicesBuffer: MTLBuffer?
     internal var tileListBuffer: MTLBuffer?
@@ -201,6 +209,9 @@ class MetalRenderer {
            let value = Int(override), value >= 8 {
             self.tileSize = value
         }
+        // Live tile size defaults to 16 (see LiveConfig.liveTileSize); ART_LIVE_TILE_SIZE
+        // overrides, otherwise an explicit ART_TILE_SIZE is honoured, otherwise 16.
+        self.liveTileSize = LiveConfig.liveTileSize()
         
         self.commandQueue = device.makeCommandQueue()
         

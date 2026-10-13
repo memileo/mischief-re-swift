@@ -230,6 +230,51 @@ public enum SegmentPrune {
     }
 }
 
+// MARK: - Tile-bin padding (platform-independent; unit-tested on Linux)
+
+/// Conservative per-segment tile-bin padding: how far a segment's ink can reach from
+/// its chord p1→p2, expanded to whole tiles. Must contain the kernel's paint, or tiles
+/// get dropped and strokes clip.
+///
+/// * plain strokes sweep radius r → 1.4·r + 1 (matches the historic binning constant;
+///   covers r + the 0.44 px AA tail + tile rounding).
+/// * markers sweep a 45° chisel reaching 4·r from the chord (3r along the axis + r
+///   capsule radius) → 4·r + 2 (the +2 covers the AA tail + tile rounding). The old
+///   constant (1 + 2·√2 ≈ 3.83)·r + 1 clipped large markers by ~0.17·r per side — the
+///   "clipped thickness + aliased edges" bug.
+public enum SegmentPadding {
+    public static func pad(radiusMax: Float, isMarker: Bool) -> Float {
+        if isMarker {
+            return 4.0 * radiusMax + 2.0
+        } else {
+            return 1.4 * radiusMax + 1.0
+        }
+    }
+}
+
+// MARK: - Live-view defaults (platform-independent; unit-tested on Linux)
+
+/// Default configuration for the interactive live path. Pure functions of the
+/// environment so they can be pinned by Linux tests; the Metal renderers call through.
+public enum LiveConfig {
+    /// Per-tile composite (one dispatch per layer) is the default; set
+    /// `ART_LIVE_PERTILE=0` to force the per-stroke path for A/B comparison.
+    public static func perTileEnabled(environment: [String: String]? = nil) -> Bool {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        return env["ART_LIVE_PERTILE"] != "0"
+    }
+
+    /// Tile size for the *live* binning/dispatch. Resolution order:
+    /// `ART_LIVE_TILE_SIZE` → `ART_TILE_SIZE` → 16 (the measured default).
+    /// The static path keeps its own default (32); only the live path uses this.
+    public static func liveTileSize(environment: [String: String]? = nil) -> Int {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        if let v = env["ART_LIVE_TILE_SIZE"], let n = Int(v), n >= 8 { return n }
+        if let v = env["ART_TILE_SIZE"], let n = Int(v), n >= 8 { return n }
+        return 16
+    }
+}
+
 // MARK: - GPU and Layer Payloads
 public struct GPUSplineSegment {
     public var p0: SIMD2<Float>    // CR Control Point 0 (Prev tangent)

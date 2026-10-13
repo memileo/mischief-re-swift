@@ -238,6 +238,30 @@ public enum LiveDeviceOp {
     case cut(meta: CutMeta)
 }
 
+/// Per-tile eligibility (pure; unit-tested on Linux). The per-tile kernels implement the
+/// plain AA composite and the noise composite, both grouped by stroke with per-stroke
+/// 8-bit quantisation — so any layer without cuts and without markers is eligible,
+/// noise included. Markers need the chisel SDF (per-stroke path only); cuts erase below
+/// them, so ordering forces the per-stroke path.
+public enum LivePerTileEligibility {
+    public static func isEligible(_ ops: [LiveDeviceOp]) -> Bool {
+        for op in ops {
+            switch op {
+            case .cut:
+                return false
+            case .stroke(_, _, _, let isMarker):
+                if isMarker { return false }
+            }
+        }
+        return true
+    }
+
+    /// Per-stroke flags bit1 = hasNoise. Pure helper so the bit layout is pinned by tests.
+    public static func strokeFlags(isEraser: Bool, hasNoise: Bool) -> UInt32 {
+        (isEraser ? 1 : 0) | (hasNoise ? 2 : 0)
+    }
+}
+
 extension Renderer {
     /// Above this many cached segments the interactive mode is abandoned in favour of the
     /// single-raster fallback. ~1.5 M segments ≈ 84 MB of geometry, i.e. a document far
