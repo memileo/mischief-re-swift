@@ -57,6 +57,7 @@ LIVE_KERNELS=(
     livePresentFragmentShader
     liveSegmentAACompositeKernel
     liveSegmentNoiseCompositeKernel
+    livePerTileAACompositeKernel
 )
 REQUIRED_KERNELS=(
     clearKernel

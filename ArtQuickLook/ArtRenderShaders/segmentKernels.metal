@@ -1142,3 +1142,102 @@ kernel void liveSegmentNoiseCompositeKernel(
         target.write(dst, pixel);
     }
 }
+
+// MARK: - Per-tile composite (one dispatch per layer, one canvas write per pixel)
+//
+// Same result as one-dispatch-per-stroke, but every overlapping stroke of a pixel is
+// composited in registers and the canvas is written ONCE (instead of read+written once per
+// stroke). That is the memory win: the Instruments profile showed the per-stroke kernel is
+// ~98% memory-stall with only ~7 resident SIMD-groups (register-limited occupancy), and a
+// single large dispatch both removes the k× canvas traffic and raises occupancy. It is used
+// only for the simple common case (no cut ops, and every stroke non-marker + non-noise);
+// anything else falls back to the per-stroke path above.
+
+// Source-over of one stroke's coverage onto the running accumulator. `flagsBit0` = eraser.
+static inline void perTileCompositeStroke(thread float4 &acc, float4 col, uint flagsValue, float a) {
+    if ((flagsValue & 0x1u) != 0u) {                 // eraser: multiply coverage out
+        acc.rgb *= (1.0f - a);
+        acc.a   *= (1.0f - a);
+    } else {                                         // normal: premultiplied source-over
+        acc.rgb = col.rgb * a + acc.rgb * (1.0f - a);
+        acc.a   = a + acc.a * (1.0f - a);
+    }
+}
+
+struct PerTileParams {
+    uint tileOriginX;
+    uint tileOriginY;
+    uint boxTilesPerRow;
+    uint tileSize;
+};
+
+kernel void livePerTileAACompositeKernel(
+    const device PerTileParams &params    [[buffer(0)]],
+    const device GPUSplineSegment *segments [[buffer(1)]],   // global, document (stroke) order
+    const device uint32_t *strokeOfSegment [[buffer(2)]],     // global segIdx -> stroke idx
+    const device TileIndex *tileStartCount [[buffer(3)]],     // per box-local tile: start/count
+    const device uint32_t *tileList [[buffer(4)]],            // global segIdx, ascending (= doc order)
+    const device float4 *strokeColor [[buffer(5)]],           // per stroke: pen colour
+    const device uint32_t *strokeFlags [[buffer(6)]],         // per stroke: bit0 = eraser
+    texture2d<float, access::read_write> target [[texture(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint w = target.get_width();
+    uint h = target.get_height();
+    uint2 originPx = uint2(params.tileOriginX, params.tileOriginY) * params.tileSize;
+    uint2 pixel = originPx + gid;
+    if (pixel.x >= w || pixel.y >= h) return;
+
+    uint2 tileID = pixel / params.tileSize;
+    uint localTile = (tileID.y - params.tileOriginY) * params.boxTilesPerRow
+                   + (tileID.x - params.tileOriginX);
+    TileIndex tc = tileStartCount[localTile];
+    float2 pos = float2(pixel.x, pixel.y) + float2(0.5f, 0.5f);
+
+    float4 acc = float4(0.0f);          // canvas is cleared before the layer, so start transparent
+    uint curStroke = 0xFFFFFFFFu;       // no stroke yet
+    float curMax = 0.0f;
+
+    for (uint j = 0; j < tc.count; ++j) {
+        uint segIdx = tileList[tc.start + j];        // ascending global index == document order
+        uint sId = strokeOfSegment[segIdx];
+        if (sId != curStroke) {                       // crossed into a new stroke: composite the last
+            if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f) {
+                float4 col = strokeColor[curStroke];
+                perTileCompositeStroke(acc, col, strokeFlags[curStroke], curMax * col.a);
+            }
+            curStroke = sId;
+            curMax = 0.0f;
+        }
+
+        GPUSplineSegment seg = segments[segIdx];
+        float pruneRadius = (seg.padding1 != 0u) ? as_type<float>(seg.padding1) : 3.4e38f;
+        if (liveSegDist(pos, seg.p1, seg.p2) > pruneRadius) continue;
+
+        float signedDist = 1e6f;
+        float t = 0.0f;
+        if (seg.segmentType == 0) {
+            SDFResult res = sdUnevenCapsule(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
+            signedDist = res.dist; t = res.t;
+        } else if (seg.segmentType == 1) {
+            SDFResult res = sdSplineSegment(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+            signedDist = res.dist; t = res.t;
+        } else if (seg.segmentType == 2) {
+            SDFResult res = sdSoftEnvelopeSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+            signedDist = res.dist; t = res.t;
+        }
+        float opacity = mix(seg.opacity0, seg.opacity1, t);
+        float edgeWidth = 0.94f;
+        float bias = 0.5f;
+        float cov = 1.0f - smootherstep(-edgeWidth, edgeWidth, signedDist + bias);
+        float stamped = cov * opacity;
+        if (stamped > curMax) curMax = stamped;
+    }
+    // Composite the final stroke group.
+    if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f) {
+        float4 col = strokeColor[curStroke];
+        perTileCompositeStroke(acc, col, strokeFlags[curStroke], curMax * col.a);
+    }
+
+    if (acc.a > 0.0001f) target.write(acc, pixel);
+}

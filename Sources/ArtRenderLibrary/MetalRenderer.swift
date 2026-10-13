@@ -73,6 +73,8 @@ class MetalRenderer {
     // prepareLiveCompositing; when absent the live view falls back to the static path.
     internal var liveSegmentAACompositePipeline: MTLComputePipelineState?
     internal var liveSegmentNoiseCompositePipeline: MTLComputePipelineState?
+    // Per-tile live composite (one dispatch per layer; AA-only fast path).
+    internal var livePerTileAACompositePipeline: MTLComputePipelineState?
     internal var segmentPasteLayerAACompositePipeline: MTLComputePipelineState?
     internal var segmentPasteLayerNoiseCompositePipeline: MTLComputePipelineState?
     internal var segmentCutCompositePipeline: MTLComputePipelineState?

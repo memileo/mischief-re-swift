@@ -18,6 +18,7 @@
 
 #if os(macOS)
 import Metal
+import Foundation
 import CoreGraphics
 import ImageIO
 
@@ -60,6 +61,26 @@ struct LiveStrokeParams {
     var penColorA: Float
     var noiseScale: Float
     var flags: UInt32
+}
+
+// Must match `PerTileParams` in segmentKernels.metal byte for byte (scalars only).
+struct PerTileParams {
+    var tileOriginX: UInt32
+    var tileOriginY: UInt32
+    var boxTilesPerRow: UInt32
+    var tileSize: UInt32
+}
+
+// One layer's worth of per-tile data, as byte-slices into the single upload buffer.
+private struct PerTilePlan {
+    var empty = true
+    var segOffset = 0, segCount = 0
+    var strokeOfSegOffset = 0, strokeOfSegCount = 0
+    var tileStartCountOffset = 0, tileBoxCount = 0
+    var tileListOffset = 0, tileListCount = 0
+    var strokeColorOffset = 0, strokeCount = 0
+    var strokeFlagsOffset = 0
+    var minTileX = 0, minTileY = 0, boxWidth = 0, boxHeight = 0
 }
 
 extension MetalRenderer {
@@ -124,6 +145,17 @@ extension MetalRenderer {
             }
         } else {
             failures.append("liveSegmentNoiseCompositeKernel: not found in the metallib")
+        }
+
+        // Per-tile live composite (AA-only fast path). Optional on purpose: if it's missing
+        // the live view silently uses the per-stroke path instead.
+        if let fn = library.makeFunction(name: "livePerTileAACompositeKernel") {
+            do {
+                livePerTileAACompositePipeline = try device.makeComputePipelineState(function: fn)
+            } catch {
+                failures.append("livePerTileAACompositeKernel: \(error)")
+                livePerTileAACompositePipeline = nil
+            }
         }
 
         // Present render pipeline (drawables are BGRA, offscreen readback is RGBA)
@@ -353,20 +385,42 @@ extension MetalRenderer {
             throw MetalRendererError.textureCreationFailed
         }
         
-        // ── 1. Tile-bin every stroke into the staging arena (CPU only), keeping order.
+        // ── 1+2. Tile-bin the layer into the staging arena, then encode it.
+        //
+        // The *per-tile* path composites the whole layer in ONE dispatch (one canvas write
+        // per pixel + high occupancy — the memory fix) for the simple common case: no cuts
+        // and every stroke non-marker/non-noise. Anything else uses the proven *per-stroke*
+        // path (one dispatch per stroke) — the only way cut/marker/noise stay exact today.
         var clock = DispatchTime.now().uptimeNanoseconds
-        let (steps, bins) = try bin(layerOps: layerOps, width: width, height: height)
+        var perTilePlan: PerTilePlan?
+        if Self.perTileEnabled, isPerTileEligible(layerOps), livePerTileAACompositePipeline != nil {
+            perTilePlan = try buildPerTilePlan(layerOps: layerOps, width: width, height: height)
+        }
+        if let plan = perTilePlan, plan.empty {
+            perTilePlan = nil                  // nothing on-canvas → fall back to per-stroke
+        }
+        var steps: [LiveLayerStep] = []
+        var bins: [LiveStrokeBin] = []
+        if perTilePlan == nil {
+            let (s, b) = try bin(layerOps: layerOps, width: width, height: height)
+            steps = s
+            bins = b
+        }
         liveTiming.binMilliseconds += Self.milliseconds(since: clock)
-        
-        // ── 2. One copy, then encode each step against its slice of the arena.
-        clock = DispatchTime.now().uptimeNanoseconds
+
+        // One upload, then encode whichever plan we built.
         try uploadArena(byteCount: liveStagingUsed)
-        for step in steps {
-            switch step {
-                case .stroke(let index):
-                    try encode(stroke: bins[index], width: width, height: height, encoder: encoder)
-                case .cut(let meta):
-                    try dispatchLiveCut(meta: meta, width: width, height: height, encoder: encoder)
+        clock = DispatchTime.now().uptimeNanoseconds
+        if let plan = perTilePlan {
+            try encodePerTile(plan: plan, encoder: encoder)
+        } else {
+            for step in steps {
+                switch step {
+                    case .stroke(let index):
+                        try encode(stroke: bins[index], width: width, height: height, encoder: encoder)
+                    case .cut(let meta):
+                        try dispatchLiveCut(meta: meta, width: width, height: height, encoder: encoder)
+                }
             }
         }
         liveTiming.encodeMilliseconds += Self.milliseconds(since: clock)
@@ -391,6 +445,130 @@ extension MetalRenderer {
         if let err = commandBuffer.error { throw err }
     }
     
+    /// A layer is per-tile-able only if it has no cut ops and every stroke is non-marker and
+    /// non-noise — the per-tile kernel implements the plain AA composite for exactly that.
+    private func isPerTileEligible(_ ops: [LiveDeviceOp]) -> Bool {
+        for op in ops {
+            if case .cut = op { return false }
+            if case .stroke(let segments, _, _, let isMarker) = op {
+                if isMarker { return false }
+                if segments.contains(where: { $0.noiseSeed != 0 }) { return false }
+            }
+        }
+        return true
+    }
+
+    /// Builds the whole layer's per-tile structure into `liveStaging`: one flat, document-
+    /// (stroke-)ordered segment array, a per-segment stroke index, per-stroke colour + flags,
+    /// and a box-local tile → segment list (built by the shared `SegmentBinner`, so each
+    /// tile's list is already ascending = document order — which is what makes per-stroke
+    /// grouping correct). Sets `liveStagingUsed` and the debug counters; the returned plan's
+    /// offsets are what `encodePerTile` binds.
+    private func buildPerTilePlan(layerOps: [LiveDeviceOp],
+                                  width: Int, height: Int) throws -> PerTilePlan {
+        var segments: [GPUSplineSegment] = []
+        var strokeOfSegment: [UInt32] = []
+        var strokeColors: [SIMD4<Float>] = []
+        var strokeFlags: [UInt32] = []
+        for op in layerOps {
+            if case .stroke(let segs, let color, let isEraser, _) = op {
+                let strokeIndex = UInt32(strokeColors.count)
+                strokeColors.append(color)
+                strokeFlags.append(isEraser ? 1 : 0)
+                segments.append(contentsOf: segs)
+                strokeOfSegment.append(contentsOf: Array(repeating: strokeIndex, count: segs.count))
+            }
+        }
+
+        var plan = PerTilePlan()
+        plan.strokeCount = strokeColors.count
+        plan.segCount = segments.count
+        plan.strokeOfSegCount = strokeOfSegment.count
+
+        let boxed = buildSegmentTileIndicesBoxed(segments: segments,
+                                                 textureWidth: width, textureHeight: height,
+                                                 tileSize: tileSize, isMarker: false, transform: nil)
+        plan.tileListCount = boxed.tileList.count
+        plan.tileBoxCount = boxed.tileIndices.count
+        plan.minTileX = boxed.minTileX
+        plan.minTileY = boxed.minTileY
+        plan.boxWidth = boxed.boxWidth
+        plan.boxHeight = boxed.boxHeight
+
+        if boxed.tileList.isEmpty {
+            plan.empty = true
+            liveStagingUsed = 0
+            return plan
+        }
+        plan.empty = false
+
+        if liveStagingUsed > 0, staging(needed: liveStagingUsed) == nil {
+            throw MetalRendererError.bufferCreationFailed
+        }
+        var cursor = 0
+        func place(_ byteCount: Int) -> Int {
+            cursor = Self.alignUp(cursor, Self.liveArenaAlignment)
+            let offset = cursor
+            cursor += byteCount
+            return offset
+        }
+        plan.segOffset = place(MemoryLayout<GPUSplineSegment>.stride * segments.count)
+        plan.strokeOfSegOffset = place(MemoryLayout<UInt32>.stride * strokeOfSegment.count)
+        plan.tileStartCountOffset = place(MemoryLayout<TileIndex>.stride * boxed.tileIndices.count)
+        plan.tileListOffset = place(MemoryLayout<UInt32>.stride * boxed.tileList.count)
+        plan.strokeColorOffset = place(MemoryLayout<SIMD4<Float>>.stride * strokeColors.count)
+        plan.strokeFlagsOffset = place(MemoryLayout<UInt32>.stride * strokeFlags.count)
+
+        guard let base = staging(needed: cursor) else { throw MetalRendererError.bufferCreationFailed }
+        func write<T>(_ array: [T], at offset: Int) {
+            array.withUnsafeBytes { raw in
+                if let src = raw.baseAddress {
+                    (base + offset).copyMemory(from: src, byteCount: raw.count)
+                }
+            }
+        }
+        write(segments, at: plan.segOffset)
+        write(strokeOfSegment, at: plan.strokeOfSegOffset)
+        write(boxed.tileIndices, at: plan.tileStartCountOffset)
+        write(boxed.tileList, at: plan.tileListOffset)
+        write(strokeColors, at: plan.strokeColorOffset)
+        write(strokeFlags, at: plan.strokeFlagsOffset)
+        liveStagingUsed = Self.alignUp(cursor, Self.liveArenaAlignment)
+
+        // Debug counters.
+        liveTiming.dispatchedTiles += boxed.boxWidth * boxed.boxHeight
+        liveTiming.inkedTiles += boxed.tileIndices.reduce(0) { $0 + ($1.count > 0 ? 1 : 0) }
+        liveTiming.sdfEvaluations += boxed.tileList.count * (tileSize * tileSize)
+        return plan
+    }
+
+    /// Binds the per-tile plan and dispatches ONE compute over the layer's tile box.
+    private func encodePerTile(plan: PerTilePlan, encoder: MTLComputeCommandEncoder) throws {
+        guard let pipeline = livePerTileAACompositePipeline else {
+            throw MetalRendererError.pipelineMissing("livePerTileAACompositeKernel")
+        }
+        guard let arena = liveArena else { throw MetalRendererError.bufferCreationFailed }
+        var params = PerTileParams(tileOriginX: UInt32(plan.minTileX),
+                                   tileOriginY: UInt32(plan.minTileY),
+                                   boxTilesPerRow: UInt32(plan.boxWidth),
+                                   tileSize: UInt32(tileSize))
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBytes(&params, length: MemoryLayout<PerTileParams>.stride, index: 0)
+        encoder.setBuffer(arena, offset: plan.segOffset, index: 1)
+        encoder.setBuffer(arena, offset: plan.strokeOfSegOffset, index: 2)
+        encoder.setBuffer(arena, offset: plan.tileStartCountOffset, index: 3)
+        encoder.setBuffer(arena, offset: plan.tileListOffset, index: 4)
+        encoder.setBuffer(arena, offset: plan.strokeColorOffset, index: 5)
+        encoder.setBuffer(arena, offset: plan.strokeFlagsOffset, index: 6)
+        encoder.setTexture(gpuRenderTarget, index: 0)
+        let groupsPerTileX = (tileSize + Int(Self.liveThreads.width) - 1) / Int(Self.liveThreads.width)
+        let groupsPerTileY = (tileSize + Int(Self.liveThreads.height) - 1) / Int(Self.liveThreads.height)
+        let groups = MTLSize(width: plan.boxWidth * groupsPerTileX,
+                             height: plan.boxHeight * groupsPerTileY,
+                             depth: 1)
+        encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: Self.liveThreads)
+    }
+
     static func milliseconds(since start: UInt64) -> Double {
         Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000.0
     }
@@ -403,7 +581,20 @@ extension MetalRenderer {
     /// stroke*, and each launch covers the whole canvas, so the launch overhead of the
     /// (mostly empty) tiles dominates. 32×32 = 1024 threads is the hardware maximum, which
     /// makes it 16× fewer threadgroup launches for identical work.
-    static let liveThreads = MTLSize(width: 32, height: 32, depth: 1)
+    /// Threads per threadgroup for the live passes. Thread-per-pixel, so the shape is free
+    /// *and it's an occupancy knob*: the kernels are memory-latency bound (Instruments
+    /// shows ~80% SIMD-group memory stall), and smaller groups let more of them be resident
+    /// at once, which is what hides that latency. 16×16 ≈ 256 threads is fewer registers
+    /// per group than 32×32 and roughly quadruples the number of resident groups;
+    /// `groupsPerTile` in `encode(stroke:)` scales with this automatically. (8×8 if you
+    /// want to push occupancy further.) Output is unaffected — only dispatch granularity.
+    /// Opt-in for the per-tile composite (one compute dispatch per layer → one canvas write
+    /// per pixel, high occupancy). Set `ART_LIVE_PERTILE=1`. Automatically falls back to the
+    /// per-stroke path for any layer with cut ops or marker/noise strokes, or if the kernel
+    /// isn't in the installed metallib.
+    static let perTileEnabled = ProcessInfo.processInfo.environment["ART_LIVE_PERTILE"] == "1"
+
+    static let liveThreads = MTLSize(width: 16, height: 16, depth: 1)
 
     /// Threadgroups needed for `width` × `height` pixels at `liveThreads`.
     static func liveGroups(width: Int, height: Int) -> MTLSize {
