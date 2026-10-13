@@ -108,6 +108,36 @@ final class SegmentPruneTests: XCTestCase {
         XCTAssertLessThan(5.0, Double(radius))            // on-ink edge pixel kept
         XCTAssertGreaterThan(20.0, Double(radius))        // far pixel pruned
     }
+
+    /// Regression for the ellipses marker bug: polyline strokes emit straight (type-0)
+    /// segments, and their prune radius must use the marker reach (4·r), not the plain
+    /// capsule reach. `flattenPolyline` used to hardcode `isMarker: false`, so every
+    /// straight marker segment was over-pruned → clipped thickness + aliased edges.
+    func testPolylineMarkerSegmentsCarryMarkerPruneRadius() {
+        func build(isMarker: Bool) -> [GPUSplineSegment] {
+            var segs: [GPUSplineSegment] = []
+            let span = CRPointSpan(p0: CGPoint(x: 0, y: 0), p1: CGPoint(x: 0, y: 0),
+                                   p2: CGPoint(x: 100, y: 0), p3: CGPoint(x: 100, y: 0))
+            let rSpan = CRScalarSpan(s0: 5, s1: 5, s2: 5, s3: 5)
+            let oSpan = CRScalarSpan(s0: 1, s1: 1, s2: 1, s3: 1)
+            flattenPolyline(span: span, rSpan: rSpan, oSpan: oSpan, seed: 0,
+                            into: &segs, isMarker: isMarker)
+            return segs
+        }
+        let plain = build(isMarker: false)
+        let marker = build(isMarker: true)
+        XCTAssertFalse(plain.isEmpty)
+        XCTAssertEqual(plain.count, marker.count)
+        for s in plain {
+            XCTAssertEqual(s.segmentType, 0)
+            XCTAssertEqual(Double(Float(bitPattern: s.padding1)), 6.875, accuracy: 1e-4)
+        }
+        for s in marker {
+            XCTAssertEqual(s.segmentType, 0)
+            // 4·5 + max(0.75, 0.375·5) = 21.875 — the chisel reach, not 6.875.
+            XCTAssertEqual(Double(Float(bitPattern: s.padding1)), 21.875, accuracy: 1e-4)
+        }
+    }
 }
 
 /// Regression: the per-pixel prune radius (`padding1`, a distance) must be rescaled with the

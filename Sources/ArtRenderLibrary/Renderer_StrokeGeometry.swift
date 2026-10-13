@@ -423,7 +423,8 @@ func isStraightAngle(_ v1: CGPoint, _ v2: CGPoint) -> Bool {
 internal func flattenAndBuild(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRScalarSpan, seed: UInt32, depth: Int = 0, into segments: inout [GPUSplineSegment], isPolyline: Bool, isMarker: Bool) {
     
     if isPolyline {
-        flattenPolyline(span: span, rSpan: rSpan, oSpan: oSpan, seed: seed, into: &segments)
+        flattenPolyline(span: span, rSpan: rSpan, oSpan: oSpan, seed: seed, into: &segments,
+                        isMarker: isMarker)
         return
     }
     
@@ -495,7 +496,8 @@ func flattenPolyline(
     rSpan: CRScalarSpan,
     oSpan: CRScalarSpan,
     seed: UInt32,
-    into segments: inout [GPUSplineSegment]
+    into segments: inout [GPUSplineSegment],
+    isMarker: Bool = false
 ) {
     let p1 = span.p1, p2 = span.p2
     let dx = p2.x - p1.x, dy = p2.y - p1.y
@@ -545,7 +547,7 @@ func flattenPolyline(
         )
         seg.padding1 = SegmentPrune.radius(p0: seg.p0, p1: seg.p1, p2: seg.p2, p3: seg.p3,
                                            radius0: seg.radius0, radius1: seg.radius1,
-                                           segmentType: 0, isMarker: false).bitPattern
+                                           segmentType: 0, isMarker: isMarker).bitPattern
         segments.append(seg)
     }
 }
