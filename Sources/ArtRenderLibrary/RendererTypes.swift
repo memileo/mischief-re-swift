@@ -264,6 +264,15 @@ public enum LiveConfig {
         return env["ART_LIVE_PERTILE"] != "0"
     }
 
+    /// GPU tile binning (transform + tile ranges + counts on the GPU, scatter + sort on
+    /// the GPU, tiny prefix on the CPU) is the default; set `ART_LIVE_GPUBIN=0` to force
+    /// the CPU binning path for A/B comparison. Missing pipelines also fall back to CPU
+    /// automatically — never to wrong pixels.
+    public static func gpuBinEnabled(environment: [String: String]? = nil) -> Bool {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        return env["ART_LIVE_GPUBIN"] != "0"
+    }
+
     /// Tile size for the *live* binning/dispatch. Resolution order:
     /// `ART_LIVE_TILE_SIZE` → `ART_TILE_SIZE` → 16 (the measured default).
     /// The static path keeps its own default (32); only the live path uses this.
@@ -272,6 +281,84 @@ public enum LiveConfig {
         if let v = env["ART_LIVE_TILE_SIZE"], let n = Int(v), n >= 8 { return n }
         if let v = env["ART_TILE_SIZE"], let n = Int(v), n >= 8 { return n }
         return 16
+    }
+}
+
+// MARK: - GPU tile binning spec (platform-independent; unit-tested on Linux)
+//
+// Contract between the CPU plan builder and the `liveBin*` Metal kernels
+// (`ArtQuickLook/ArtRenderShaders/segmentKernels.metal`). The kernels mirror this maths
+// exactly (same float op order, same truncation-toward-zero int conversion, same clamps),
+// so GPU-built tile structures agree with the CPU-built ones up to the conservative
+// padding slop — which can only add empty tiles, never drop inked ones.
+//
+// Layout note: `GpuBinTileEntry` is layout-identical to the Metal/Swift `TileIndex`
+// `{start, count}` pair (two UInt32, stride 8). The macOS side memcpys between them.
+
+/// One tile's slice of the tile list. Layout-identical to `TileIndex`.
+public struct GpuBinTileEntry {
+    public var start: UInt32
+    public var count: UInt32
+    public init(start: UInt32, count: UInt32) {
+        self.start = start
+        self.count = count
+    }
+}
+
+public enum GpuBinSpec {
+    /// Tile grid dimensions for a viewport. Mirrors `(w + tile - 1) / tile` on both sides.
+    public static func tileGrid(viewportWidth: Int, viewportHeight: Int,
+                                tileSize: Int) -> (tilesX: Int, tilesY: Int) {
+        ((viewportWidth + tileSize - 1) / tileSize,
+         (viewportHeight + tileSize - 1) / tileSize)
+    }
+
+    /// Tile AABB of a camera-transformed stroke-bounds AABB, clamped to the canvas grid.
+    /// Uses floor/ceil (NOT truncation) so the result is a SUPERSET of the per-segment
+    /// ranges the binning kernels compute — a shrunken box would drop ink, an extra empty
+    /// tile row/column only costs a few no-op threadgroups. Returns nil when the AABB is
+    /// strictly off-canvas (same strict inequalities as the per-segment cull).
+    public static func tileBoxForAABB(minX: Float, minY: Float, maxX: Float, maxY: Float,
+                                      texW: Float, texH: Float,
+                                      tilesX: Int, tilesY: Int,
+                                      invTile: Float)
+        -> (minX: Int, minY: Int, maxX: Int, maxY: Int)? {
+        if maxX < 0 || minX > texW || maxY < 0 || minY > texH { return nil }
+        let a = max(0, min(tilesX - 1, Int(floor(minX * invTile))))
+        let b = max(0, min(tilesX - 1, Int(ceil(maxX * invTile))))
+        let c = max(0, min(tilesY - 1, Int(floor(minY * invTile))))
+        let d = max(0, min(tilesY - 1, Int(ceil(maxY * invTile))))
+        guard a <= b && c <= d else { return nil }
+        return (a, c, b, d)
+    }
+
+    /// Merges a stroke tile box into the running layer box (absolute canvas tiles).
+    public static func unionTileBox(_ acc: (minX: Int, minY: Int, maxX: Int, maxY: Int)?,
+                                    with box: (minX: Int, minY: Int, maxX: Int, maxY: Int))
+        -> (minX: Int, minY: Int, maxX: Int, maxY: Int) {
+        guard let acc else { return box }
+        return (min(acc.minX, box.minX), min(acc.minY, box.minY),
+                max(acc.maxX, box.maxX), max(acc.maxY, box.maxY))
+    }
+
+    /// Prefix-sums per-tile counts into per-tile (start, count) entries plus the grand
+    /// total (the tile-list size). `starts[t]` is both the scatter head seed and
+    /// `entries[t].start` — the single source of truth the GPU scatter/sort/render agree on.
+    public static func combine(counts: [UInt32])
+        -> (entries: [GpuBinTileEntry], starts: [UInt32], total: Int) {
+        var entries = [GpuBinTileEntry]()
+        entries.reserveCapacity(counts.count)
+        var starts = [UInt32]()
+        starts.reserveCapacity(counts.count)
+        var running: UInt64 = 0
+        for c in counts {
+            precondition(running + UInt64(c) <= UInt64(UInt32.max),
+                         "tile-list overflow: more incidences than UInt32 range")
+            starts.append(UInt32(running))
+            entries.append(GpuBinTileEntry(start: UInt32(running), count: c))
+            running += UInt64(c)
+        }
+        return (entries, starts, Int(running))
     }
 }
 

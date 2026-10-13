@@ -79,6 +79,66 @@ class MetalRenderer {
     // Optional: noisy layers fall back to per-stroke when the installed metallib
     // predates this kernel.
     internal var livePerTileNoiseCompositePipeline: MTLComputePipelineState?
+    // GPU tile-binning kernels (live view `bin` stage). All optional: a metallib that
+    // predates them (or ART_LIVE_GPUBIN=0) silently uses the CPU binning instead.
+    internal var liveBinTransformRangesPipeline: MTLComputePipelineState?
+    internal var liveBinCountPipeline: MTLComputePipelineState?
+    internal var liveBinScatterPipeline: MTLComputePipelineState?
+    internal var liveBinSortTilesPipeline: MTLComputePipelineState?
+    /// Per-layer GPU-binning state, keyed by layer index. Entries are validated against
+    /// the owning cache (`ObjectIdentifier`) + segment count and dropped wholesale when
+    /// the document changes — reference-space geometry never crosses documents.
+    internal var liveBinLayers: [Int: LiveBinRefLayer] = [:]
+    internal var liveBinDocID: ObjectIdentifier?
+
+/// One layer's GPU-binning state. Reference-space geometry is uploaded ONCE per
+/// document/layer (it never changes across frames — only the camera does); frame buffers
+/// are geometrically resized and reused, so steady-state frames allocate nothing.
+internal final class LiveBinRefLayer {
+    var docID: ObjectIdentifier
+    var segCount: Int
+    var strokeCount: Int
+    // Static per document/layer (uploaded once):
+    var refSegments: MTLBuffer       // N × GPUSplineSegment, reference space (.shared)
+    var segStroke: MTLBuffer         // N × UInt32: global segIdx → stroke idx (.shared)
+    var strokeColors: MTLBuffer      // S × SIMD4<Float> (.shared)
+    var strokeFlags: MTLBuffer       // S × UInt32, bit0 = eraser, bit1 = hasNoise (.shared)
+    var strokeVisible: MTLBuffer     // S × UInt8, rewritten per frame (.shared)
+    var strokeBounds: [CGRect]       // S, CPU side for culling
+    var strokeIsMarker: [Bool]       // S
+    var strokeHasNoise: [Bool]       // S
+    var strokeSegCounts: [Int]       // S, segments per stroke (timing counters)
+    // Frame buffers (sized geometrically, reused across frames):
+    var frameSegments: MTLBuffer?    // N × GPUSplineSegment, device space (.private)
+    var ranges: MTLBuffer?           // N × int4 tile ranges (.private)
+    var counts: MTLBuffer?           // boxTiles × UInt32 atomics (.shared: CPU memset+readback)
+    var heads: MTLBuffer?            // boxTiles × UInt32 scatter heads (.shared)
+    var starts: MTLBuffer?           // boxTiles × UInt32 prefix starts (.shared)
+    var tileIndex: MTLBuffer?        // boxTiles × TileIndex, render + sort input (.shared)
+    var tileList: MTLBuffer?         // incidences × UInt32 (.private)
+    var boxCap = 0                   // boxTiles currently allocated
+    var tileListCap = 0              // incidences currently allocated
+
+    init(docID: ObjectIdentifier, segCount: Int, strokeCount: Int,
+         refSegments: MTLBuffer, segStroke: MTLBuffer,
+         strokeColors: MTLBuffer, strokeFlags: MTLBuffer, strokeVisible: MTLBuffer,
+         strokeBounds: [CGRect], strokeIsMarker: [Bool], strokeHasNoise: [Bool],
+         strokeSegCounts: [Int]) {
+        self.docID = docID
+        self.segCount = segCount
+        self.strokeCount = strokeCount
+        self.refSegments = refSegments
+        self.segStroke = segStroke
+        self.strokeColors = strokeColors
+        self.strokeFlags = strokeFlags
+        self.strokeVisible = strokeVisible
+        self.strokeBounds = strokeBounds
+        self.strokeIsMarker = strokeIsMarker
+        self.strokeHasNoise = strokeHasNoise
+        self.strokeSegCounts = strokeSegCounts
+    }
+}
+
     internal var segmentPasteLayerAACompositePipeline: MTLComputePipelineState?
     internal var segmentPasteLayerNoiseCompositePipeline: MTLComputePipelineState?
     internal var segmentCutCompositePipeline: MTLComputePipelineState?

@@ -235,6 +235,14 @@ extension Renderer {
                 mr.liveTiming.cachedLayers += 1
                 let strokesInLayer = cache.strokeCount(at: position)
                 let viewportRect = CGRect(origin: .zero, size: CGSize(width: width, height: height))
+                // GPU-binned per-tile path first: same pixels, ~bulk CPU work moved to GPU.
+                // Returns false when ineligible (cuts/markers) or unavailable → CPU below.
+                if mr.renderCachedLayerGPU(cache: cache, position: position,
+                                           camera: cameraTransform, viewport: viewportRect,
+                                           width: width, height: height,
+                                           opacity: layer.opacity) {
+                    continue
+                }
                 guard let deviceOps = cache.deviceOps(forLayerAt: position,
                                                       camera: cameraTransform,
                                                       viewport: viewportRect),

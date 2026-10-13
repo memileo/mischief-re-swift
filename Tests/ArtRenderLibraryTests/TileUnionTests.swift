@@ -197,6 +197,12 @@ final class LiveConfigTests: XCTestCase {
         XCTAssertFalse(LiveConfig.perTileEnabled(environment: ["ART_LIVE_PERTILE": "0"]))
     }
 
+    func testGpuBinDefaultsOn() {
+        XCTAssertTrue(LiveConfig.gpuBinEnabled(environment: [:]))
+        XCTAssertTrue(LiveConfig.gpuBinEnabled(environment: ["ART_LIVE_GPUBIN": "1"]))
+        XCTAssertFalse(LiveConfig.gpuBinEnabled(environment: ["ART_LIVE_GPUBIN": "0"]))
+    }
+
     func testLiveTileSizeDefaultsSixteen() {
         XCTAssertEqual(LiveConfig.liveTileSize(environment: [:]), 16)
         XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_TILE_SIZE": "32"]), 32)
@@ -206,6 +212,76 @@ final class LiveConfigTests: XCTestCase {
     }
 }
 
+/// GPU binning spec: grid sizing, conservative layer-box math, count prefixing.
+/// Pure integer/float logic, runs on Linux. The Metal kernels mirror this exactly.
+final class GpuBinSpecTests: XCTestCase {
+    func testTileGridRoundsUp() {
+        XCTAssertEqual(GpuBinSpec.tileGrid(viewportWidth: 1920, viewportHeight: 1080, tileSize: 16).tilesX, 120)
+        XCTAssertEqual(GpuBinSpec.tileGrid(viewportWidth: 1920, viewportHeight: 1080, tileSize: 16).tilesY, 68)
+        XCTAssertEqual(GpuBinSpec.tileGrid(viewportWidth: 64, viewportHeight: 64, tileSize: 16).tilesX, 4)
+    }
+
+    func testTileBoxForAABBCoversAndClamps() {
+        // AABB [10,50]² at 16px tiles → tiles 0..4 (floor/ceil), no clamping needed.
+        let box = GpuBinSpec.tileBoxForAABB(minX: 10, minY: 10, maxX: 50, maxY: 50,
+                                            texW: 1920, texH: 1080,
+                                            tilesX: 120, tilesY: 68, invTile: 1.0 / 16.0)!
+        XCTAssertEqual(box.minX, 0); XCTAssertEqual(box.maxX, 4)
+        XCTAssertEqual(box.minY, 0); XCTAssertEqual(box.maxY, 4)
+        // Off-canvas → nil (same strict inequalities as the per-segment cull).
+        XCTAssertNil(GpuBinSpec.tileBoxForAABB(minX: -50, minY: 10, maxX: -1, maxY: 50,
+                                               texW: 1920, texH: 1080,
+                                               tilesX: 120, tilesY: 68, invTile: 1.0 / 16.0))
+        // Partially off-canvas clamps to the grid instead of going negative/past the edge.
+        let clamped = GpuBinSpec.tileBoxForAABB(minX: -30, minY: 1000, maxX: 2000, maxY: 2000,
+                                                texW: 1920, texH: 1080,
+                                                tilesX: 120, tilesY: 68, invTile: 1.0 / 16.0)!
+        XCTAssertEqual(clamped.minX, 0); XCTAssertEqual(clamped.maxX, 119)
+        XCTAssertEqual(clamped.minY, 62); XCTAssertEqual(clamped.maxY, 67)
+    }
+
+    func testTileBoxIsSupersetOfTruncatedSegmentRange() {
+        // The per-segment path converts with truncation-toward-zero; the layer box uses
+        // floor/ceil, so it must contain the truncated range even for negative coords
+        // (where truncation shrinks toward zero and would otherwise drop a tile).
+        let inv: Float = 1.0 / 16.0
+        let segMinX: Float = -20, segMaxX: Float = -1
+        let truncA = max(0, Int(segMinX * inv)), truncB = min(119, Int(segMaxX * inv))
+        let box = GpuBinSpec.tileBoxForAABB(minX: -25, minY: 0, maxX: 5, maxY: 16,
+                                            texW: 1920, texH: 1080,
+                                            tilesX: 120, tilesY: 68, invTile: inv)!
+        XCTAssertLessThanOrEqual(box.minX, truncA)
+        XCTAssertGreaterThanOrEqual(box.maxX, truncB)
+    }
+
+    func testUnionTileBoxGrows() {
+        let u = GpuBinSpec.unionTileBox(nil, with: (2, 4, 3, 5))
+        XCTAssertEqual(u.minX, 2); XCTAssertEqual(u.maxY, 5)
+        let u2 = GpuBinSpec.unionTileBox(u, with: (0, 0, 1, 1))
+        XCTAssertEqual(u2.minX, 0); XCTAssertEqual(u2.maxX, 3)
+        XCTAssertEqual(u2.minY, 0); XCTAssertEqual(u2.maxY, 5)
+    }
+
+    func testCombinePrefixSums() {
+        let (entries, starts, total) = GpuBinSpec.combine(counts: [1, 0, 3, 2])
+        XCTAssertEqual(starts, [0, 1, 1, 4])
+        XCTAssertEqual(entries.map(\.start), [0, 1, 1, 4])
+        XCTAssertEqual(entries.map(\.count), [1, 0, 3, 2])
+        XCTAssertEqual(total, 6)
+        // Empty + all-zero layers stay well-formed (zero-size tile list, no traps).
+        let (e2, s2, t2) = GpuBinSpec.combine(counts: [])
+        XCTAssertTrue(e2.isEmpty); XCTAssertTrue(s2.isEmpty); XCTAssertEqual(t2, 0)
+        let (_, _, t3) = GpuBinSpec.combine(counts: [UInt32](repeating: 0, count: 100))
+        XCTAssertEqual(t3, 0)
+    }
+
+    func testTileEntryMatchesTileIndexLayout() {
+        // The macOS side memcpys [GpuBinTileEntry] into the TileIndex buffer the render
+        // kernels read — same two-UInt32 layout, stride 8.
+        XCTAssertEqual(MemoryLayout<GpuBinTileEntry>.stride, 8)
+        XCTAssertEqual(MemoryLayout<GpuBinTileEntry>.size, 8)
+    }
+}
 /// Per-tile eligibility: cuts and markers force per-stroke; noise is allowed (handled by
 /// the noise-capable per-tile kernel). Pure, runs on Linux.
 final class LivePerTileEligibilityTests: XCTestCase {

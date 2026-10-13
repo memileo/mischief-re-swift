@@ -1391,3 +1391,194 @@ kernel void livePerTileNoiseCompositeKernel(
 
     if (acc.a > 0.0001f) target.write(acc, pixel);
 }
+
+// MARK: - GPU tile binning (live view `bin` stage)
+//
+// Moves the per-frame bulk CPU work — camera re-mapping, per-segment tile ranges, tile
+// counts, tile-list scatter — onto the GPU. The reference-space segments are uploaded
+// ONCE per document/layer into a persistent buffer; per frame the CPU only uploads a few
+// KB (visible-stroke bytes, params, the prefixed tile table) and reads back the tile
+// counts (one tile grid of uints).
+//
+// Pixel contract (see `GpuBinSpec`): the transform + range maths below mirror the Swift
+// `LiveRenderCache.remap` + `buildSegmentTileIndicesBoxed` op order exactly, with the
+// same truncation-toward-zero int conversion and clamps. The padding is conservative
+// (~1px beyond the ink), so even a 1-ulp compiler difference can only add empty tiles,
+// never drop inked ones. Scatter order is restored by `liveBinSortTilesKernel`, so the
+// render kernels see the same ascending document order the CPU binner produces — the
+// render kernels themselves are UNTOUCHED by this work.
+//
+// Only per-tile-eligible layers use this path (no cuts, no markers — enforced on the
+// CPU, which falls back to the CPU binning when ineligible). `isMarker` is therefore
+// hardcoded to the plain `1.4r + 1` padding here, exactly like the CPU per-tile plan.
+
+// `LiveBinTransformParams` — must match the Swift struct field for field (scalars only).
+struct LiveBinTransformParams {
+    uint  segCount;
+    uint  tilesPerRow;
+    uint  tilesPerCol;
+    uint  tileSize;
+    float texW;
+    float texH;
+    float invTile;
+    float radiusFactor;
+    float camA;
+    float camB;
+    float camC;
+    float camD;
+    float camTX;
+    float camTY;
+};
+
+// `LiveBinBoxParams` — must match the Swift struct field for field (scalars only).
+struct LiveBinBoxParams {
+    uint segCount;
+    int  boxMinX;
+    int  boxMinY;
+    int  boxW;
+    int  boxH;
+    uint tilesPerRow;
+};
+
+// Per-segment camera transform + tile range. One thread per reference segment; the grid
+// is 1D (`thread_position_in_grid.x`). Culled strokes (visible == 0) emit the
+// `SegTileRange.empty` sentinel (1,0,0,0), which the count/scatter kernels skip exactly
+// like the CPU `isValid` check does.
+kernel void liveBinTransformRangesKernel(
+    constant LiveBinTransformParams &p [[buffer(0)]],
+    const device GPUSplineSegment *refSegs [[buffer(1)]],
+    const device uint *segStroke [[buffer(2)]],
+    const device uchar *strokeVisible [[buffer(3)]],
+    device GPUSplineSegment *outSegs [[buffer(4)]],
+    device int4 *outRanges [[buffer(5)]],
+    uint3 tpg [[thread_position_in_grid]])
+{
+    uint gid = tpg.x;
+    if (gid >= p.segCount) return;
+
+    GPUSplineSegment s = refSegs[gid];
+    uint sId = segStroke[gid];
+    if (strokeVisible[sId] == 0) {
+        outSegs[gid] = s;
+        outRanges[gid] = int4(1, 0, 0, 0);
+        return;
+    }
+
+    // Mirror of `LiveRenderCache.remap` in full-math form (branch-free here evaluates to
+    // the identical values: x*1+0 is exact in IEEE, 0*anything+0 is 0).
+    float2 p0 = float2(p.camA * s.p0.x + p.camC * s.p0.y + p.camTX,
+                       p.camB * s.p0.x + p.camD * s.p0.y + p.camTY);
+    float2 p1 = float2(p.camA * s.p1.x + p.camC * s.p1.y + p.camTX,
+                       p.camB * s.p1.x + p.camD * s.p1.y + p.camTY);
+    float2 p2 = float2(p.camA * s.p2.x + p.camC * s.p2.y + p.camTX,
+                       p.camB * s.p2.x + p.camD * s.p2.y + p.camTY);
+    float2 p3 = float2(p.camA * s.p3.x + p.camC * s.p3.y + p.camTX,
+                       p.camB * s.p3.x + p.camD * s.p3.y + p.camTY);
+    float r0 = s.radius0 * p.radiusFactor;
+    float r1 = s.radius1 * p.radiusFactor;
+    float prune = as_type<float>(s.padding1) * p.radiusFactor;
+
+    GPUSplineSegment o;
+    o.p0 = p0; o.p1 = p1; o.p2 = p2; o.p3 = p3;
+    o.radius0 = r0; o.radius1 = r1;
+    o.opacity0 = s.opacity0; o.opacity1 = s.opacity1;
+    o.noiseSeed = s.noiseSeed; o.segmentType = s.segmentType;
+    o.padding1 = as_type<uint>(prune); o.padding2 = s.padding2;
+    outSegs[gid] = o;
+
+    // Mirror of `buildSegmentTileIndicesBoxed` with isMarker == false (per-tile layers
+    // never contain markers): pad = 1.4 * rMax + 1, strict-inequality off-canvas cull,
+    // truncation-toward-zero int conversion, clamp to the grid.
+    float rMax = max(r0, r1);
+    float pad = 1.4f * rMax + 1.0f;
+    float minX = min(p1.x, p2.x) - pad;
+    float maxX = max(p1.x, p2.x) + pad;
+    float minY = min(p1.y, p2.y) - pad;
+    float maxY = max(p1.y, p2.y) + pad;
+    if (maxX < 0.0f || minX > p.texW || maxY < 0.0f || minY > p.texH) {
+        outRanges[gid] = int4(1, 0, 0, 0);
+        return;
+    }
+    int rowLimit = int(p.tilesPerRow) - 1;
+    int colLimit = int(p.tilesPerCol) - 1;
+    int minTX = max(0, min(rowLimit, int(minX * p.invTile)));
+    int maxTX = max(0, min(rowLimit, int(maxX * p.invTile)));
+    int minTY = max(0, min(colLimit, int(minY * p.invTile)));
+    int maxTY = max(0, min(colLimit, int(maxY * p.invTile)));
+    if (minTX > maxTX || minTY > maxTY) {
+        outRanges[gid] = int4(1, 0, 0, 0);
+        return;
+    }
+    outRanges[gid] = int4(minTX, minTY, maxTX, maxTY);
+}
+
+// Per-tile incidence counts over the layer box (box-local indexing). Order-free —
+// atomics are safe here because only the totals matter, not the sequence.
+kernel void liveBinCountKernel(
+    constant LiveBinBoxParams &p [[buffer(0)]],
+    const device int4 *ranges [[buffer(1)]],
+    device atomic_uint *counts [[buffer(2)]],
+    uint3 tpg [[thread_position_in_grid]])
+{
+    uint gid = tpg.x;
+    if (gid >= p.segCount) return;
+    int4 r = ranges[gid];
+    if (r.x > r.z || r.y > r.w) return;   // mirrors SegTileRange.isValid
+    for (int ty = r.y; ty <= r.w; ++ty) {
+        int tbase = (ty - p.boxMinY) * p.boxW - p.boxMinX;
+        for (int tx = r.x; tx <= r.z; ++tx) {
+            uint t = uint(tbase + tx);
+            atomic_fetch_add_explicit(&counts[t], 1u, memory_order_relaxed);
+        }
+    }
+}
+
+// Scatter segment indices into the tile list. Runs AFTER the CPU prefix-sum seeds
+// `heads` with the per-tile starts; the atomic bump hands out unique slots.
+// Deliberately unordered (parallel) — `liveBinSortTilesKernel` restores document order.
+kernel void liveBinScatterKernel(
+    constant LiveBinBoxParams &p [[buffer(0)]],
+    const device int4 *ranges [[buffer(1)]],
+    const device uint *starts [[buffer(2)]],
+    device atomic_uint *heads [[buffer(3)]],
+    device uint *tileList [[buffer(4)]],
+    uint3 tpg [[thread_position_in_grid]])
+{
+    uint gid = tpg.x;
+    if (gid >= p.segCount) return;
+    int4 r = ranges[gid];
+    if (r.x > r.z || r.y > r.w) return;
+    for (int ty = r.y; ty <= r.w; ++ty) {
+        int tbase = (ty - p.boxMinY) * p.boxW - p.boxMinX;
+        for (int tx = r.x; tx <= r.z; ++tx) {
+            uint t = uint(tbase + tx);
+            uint pos = atomic_fetch_add_explicit(&heads[t], 1u, memory_order_relaxed);
+            tileList[starts[t] + pos] = gid;
+        }
+    }
+}
+
+// Restore ascending document order within each tile's slice (one thread per tile).
+// The CPU scatter is stable, so sorted-ascending == the exact CPU tile list, which is
+// what makes the per-tile render kernel's stroke grouping correct.
+kernel void liveBinSortTilesKernel(
+    constant LiveBinBoxParams &p [[buffer(0)]],
+    const device TileIndex *tiles [[buffer(1)]],
+    device uint *tileList [[buffer(2)]],
+    uint3 tpg [[thread_position_in_grid]])
+{
+    uint t = tpg.x;
+    uint tileCount = uint(p.boxW) * uint(p.boxH);
+    if (t >= tileCount) return;
+    uint start = tiles[t].start;
+    uint count = tiles[t].count;
+    for (uint i = 1; i < count; ++i) {
+        uint key = tileList[start + i];
+        uint j = i;
+        while (j > 0 && tileList[start + j - 1] > key) {
+            tileList[start + j] = tileList[start + j - 1];
+            --j;
+        }
+        tileList[start + j] = key;
+    }
+}
