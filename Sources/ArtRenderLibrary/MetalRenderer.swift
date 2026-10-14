@@ -82,6 +82,11 @@ class MetalRenderer {
     // GPU tile-binning kernels (live view `bin` stage). All optional: a metallib that
     // predates them (or ART_LIVE_GPUBIN=0) silently uses the CPU binning instead.
     internal var liveBinTransformCountPipeline: MTLComputePipelineState?
+    // Gather-path kernels (clustered/zoomed-out layers): pure transform (no atomics),
+    // per-tile gather-count and gather-fill (ordered by construction, no sort).
+    internal var liveBinTransformPipeline: MTLComputePipelineState?
+    internal var liveBinGatherCountPipeline: MTLComputePipelineState?
+    internal var liveBinGatherFillPipeline: MTLComputePipelineState?
     internal var liveBinScatterPipeline: MTLComputePipelineState?
     internal var liveBinSortTilesPipeline: MTLComputePipelineState?
     /// Per-layer GPU-binning state, keyed by layer index. Entries are validated against

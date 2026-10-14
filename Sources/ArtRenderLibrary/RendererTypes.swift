@@ -281,6 +281,19 @@ public enum LiveConfig {
         return env["ART_LIVE_BINTIME"] == "1"
     }
 
+    /// Gather-path budget: layers with boxTiles × segCount at or below this use the
+    /// contention-free gather binning; above it the scatter+sort path runs.
+    /// `ART_LIVE_GATHER=0` forces scatter everywhere; a positive number sets a custom
+    /// budget (default 256M — comfortably between a clustered layer at ~64M and kaos
+    /// at ~2.5B). Pure environment function, runs on Linux.
+    public static func gatherBudget(environment: [String: String]? = nil) -> Int64 {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        guard let raw = env["ART_LIVE_GATHER"], let v = Int64(raw), v >= 0 else {
+            return 256_000_000
+        }
+        return v
+    }
+
     /// Tile size for the *live* binning/dispatch. Resolution order:
     /// `ART_LIVE_TILE_SIZE` → `ART_TILE_SIZE` → 16 (the measured default).
     /// The static path keeps its own default (32); only the live path uses this.
@@ -349,9 +362,19 @@ public enum GpuBinSpec {
                 max(acc.maxX, box.maxX), max(acc.maxY, box.maxY))
     }
 
+    /// Gather-vs-scatter selection. The gather walk costs ~2 × boxTiles × segCount
+    /// cheap range tests (count + fill passes) with zero atomics and no sort, while the
+    /// scatter path costs ~incidences contended atomic adds plus a per-tile sort that
+    /// goes latency-bound on dense tiles. At or below the budget gather wins
+    /// (clustered / zoomed-out layers); above it scatter wins (large even spreads).
+    /// Int64 product — boxTiles × segCount overflows 32 bits on kaos-scale documents.
+    public static func useGather(boxTiles: Int, segCount: Int, budget: Int64) -> Bool {
+        Int64(boxTiles) * Int64(segCount) <= budget
+    }
+
     /// Prefix-sums per-tile counts into per-tile (start, count) entries plus the grand
-    /// total (the tile-list size). `starts[t]` is both the scatter head seed and
-    /// `entries[t].start` — the single source of truth the GPU scatter/sort/render agree on.
+    /// total (the tile-list size). `entries[t].start` is the tile's tile-list slice —
+    /// the single source of truth the GPU scatter/sort/gather/render agree on.
     public static func combine(counts: [UInt32])
         -> (entries: [GpuBinTileEntry], starts: [UInt32], total: Int) {
         var entries = [GpuBinTileEntry]()

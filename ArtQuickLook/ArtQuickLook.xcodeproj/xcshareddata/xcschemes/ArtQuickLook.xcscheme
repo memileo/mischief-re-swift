@@ -54,7 +54,7 @@
       </BuildableProductRunnable>
       <EnvironmentVariables>
          <EnvironmentVariable
-            key = "ART_LIVE_PERTILE"
+            key = "ART_LIVE_BINTIME"
             value = "1"
             isEnabled = "YES">
          </EnvironmentVariable>

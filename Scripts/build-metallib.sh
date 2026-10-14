@@ -60,6 +60,9 @@ LIVE_KERNELS=(
     livePerTileAACompositeKernel
     livePerTileNoiseCompositeKernel
     liveBinTransformCountKernel
+    liveBinTransformKernel
+    liveBinGatherCountKernel
+    liveBinGatherFillKernel
     liveBinScatterKernel
     liveBinSortTilesKernel
 )

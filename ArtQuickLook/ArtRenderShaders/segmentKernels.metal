@@ -1440,6 +1440,36 @@ struct LiveBinBoxParams {
     uint tilesPerRow;
 };
 
+// Tile range for one camera-transformed segment: mirror of
+// `buildSegmentTileIndicesBoxed` with isMarker == false (per-tile layers never contain
+// markers): pad = 1.4 * rMax + 1, strict-inequality off-canvas cull,
+// truncation-toward-zero int conversion, clamp to the grid. Returns the
+// `SegTileRange.empty` sentinel (1,0,0,0) when off-canvas or degenerate. Shared by the
+// fused transform+count kernel and the pure transform kernel so the two binning paths
+// can never disagree on ranges.
+inline int4 liveBinRangeForSeg(constant LiveBinTransformParams &p,
+                               float2 p1, float2 p2, float r0, float r1) {
+    float rMax = max(r0, r1);
+    float pad = 1.4f * rMax + 1.0f;
+    float minX = min(p1.x, p2.x) - pad;
+    float maxX = max(p1.x, p2.x) + pad;
+    float minY = min(p1.y, p2.y) - pad;
+    float maxY = max(p1.y, p2.y) + pad;
+    if (maxX < 0.0f || minX > p.texW || maxY < 0.0f || minY > p.texH) {
+        return int4(1, 0, 0, 0);
+    }
+    int rowLimit = int(p.tilesPerRow) - 1;
+    int colLimit = int(p.tilesPerCol) - 1;
+    int minTX = max(0, min(rowLimit, int(minX * p.invTile)));
+    int maxTX = max(0, min(rowLimit, int(maxX * p.invTile)));
+    int minTY = max(0, min(colLimit, int(minY * p.invTile)));
+    int maxTY = max(0, min(colLimit, int(maxY * p.invTile)));
+    if (minTX > maxTX || minTY > maxTY) {
+        return int4(1, 0, 0, 0);
+    }
+    return int4(minTX, minTY, maxTX, maxTY);
+}
+
 // Per-segment camera transform + tile range + tile incidence counts, fused in one
 // dispatch. One thread per reference segment; the grid is 1D
 // (`thread_position_in_grid.x`). Culled strokes (visible == 0) emit the
@@ -1493,31 +1523,9 @@ kernel void liveBinTransformCountKernel(
     o.padding1 = as_type<uint>(prune); o.padding2 = s.padding2;
     outSegs[gid] = o;
 
-    // Mirror of `buildSegmentTileIndicesBoxed` with isMarker == false (per-tile layers
-    // never contain markers): pad = 1.4 * rMax + 1, strict-inequality off-canvas cull,
-    // truncation-toward-zero int conversion, clamp to the grid.
-    float rMax = max(r0, r1);
-    float pad = 1.4f * rMax + 1.0f;
-    float minX = min(p1.x, p2.x) - pad;
-    float maxX = max(p1.x, p2.x) + pad;
-    float minY = min(p1.y, p2.y) - pad;
-    float maxY = max(p1.y, p2.y) + pad;
-    if (maxX < 0.0f || minX > p.texW || maxY < 0.0f || minY > p.texH) {
-        outRanges[gid] = int4(1, 0, 0, 0);
-        return;
-    }
-    int rowLimit = int(p.tilesPerRow) - 1;
-    int colLimit = int(p.tilesPerCol) - 1;
-    int minTX = max(0, min(rowLimit, int(minX * p.invTile)));
-    int maxTX = max(0, min(rowLimit, int(maxX * p.invTile)));
-    int minTY = max(0, min(colLimit, int(minY * p.invTile)));
-    int maxTY = max(0, min(colLimit, int(maxY * p.invTile)));
-    if (minTX > maxTX || minTY > maxTY) {
-        outRanges[gid] = int4(1, 0, 0, 0);
-        return;
-    }
-    int4 r = int4(minTX, minTY, maxTX, maxTY);
+    int4 r = liveBinRangeForSeg(p, p1, p2, r0, r1);
     outRanges[gid] = r;
+    if (r.x > r.z || r.y > r.w) return;   // empty sentinel — nothing to count
     // Fused count over the layer box (box-local indexing): same totals the old
     // standalone count kernel produced, straight from registers.
     for (int ty = r.y; ty <= r.w; ++ty) {
@@ -1525,6 +1533,107 @@ kernel void liveBinTransformCountKernel(
         for (int tx = r.x; tx <= r.z; ++tx) {
             uint t = uint(tbase + tx);
             atomic_fetch_add_explicit(&counts[t], 1u, memory_order_relaxed);
+        }
+    }
+}
+
+// Pure camera transform + tile range (no counting). Used by the gather path, which
+// derives its counts contention-free below — running the fused kernel there would pay
+// for contended atomics whose results get overwritten anyway.
+kernel void liveBinTransformKernel(
+    constant LiveBinTransformParams &p [[buffer(0)]],
+    const device GPUSplineSegment *refSegs [[buffer(1)]],
+    const device uint *segStroke [[buffer(2)]],
+    const device uchar *strokeVisible [[buffer(3)]],
+    device GPUSplineSegment *outSegs [[buffer(4)]],
+    device int4 *outRanges [[buffer(5)]],
+    uint3 tpg [[thread_position_in_grid]])
+{
+    uint gid = tpg.x;
+    if (gid >= p.segCount) return;
+
+    GPUSplineSegment s = refSegs[gid];
+    uint sId = segStroke[gid];
+    if (strokeVisible[sId] == 0) {
+        outSegs[gid] = s;
+        outRanges[gid] = int4(1, 0, 0, 0);
+        return;
+    }
+
+    float2 p0 = float2(p.camA * s.p0.x + p.camC * s.p0.y + p.camTX,
+                       p.camB * s.p0.x + p.camD * s.p0.y + p.camTY);
+    float2 p1 = float2(p.camA * s.p1.x + p.camC * s.p1.y + p.camTX,
+                       p.camB * s.p1.x + p.camD * s.p1.y + p.camTY);
+    float2 p2 = float2(p.camA * s.p2.x + p.camC * s.p2.y + p.camTX,
+                       p.camB * s.p2.x + p.camD * s.p2.y + p.camTY);
+    float2 p3 = float2(p.camA * s.p3.x + p.camC * s.p3.y + p.camTX,
+                       p.camB * s.p3.x + p.camD * s.p3.y + p.camTY);
+    float r0 = s.radius0 * p.radiusFactor;
+    float r1 = s.radius1 * p.radiusFactor;
+    float prune = as_type<float>(s.padding1) * p.radiusFactor;
+
+    GPUSplineSegment o;
+    o.p0 = p0; o.p1 = p1; o.p2 = p2; o.p3 = p3;
+    o.radius0 = r0; o.radius1 = r1;
+    o.opacity0 = s.opacity0; o.opacity1 = s.opacity1;
+    o.noiseSeed = s.noiseSeed; o.segmentType = s.segmentType;
+    o.padding1 = as_type<uint>(prune); o.padding2 = s.padding2;
+    outSegs[gid] = o;
+    outRanges[gid] = liveBinRangeForSeg(p, p1, p2, r0, r1);
+}
+
+// Gather-path tile binning (clustered artwork / zoomed-out views): one thread per tile
+// walks ALL segments in document order and keeps the ones covering its tile. Perfectly
+// load-balanced (every tile runs exactly segCount iterations — no divergence in loop
+// count), zero atomics, and the list comes out in ascending order BY CONSTRUCTION, so
+// no sort is needed. Costs O(boxTiles × segCount) cheap range tests, so the CPU picks
+// this path only when that product is small (see `GpuBinSpec.useGather`); the
+// scatter+sort path stays for large even distributions like kaos.
+
+// Pass 1: per-tile incidence counts. Plain stores (each tile written by exactly its
+// own thread) — the CPU prefix-sums these exactly like the atomic counts.
+kernel void liveBinGatherCountKernel(
+    constant LiveBinBoxParams &p [[buffer(0)]],
+    const device int4 *ranges [[buffer(1)]],
+    device uint *counts [[buffer(2)]],
+    uint3 tpg [[thread_position_in_grid]])
+{
+    uint t = tpg.x;
+    uint tileCount = uint(p.boxW) * uint(p.boxH);
+    if (t >= tileCount) return;
+    int atx = p.boxMinX + int(t % uint(p.boxW));
+    int aty = p.boxMinY + int(t / uint(p.boxW));
+    uint n = 0;
+    for (uint gid = 0; gid < p.segCount; ++gid) {
+        int4 r = ranges[gid];
+        // The empty sentinel (1,0,0,0) has x > z, so it fails this test automatically.
+        if (r.x <= atx && atx <= r.z && r.y <= aty && aty <= r.w) ++n;
+    }
+    counts[t] = n;
+}
+
+// Pass 2 (after the CPU prefix): fill each tile's slice in ascending segment order.
+// `dst < end` bounds the walk AND the writes: the count pass guarantees exactly
+// `count` matches, so the slice fills exactly.
+kernel void liveBinGatherFillKernel(
+    constant LiveBinBoxParams &p [[buffer(0)]],
+    const device int4 *ranges [[buffer(1)]],
+    const device TileIndex *tiles [[buffer(2)]],
+    device uint *tileList [[buffer(3)]],
+    uint3 tpg [[thread_position_in_grid]])
+{
+    uint t = tpg.x;
+    uint tileCount = uint(p.boxW) * uint(p.boxH);
+    if (t >= tileCount) return;
+    int atx = p.boxMinX + int(t % uint(p.boxW));
+    int aty = p.boxMinY + int(t / uint(p.boxW));
+    uint dst = tiles[t].start;
+    uint end = dst + tiles[t].count;
+    for (uint gid = 0; gid < p.segCount && dst < end; ++gid) {
+        int4 r = ranges[gid];
+        if (r.x <= atx && atx <= r.z && r.y <= aty && aty <= r.w) {
+            tileList[dst] = gid;
+            ++dst;
         }
     }
 }
