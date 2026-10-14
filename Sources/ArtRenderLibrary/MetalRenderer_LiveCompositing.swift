@@ -907,9 +907,12 @@ extension MetalRenderer {
         starts.withUnsafeBytes { raw in
             if let src = raw.baseAddress {
                 memcpy(startsBuf.contents(), src, raw.count)
-                memcpy(heads.contents(), src, raw.count)          // heads seeded with starts
             }
         }
+        // Scatter heads are per-tile bump counters starting at 0: the kernel writes
+        // slot `starts[t] + bump(heads[t])`, so seeding heads with starts would add
+        // the base twice and store past the tile list (GPU validation fault + hangs).
+        memset(heads.contents(), 0, boxTiles * MemoryLayout<UInt32>.size)
         liveTiming.binMilliseconds += Self.milliseconds(since: prefixStart)
 
         // ── CB2: scatter + sort + per-tile render + layer composite, one encoder so all

@@ -281,6 +281,30 @@ final class GpuBinSpecTests: XCTestCase {
         XCTAssertEqual(MemoryLayout<GpuBinTileEntry>.stride, 8)
         XCTAssertEqual(MemoryLayout<GpuBinTileEntry>.size, 8)
     }
+
+    func testScatterProtocolStaysInBounds() {
+        // Locks the CPU↔GPU scatter contract that `liveBinScatterKernel` implements:
+        // heads are bump counters ZEROED before dispatch, slot = starts[t] + bump.
+        // Simulates the scatter sequentially (order irrelevant — every slot must be
+        // unique and within the tile list). The Oct-2026 double-base bug seeded heads
+        // with starts, writing starts[t]+starts[t]+k past the allocation.
+        let counts: [UInt32] = [1, 0, 3, 2, 5, 0, 1]
+        let (_, starts, total) = GpuBinSpec.combine(counts: counts)
+        var heads = [UInt32](repeating: 0, count: counts.count)   // zeroed, as shipped
+        var maxSlot = -1
+        var slots = Set<Int>()
+        for t in 0..<counts.count {
+            for _ in 0..<counts[t] {
+                let pos = Int(heads[t]); heads[t] += 1
+                let slot = Int(starts[t]) + pos
+                XCTAssertLessThan(slot, total, "tile \(t) scatters past the tile list")
+                slots.insert(slot)
+                maxSlot = max(maxSlot, slot)
+            }
+        }
+        XCTAssertEqual(slots.count, total, "every incidence owns a unique slot")
+        if total > 0 { XCTAssertEqual(maxSlot, total - 1) }
+    }
 }
 /// Per-tile eligibility: cuts and markers force per-stroke; noise is allowed (handled by
 /// the noise-capable per-tile kernel). Pure, runs on Linux.

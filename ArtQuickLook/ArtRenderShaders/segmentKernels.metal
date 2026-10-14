@@ -1533,8 +1533,9 @@ kernel void liveBinCountKernel(
     }
 }
 
-// Scatter segment indices into the tile list. Runs AFTER the CPU prefix-sum seeds
-// `heads` with the per-tile starts; the atomic bump hands out unique slots.
+// Scatter segment indices into the tile list. `heads` are per-tile bump counters that
+// must be ZEROED before dispatch; each thread writes slot `starts[t] + bump(heads[t])`.
+// (Seeding heads with starts would add the base twice and store past the tile list.)
 // Deliberately unordered (parallel) — `liveBinSortTilesKernel` restores document order.
 kernel void liveBinScatterKernel(
     constant LiveBinBoxParams &p [[buffer(0)]],
