@@ -1559,9 +1559,29 @@ kernel void liveBinScatterKernel(
     }
 }
 
+// Max-heap sift-down over `list[0, heapEnd)`: drops `v` from `root` to its heap
+// position. Iterative (no recursion/stack) and in-place — Metal-2 safe.
+inline void liveBinSiftDown(device uint *list, uint root, uint v, uint heapEnd) {
+    for (;;) {
+        uint left = root * 2 + 1;
+        if (left >= heapEnd) break;
+        uint right = left + 1;
+        uint child = (right < heapEnd && list[right] > list[left]) ? right : left;
+        if (list[child] <= v) break;
+        list[root] = list[child];
+        root = child;
+    }
+    list[root] = v;
+}
+
 // Restore ascending document order within each tile's slice (one thread per tile).
 // The CPU scatter is stable, so sorted-ascending == the exact CPU tile list, which is
 // what makes the per-tile render kernel's stroke grouping correct.
+//
+// Heapsort (O(n log n) worst case), NOT insertion sort: clustered artwork packs
+// thousands of incidences into a few tiles, where insertion sort's O(n²) stalls a
+// whole GPU thread for hundreds of ms (evenly-spread docs never notice — ~200/tile).
+// Segment indices are unique, so stability is irrelevant; only ascending order matters.
 kernel void liveBinSortTilesKernel(
     constant LiveBinBoxParams &p [[buffer(0)]],
     const device TileIndex *tiles [[buffer(1)]],
@@ -1571,15 +1591,16 @@ kernel void liveBinSortTilesKernel(
     uint t = tpg.x;
     uint tileCount = uint(p.boxW) * uint(p.boxH);
     if (t >= tileCount) return;
-    uint start = tiles[t].start;
     uint count = tiles[t].count;
-    for (uint i = 1; i < count; ++i) {
-        uint key = tileList[start + i];
-        uint j = i;
-        while (j > 0 && tileList[start + j - 1] > key) {
-            tileList[start + j] = tileList[start + j - 1];
-            --j;
-        }
-        tileList[start + j] = key;
+    if (count < 2) return;
+    device uint *list = tileList + tiles[t].start;
+    for (uint i = count / 2; i > 0; --i) {
+        liveBinSiftDown(list, i - 1, list[i - 1], count);
+    }
+    for (uint end = count; end > 1; --end) {
+        uint maxV = list[0];
+        // Move the tail into the root, restore the heap over [0, end - 1), park max.
+        liveBinSiftDown(list, 0, list[end - 1], end - 1);
+        list[end - 1] = maxV;
     }
 }

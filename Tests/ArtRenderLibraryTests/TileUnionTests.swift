@@ -282,6 +282,63 @@ final class GpuBinSpecTests: XCTestCase {
         XCTAssertEqual(MemoryLayout<GpuBinTileEntry>.size, 8)
     }
 
+    /// Swift mirror of `liveBinSortTilesKernel`'s heapsort (+ `liveBinSiftDown`), kept
+    /// structurally identical so this test guards the algorithm the GPU runs. The kernel
+    /// must emit ascending document order for any tile density — clustered artwork packs
+    /// thousands of entries per tile, where the old insertion sort went quadratic.
+    private func heapSort(_ list: inout [UInt32]) {
+        func siftDown(_ list: inout [UInt32], _ root: Int, _ v: UInt32, _ heapEnd: Int) {
+            var root = root
+            while true {
+                let left = root * 2 + 1
+                if left >= heapEnd { break }
+                let right = left + 1
+                let child = (right < heapEnd && list[right] > list[left]) ? right : left
+                if list[child] <= v { break }
+                list[root] = list[child]
+                root = child
+            }
+            list[root] = v
+        }
+        let n = list.count
+        guard n >= 2 else { return }
+        var i = n / 2
+        while i > 0 {
+            i -= 1
+            siftDown(&list, i, list[i], n)
+        }
+        var end = n
+        while end > 1 {
+            end -= 1
+            let maxV = list[0]
+            siftDown(&list, 0, list[end], end)
+            list[end] = maxV
+        }
+    }
+
+    func testHeapSortOrdersAllDensities() {
+        // Reverse-sorted dense tile: the clustered worst case (insertion sort O(n²)).
+        var denseArr = (0 as UInt32..<5000).reversed()
+        var dense = Array(denseArr)
+        heapSort(&dense)
+        XCTAssertEqual(dense, Array(0 as UInt32..<5000))
+        // Deterministic pseudo-random order, plus edge sizes.
+        var rng: UInt64 = 0x12345679
+        var random = (0..<3000).map { _ in
+            rng = rng &* 6364136223846793005 &+ 1442695040888963407
+            return UInt32(truncatingIfNeeded: rng >> 33)
+        }
+        let expected = random.sorted()
+        heapSort(&random)
+        XCTAssertEqual(random, expected)
+        var empty: [UInt32] = []
+        heapSort(&empty)
+        XCTAssertTrue(empty.isEmpty)
+        var single: [UInt32] = [42]
+        heapSort(&single)
+        XCTAssertEqual(single, [42])
+    }
+
     func testScatterProtocolStaysInBounds() {
         // Locks the CPU↔GPU scatter contract that `liveBinScatterKernel` implements:
         // heads are bump counters ZEROED before dispatch, slot = starts[t] + bump.
