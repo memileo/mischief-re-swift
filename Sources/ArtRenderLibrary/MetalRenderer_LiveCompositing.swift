@@ -207,8 +207,7 @@ extension MetalRenderer {
         // metallib without them (or ART_LIVE_GPUBIN=0) silently uses the CPU binning.
         // Missing ones are NOT in `failures` — they must never fail the whole live view.
         let binKernels: [(String, (MTLComputePipelineState?) -> Void)] = [
-            ("liveBinTransformRangesKernel", { self.liveBinTransformRangesPipeline = $0 }),
-            ("liveBinCountKernel", { self.liveBinCountPipeline = $0 }),
+            ("liveBinTransformCountKernel", { self.liveBinTransformCountPipeline = $0 }),
             ("liveBinScatterKernel", { self.liveBinScatterPipeline = $0 }),
             ("liveBinSortTilesKernel", { self.liveBinSortTilesPipeline = $0 }),
         ]
@@ -225,7 +224,7 @@ extension MetalRenderer {
                 assign(nil)
             }
         }
-        if liveBinTransformRangesPipeline != nil {
+        if liveBinTransformCountPipeline != nil {
             print("Live view: GPU tile binning ready")
         }
 
@@ -732,8 +731,7 @@ extension MetalRenderer {
                                               width: Int, height: Int,
                                               opacity: Float) throws -> Bool {
         guard LiveConfig.gpuBinEnabled() else { return false }
-        guard let transformPipe = liveBinTransformRangesPipeline,
-              let countPipe = liveBinCountPipeline,
+        guard let transformPipe = liveBinTransformCountPipeline,
               let scatterPipe = liveBinScatterPipeline,
               let sortPipe = liveBinSortTilesPipeline,
               let compositePipeline = liveCompositeLayerPipeline else { return false }
@@ -809,17 +807,19 @@ extension MetalRenderer {
         if !needsNoise && livePerTileAACompositePipeline == nil { return false }
         try ensureBinFrameBuffers(device: device, ref: ref, boxTiles: boxTiles)
         guard let frameSegs = ref.frameSegments, let ranges = ref.ranges,
-              let counts = ref.counts, let tileIndexBuf = ref.tileIndex else {
+              let counts = ref.counts, let staging = ref.countsStaging,
+              let heads = ref.heads, let startsBuf = ref.starts,
+              let tileIndexBuf = ref.tileIndex else {
             return false
         }
 
-        // Visible-stroke bytes + zeroed counts.
+        // Visible-stroke bytes (shared buffer, CPU-written). Counts/heads are .private
+        // and zeroed on the GPU (blit fill) inside the command buffers below.
         var visBytes = [UInt8](repeating: 0, count: ref.strokeCount)
         for id in visStrokeIDs { visBytes[id] = 1 }
         visBytes.withUnsafeBytes { raw in
             if let src = raw.baseAddress { memcpy(ref.strokeVisible.contents(), src, raw.count) }
         }
-        memset(counts.contents(), 0, boxTiles * MemoryLayout<UInt32>.size)
 
         // Same radius factor formula as `deviceOps` — passed in, never recomputed on GPU.
         let scaleX = sqrt(camera.a * camera.a + camera.c * camera.c)
@@ -843,14 +843,19 @@ extension MetalRenderer {
         try ensureRenderTargets(width: width, height: height)
         try clearTexture(gpuRenderTarget!)
 
-        // ── CB1: transform + ranges, then counts. One wait; its time is GPU time.
+        // ── CB1: zero counts, fused transform+count, copy counts to staging for the
+        // CPU prefix. Encoders in one command buffer retire in order. One wait; GPU time.
         let binThreads = MTLSize(width: 256, height: 1, depth: 1)
         func binGroups(_ n: Int) -> MTLSize {
             MTLSize(width: (n + 255) / 256, height: 1, depth: 1)
         }
+        let countBytes = boxTiles * MemoryLayout<UInt32>.size
         var clock = DispatchTime.now().uptimeNanoseconds
         guard let cb1 = queue.makeCommandBuffer(),
-              let enc1 = cb1.makeComputeCommandEncoder() else { return false }
+              let zeroEnc = cb1.makeBlitCommandEncoder() else { return false }
+        zeroEnc.fill(buffer: counts, range: 0..<countBytes, value: 0)
+        zeroEnc.endEncoding()
+        guard let enc1 = cb1.makeComputeCommandEncoder() else { return false }
         enc1.setComputePipelineState(transformPipe)
         enc1.setBytes(&tp, length: MemoryLayout<LiveBinTransformParams>.stride, index: 0)
         enc1.setBuffer(ref.refSegments, offset: 0, index: 1)
@@ -858,13 +863,14 @@ extension MetalRenderer {
         enc1.setBuffer(ref.strokeVisible, offset: 0, index: 3)
         enc1.setBuffer(frameSegs, offset: 0, index: 4)
         enc1.setBuffer(ranges, offset: 0, index: 5)
-        enc1.dispatchThreadgroups(binGroups(ref.segCount), threadsPerThreadgroup: binThreads)
-        enc1.setComputePipelineState(countPipe)
-        enc1.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 0)
-        enc1.setBuffer(ranges, offset: 0, index: 1)
-        enc1.setBuffer(counts, offset: 0, index: 2)
+        enc1.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 6)
+        enc1.setBuffer(counts, offset: 0, index: 7)
         enc1.dispatchThreadgroups(binGroups(ref.segCount), threadsPerThreadgroup: binThreads)
         enc1.endEncoding()
+        guard let copyEnc = cb1.makeBlitCommandEncoder() else { return false }
+        copyEnc.copy(from: counts, sourceOffset: 0,
+                     to: staging, destinationOffset: 0, size: countBytes)
+        copyEnc.endEncoding()
         clock = DispatchTime.now().uptimeNanoseconds
         cb1.commit()
         cb1.waitUntilCompleted()
@@ -876,7 +882,7 @@ extension MetalRenderer {
         var countsArr = [UInt32](repeating: 0, count: boxTiles)
         countsArr.withUnsafeMutableBytes { raw in
             if let dst = raw.baseAddress {
-                memcpy(dst, counts.contents(), boxTiles * MemoryLayout<UInt32>.size)
+                memcpy(dst, staging.contents(), countBytes)
             }
         }
         let (entries, starts, total) = GpuBinSpec.combine(counts: countsArr)
@@ -897,8 +903,7 @@ extension MetalRenderer {
             ref.tileList = buf
             ref.tileListCap = cap
         }
-        guard let tileList = ref.tileList,
-              let heads = ref.heads, let startsBuf = ref.starts else { return false }
+        guard let tileList = ref.tileList else { return false }
         entries.withUnsafeBytes { raw in
             if let src = raw.baseAddress {
                 memcpy(tileIndexBuf.contents(), src, raw.count)   // GpuBinTileEntry == TileIndex
@@ -912,14 +917,90 @@ extension MetalRenderer {
         // Scatter heads are per-tile bump counters starting at 0: the kernel writes
         // slot `starts[t] + bump(heads[t])`, so seeding heads with starts would add
         // the base twice and store past the tile list (GPU validation fault + hangs).
-        memset(heads.contents(), 0, boxTiles * MemoryLayout<UInt32>.size)
+        // Heads are .private — zeroed by blit fill in CB2 below, not by CPU memset.
         liveTiming.binMilliseconds += Self.milliseconds(since: prefixStart)
 
         // ── CB2: scatter + sort + per-tile render + layer composite, one encoder so all
         // dispatches retire in order with coherent memory (same pattern as the CPU path).
+        // With ART_LIVE_BINTIME=1 each stage gets its own command buffer + wait so the
+        // log shows exactly which bin stage costs what (diagnostic only — steady state
+        // keeps the single-CB form to avoid extra round trips).
+        let stageTiming = LiveConfig.binStageTimingEnabled()
+        var tScatter = 0.0, tSort = 0.0, tRender = 0.0
+        func sync(_ cb: MTLCommandBuffer) throws -> Double {
+            let t = DispatchTime.now().uptimeNanoseconds
+            cb.commit()
+            cb.waitUntilCompleted()
+            if let err = cb.error { throw err }
+            return Self.milliseconds(since: t)
+        }
+        if stageTiming {
+            guard let cbH = queue.makeCommandBuffer(),
+                  let fillH = cbH.makeBlitCommandEncoder(),
+                  let cbS = queue.makeCommandBuffer(),
+                  let encS = cbS.makeComputeCommandEncoder(),
+                  let cbO = queue.makeCommandBuffer(),
+                  let encO = cbO.makeComputeCommandEncoder(),
+                  let cbR = queue.makeCommandBuffer(),
+                  let encR = cbR.makeComputeCommandEncoder() else { return false }
+            fillH.fill(buffer: heads, range: 0..<countBytes, value: 0)
+            fillH.endEncoding()
+            _ = try sync(cbH)
+            encS.setComputePipelineState(scatterPipe)
+            encS.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 0)
+            encS.setBuffer(ranges, offset: 0, index: 1)
+            encS.setBuffer(startsBuf, offset: 0, index: 2)
+            encS.setBuffer(heads, offset: 0, index: 3)
+            encS.setBuffer(tileList, offset: 0, index: 4)
+            encS.dispatchThreadgroups(binGroups(ref.segCount), threadsPerThreadgroup: binThreads)
+            encS.endEncoding()
+            tScatter = try sync(cbS)
+            encO.setComputePipelineState(sortPipe)
+            encO.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 0)
+            encO.setBuffer(tileIndexBuf, offset: 0, index: 1)
+            encO.setBuffer(tileList, offset: 0, index: 2)
+            encO.dispatchThreadgroups(binGroups(boxTiles), threadsPerThreadgroup: binThreads)
+            encO.endEncoding()
+            tSort = try sync(cbO)
+            let renderStart = DispatchTime.now().uptimeNanoseconds
+            try encodePerTileBuffers(segBuffer: frameSegs, segOffset: 0,
+                                     strokeOfSegBuffer: ref.segStroke, strokeOfSegOffset: 0,
+                                     tileStartCountBuffer: tileIndexBuf, tileStartCountOffset: 0,
+                                     tileListBuffer: tileList, tileListOffset: 0,
+                                     strokeColorBuffer: ref.strokeColors, strokeColorOffset: 0,
+                                     strokeFlagsBuffer: ref.strokeFlags, strokeFlagsOffset: 0,
+                                     boxMinX: box.minX, boxMinY: box.minY,
+                                     boxWidth: boxW, boxHeight: boxH,
+                                     containsNoise: needsNoise,
+                                     encoder: encR)
+            liveTiming.encodeMilliseconds += Self.milliseconds(since: renderStart)
+            guard let canvas = liveCanvasTexture, let layerTex = gpuRenderTarget else { return false }
+            var layerOpacity = opacity
+            encR.setComputePipelineState(compositePipeline)
+            encR.setTexture(layerTex, index: 0)
+            encR.setTexture(canvas, index: 1)
+            encR.setBytes(&layerOpacity, length: MemoryLayout<Float>.stride, index: 0)
+            encR.dispatchThreadgroups(Self.liveGroups(width: width, height: height),
+                                      threadsPerThreadgroup: Self.liveThreads)
+            encR.endEncoding()
+            tRender = try sync(cbR)
+            liveTiming.gpuMilliseconds += tScatter + tSort + tRender
+            print(String(format: "livebin layer %d: segs %d tiles %d — scatter %.2f sort %.2f render+comp %.2f ms",
+                         position, ref.segCount, boxTiles, tScatter, tSort, tRender))
+            liveTiming.dispatchedTiles += boxTiles
+            liveTiming.sdfEvaluations += total * (liveTile * liveTile)
+            liveTiming.strokes += visStrokeIDs.count
+            var segTotal = 0
+            for id in visStrokeIDs { segTotal += ref.strokeSegCounts[id] }
+            liveTiming.segments += segTotal
+            return true
+        }
         clock = DispatchTime.now().uptimeNanoseconds
         guard let cb2 = queue.makeCommandBuffer(),
-              let enc2 = cb2.makeComputeCommandEncoder() else { return false }
+              let fill2 = cb2.makeBlitCommandEncoder() else { return false }
+        fill2.fill(buffer: heads, range: 0..<countBytes, value: 0)
+        fill2.endEncoding()
+        guard let enc2 = cb2.makeComputeCommandEncoder() else { return false }
         enc2.setComputePipelineState(scatterPipe)
         enc2.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 0)
         enc2.setBuffer(ranges, offset: 0, index: 1)
@@ -1052,8 +1133,16 @@ extension MetalRenderer {
             guard ref.ranges != nil else { throw MetalRendererError.bufferCreationFailed }
         }
         if ref.boxCap < boxTiles {
-            ref.counts = try shared(boxTiles * MemoryLayout<UInt32>.size)
-            ref.heads = try shared(boxTiles * MemoryLayout<UInt32>.size)
+            func priv(_ bytes: Int) throws -> MTLBuffer {
+                guard let buf = device.makeBuffer(length: max(bytes, 1),
+                                                  options: .storageModePrivate) else {
+                    throw MetalRendererError.bufferCreationFailed
+                }
+                return buf
+            }
+            ref.counts = try priv(boxTiles * MemoryLayout<UInt32>.size)
+            ref.countsStaging = try shared(boxTiles * MemoryLayout<UInt32>.size)
+            ref.heads = try priv(boxTiles * MemoryLayout<UInt32>.size)
             ref.starts = try shared(boxTiles * MemoryLayout<UInt32>.size)
             ref.tileIndex = try shared(boxTiles * 8)
             ref.boxCap = boxTiles

@@ -81,8 +81,7 @@ class MetalRenderer {
     internal var livePerTileNoiseCompositePipeline: MTLComputePipelineState?
     // GPU tile-binning kernels (live view `bin` stage). All optional: a metallib that
     // predates them (or ART_LIVE_GPUBIN=0) silently uses the CPU binning instead.
-    internal var liveBinTransformRangesPipeline: MTLComputePipelineState?
-    internal var liveBinCountPipeline: MTLComputePipelineState?
+    internal var liveBinTransformCountPipeline: MTLComputePipelineState?
     internal var liveBinScatterPipeline: MTLComputePipelineState?
     internal var liveBinSortTilesPipeline: MTLComputePipelineState?
     /// Per-layer GPU-binning state, keyed by layer index. Entries are validated against
@@ -111,8 +110,13 @@ internal final class LiveBinRefLayer {
     // Frame buffers (sized geometrically, reused across frames):
     var frameSegments: MTLBuffer?    // N × GPUSplineSegment, device space (.private)
     var ranges: MTLBuffer?           // N × int4 tile ranges (.private)
-    var counts: MTLBuffer?           // boxTiles × UInt32 atomics (.shared: CPU memset+readback)
-    var heads: MTLBuffer?            // boxTiles × UInt32 scatter heads (.shared)
+    // Counts/heads live in .private memory: the count/scatter atomics hammer them from
+    // tens of thousands of threads, and atomics to .shared buffers cross the system
+    // fabric (much slower under contention, exactly the clustered-artwork case). The
+    // CPU only needs the counts back, so one small blit copies them to .shared staging.
+    var counts: MTLBuffer?           // boxTiles × UInt32 atomics (.private)
+    var countsStaging: MTLBuffer?    // boxTiles × UInt32 CPU readback (.shared)
+    var heads: MTLBuffer?            // boxTiles × UInt32 scatter heads (.private)
     var starts: MTLBuffer?           // boxTiles × UInt32 prefix starts (.shared)
     var tileIndex: MTLBuffer?        // boxTiles × TileIndex, render + sort input (.shared)
     var tileList: MTLBuffer?         // incidences × UInt32 (.private)

@@ -59,8 +59,7 @@ LIVE_KERNELS=(
     liveSegmentNoiseCompositeKernel
     livePerTileAACompositeKernel
     livePerTileNoiseCompositeKernel
-    liveBinTransformRangesKernel
-    liveBinCountKernel
+    liveBinTransformCountKernel
     liveBinScatterKernel
     liveBinSortTilesKernel
 )

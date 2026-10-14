@@ -203,6 +203,12 @@ final class LiveConfigTests: XCTestCase {
         XCTAssertFalse(LiveConfig.gpuBinEnabled(environment: ["ART_LIVE_GPUBIN": "0"]))
     }
 
+    func testBinStageTimingDefaultsOff() {
+        XCTAssertFalse(LiveConfig.binStageTimingEnabled(environment: [:]))
+        XCTAssertTrue(LiveConfig.binStageTimingEnabled(environment: ["ART_LIVE_BINTIME": "1"]))
+        XCTAssertFalse(LiveConfig.binStageTimingEnabled(environment: ["ART_LIVE_BINTIME": "0"]))
+    }
+
     func testLiveTileSizeDefaultsSixteen() {
         XCTAssertEqual(LiveConfig.liveTileSize(environment: [:]), 16)
         XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_TILE_SIZE": "32"]), 32)

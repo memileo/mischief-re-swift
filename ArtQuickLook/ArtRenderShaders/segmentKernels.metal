@@ -1440,17 +1440,24 @@ struct LiveBinBoxParams {
     uint tilesPerRow;
 };
 
-// Per-segment camera transform + tile range. One thread per reference segment; the grid
-// is 1D (`thread_position_in_grid.x`). Culled strokes (visible == 0) emit the
-// `SegTileRange.empty` sentinel (1,0,0,0), which the count/scatter kernels skip exactly
+// Per-segment camera transform + tile range + tile incidence counts, fused in one
+// dispatch. One thread per reference segment; the grid is 1D
+// (`thread_position_in_grid.x`). Culled strokes (visible == 0) emit the
+// `SegTileRange.empty` sentinel (1,0,0,0), which the scatter kernel skips exactly
 // like the CPU `isValid` check does.
-kernel void liveBinTransformRangesKernel(
+//
+// Fusion rationale: the count loop reuses the just-computed range straight from
+// registers, saving a dispatch and a full re-read of the ranges buffer. Order-free
+// (atomics only accumulate totals), so fusing changes no pixel.
+kernel void liveBinTransformCountKernel(
     constant LiveBinTransformParams &p [[buffer(0)]],
     const device GPUSplineSegment *refSegs [[buffer(1)]],
     const device uint *segStroke [[buffer(2)]],
     const device uchar *strokeVisible [[buffer(3)]],
     device GPUSplineSegment *outSegs [[buffer(4)]],
     device int4 *outRanges [[buffer(5)]],
+    constant LiveBinBoxParams &b [[buffer(6)]],
+    device atomic_uint *counts [[buffer(7)]],
     uint3 tpg [[thread_position_in_grid]])
 {
     uint gid = tpg.x;
@@ -1509,23 +1516,12 @@ kernel void liveBinTransformRangesKernel(
         outRanges[gid] = int4(1, 0, 0, 0);
         return;
     }
-    outRanges[gid] = int4(minTX, minTY, maxTX, maxTY);
-}
-
-// Per-tile incidence counts over the layer box (box-local indexing). Order-free —
-// atomics are safe here because only the totals matter, not the sequence.
-kernel void liveBinCountKernel(
-    constant LiveBinBoxParams &p [[buffer(0)]],
-    const device int4 *ranges [[buffer(1)]],
-    device atomic_uint *counts [[buffer(2)]],
-    uint3 tpg [[thread_position_in_grid]])
-{
-    uint gid = tpg.x;
-    if (gid >= p.segCount) return;
-    int4 r = ranges[gid];
-    if (r.x > r.z || r.y > r.w) return;   // mirrors SegTileRange.isValid
+    int4 r = int4(minTX, minTY, maxTX, maxTY);
+    outRanges[gid] = r;
+    // Fused count over the layer box (box-local indexing): same totals the old
+    // standalone count kernel produced, straight from registers.
     for (int ty = r.y; ty <= r.w; ++ty) {
-        int tbase = (ty - p.boxMinY) * p.boxW - p.boxMinX;
+        int tbase = (ty - b.boxMinY) * b.boxW - b.boxMinX;
         for (int tx = r.x; tx <= r.z; ++tx) {
             uint t = uint(tbase + tx);
             atomic_fetch_add_explicit(&counts[t], 1u, memory_order_relaxed);

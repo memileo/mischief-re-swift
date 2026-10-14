@@ -273,6 +273,14 @@ public enum LiveConfig {
         return env["ART_LIVE_GPUBIN"] != "0"
     }
 
+    /// Per-stage GPU timing for the binned path (`ART_LIVE_BINTIME=1`): splits CB2 into
+    /// one command buffer per stage so the log shows scatter/sort/render costs
+    /// separately. Diagnostic only — steady state keeps the single-CB form.
+    public static func binStageTimingEnabled(environment: [String: String]? = nil) -> Bool {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        return env["ART_LIVE_BINTIME"] == "1"
+    }
+
     /// Tile size for the *live* binning/dispatch. Resolution order:
     /// `ART_LIVE_TILE_SIZE` → `ART_TILE_SIZE` → 16 (the measured default).
     /// The static path keeps its own default (32); only the live path uses this.
