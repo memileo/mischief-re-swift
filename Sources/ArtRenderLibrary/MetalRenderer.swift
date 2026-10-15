@@ -82,13 +82,11 @@ class MetalRenderer {
     // GPU tile-binning kernels (live view `bin` stage). All optional: a metallib that
     // predates them (or ART_LIVE_GPUBIN=0) silently uses the CPU binning instead.
     internal var liveBinTransformCountPipeline: MTLComputePipelineState?
-    // Gather-path kernels (clustered/zoomed-out layers): pure transform (no atomics),
-    // per-tile gather-count and gather-fill (ordered by construction, no sort).
-    internal var liveBinTransformPipeline: MTLComputePipelineState?
-    internal var liveBinGatherCountPipeline: MTLComputePipelineState?
-    internal var liveBinGatherFillPipeline: MTLComputePipelineState?
     internal var liveBinScatterPipeline: MTLComputePipelineState?
-    internal var liveBinSortTilesPipeline: MTLComputePipelineState?
+    // Chunked sort: one thread sorts one 512-entry chunk in place, then pairwise merge
+    // passes restore full order — bounded work per thread at any zoom (no per-tile sort).
+    internal var liveBinChunkSortPipeline: MTLComputePipelineState?
+    internal var liveBinMergePassPipeline: MTLComputePipelineState?
     /// Per-layer GPU-binning state, keyed by layer index. Entries are validated against
     /// the owning cache (`ObjectIdentifier`) + segment count and dropped wholesale when
     /// the document changes — reference-space geometry never crosses documents.
@@ -123,10 +121,13 @@ internal final class LiveBinRefLayer {
     var countsStaging: MTLBuffer?    // boxTiles × UInt32 CPU readback (.shared)
     var heads: MTLBuffer?            // boxTiles × UInt32 scatter heads (.private)
     var starts: MTLBuffer?           // boxTiles × UInt32 prefix starts (.shared)
-    var tileIndex: MTLBuffer?        // boxTiles × TileIndex, render + sort input (.shared)
+    var tileIndex: MTLBuffer?        // boxTiles × TileIndex, render + merge input (.shared)
     var tileList: MTLBuffer?         // incidences × UInt32 (.private)
+    var tileScratch: MTLBuffer?      // incidences × UInt32, merge ping-pong (.private)
+    var sortChunks: MTLBuffer?       // sort chunks × uint2 (start, len) (.shared)
     var boxCap = 0                   // boxTiles currently allocated
     var tileListCap = 0              // incidences currently allocated
+    var chunkCap = 0                 // sort chunks currently allocated
 
     init(docID: ObjectIdentifier, segCount: Int, strokeCount: Int,
          refSegments: MTLBuffer, segStroke: MTLBuffer,

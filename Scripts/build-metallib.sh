@@ -60,11 +60,9 @@ LIVE_KERNELS=(
     livePerTileAACompositeKernel
     livePerTileNoiseCompositeKernel
     liveBinTransformCountKernel
-    liveBinTransformKernel
-    liveBinGatherCountKernel
-    liveBinGatherFillKernel
     liveBinScatterKernel
-    liveBinSortTilesKernel
+    liveBinChunkSortKernel
+    liveBinMergePassKernel
 )
 REQUIRED_KERNELS=(
     clearKernel

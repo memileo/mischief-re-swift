@@ -209,14 +209,6 @@ final class LiveConfigTests: XCTestCase {
         XCTAssertFalse(LiveConfig.binStageTimingEnabled(environment: ["ART_LIVE_BINTIME": "0"]))
     }
 
-    func testGatherBudgetDefaultsAndParses() {
-        XCTAssertEqual(LiveConfig.gatherBudget(environment: [:]), 256_000_000)
-        XCTAssertEqual(LiveConfig.gatherBudget(environment: ["ART_LIVE_GATHER": "0"]), 0)
-        XCTAssertEqual(LiveConfig.gatherBudget(environment: ["ART_LIVE_GATHER": "1000"]), 1000)
-        // Garbage falls back to the default rather than disabling a path silently.
-        XCTAssertEqual(LiveConfig.gatherBudget(environment: ["ART_LIVE_GATHER": "nope"]), 256_000_000)
-    }
-
     func testLiveTileSizeDefaultsSixteen() {
         XCTAssertEqual(LiveConfig.liveTileSize(environment: [:]), 16)
         XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_TILE_SIZE": "32"]), 32)
@@ -296,10 +288,9 @@ final class GpuBinSpecTests: XCTestCase {
         XCTAssertEqual(MemoryLayout<GpuBinTileEntry>.size, 8)
     }
 
-    /// Swift mirror of `liveBinSortTilesKernel`'s heapsort (+ `liveBinSiftDown`), kept
-    /// structurally identical so this test guards the algorithm the GPU runs. The kernel
-    /// must emit ascending document order for any tile density — clustered artwork packs
-    /// thousands of entries per tile, where the old insertion sort went quadratic.
+    /// Swift mirror of `liveBinChunkSortKernel`'s in-place heapsort
+    /// (+ `liveBinSiftDown`), kept structurally identical so this test guards the
+    /// algorithm the GPU runs on every chunk.
     private func heapSort(_ list: inout [UInt32]) {
         func siftDown(_ list: inout [UInt32], _ root: Int, _ v: UInt32, _ heapEnd: Int) {
             var root = root
@@ -377,82 +368,125 @@ final class GpuBinSpecTests: XCTestCase {
         if total > 0 { XCTAssertEqual(maxSlot, total - 1) }
     }
 
-    func testUseGatherSelectsClusteredPath() {
-        let budget = LiveConfig.gatherBudget(environment: [:])
-        // complex.art zoomed-out layer: 12 tiles × 31887 segs — gather territory.
-        XCTAssertTrue(GpuBinSpec.useGather(boxTiles: 12, segCount: 31887, budget: budget))
-        // complex.art zoom-1 layer: ~2000 tiles × 31887 segs ≈ 64M — gather.
-        XCTAssertTrue(GpuBinSpec.useGather(boxTiles: 2000, segCount: 31887, budget: budget))
-        // kaos.art: 7800 tiles × 321611 segs ≈ 2.5B — scatter (would be seconds).
-        XCTAssertFalse(GpuBinSpec.useGather(boxTiles: 7800, segCount: 321611, budget: budget))
-        // Boundary is inclusive; ART_LIVE_GATHER=0 forces scatter everywhere.
-        XCTAssertTrue(GpuBinSpec.useGather(boxTiles: 4, segCount: 25, budget: 100))
-        XCTAssertFalse(GpuBinSpec.useGather(boxTiles: 4, segCount: 26, budget: 100))
-        XCTAssertFalse(GpuBinSpec.useGather(boxTiles: 7800, segCount: 321611,
-                                            budget: LiveConfig.gatherBudget(
-                                                environment: ["ART_LIVE_GATHER": "0"])))
-        // Int64 product: kaos-scale must not overflow (Int32 would go negative and
-        // wrongly select gather — the catastrophic direction).
-        XCTAssertGreaterThan(Int64(7800) * Int64(321611), Int64(Int32.max))
+    func testChunkTableBoundsWorkPerThread() {
+        // Layout lock: the macOS side memcpys [GpuBinChunk] into the uint2 buffer the
+        // chunk-sort kernel reads — same two-UInt32 layout, stride 8.
+        XCTAssertEqual(MemoryLayout<GpuBinChunk>.stride, 8)
+        XCTAssertEqual(MemoryLayout<GpuBinChunk>.size, 8)
+        XCTAssertEqual(GpuBinSpec.sortChunkSize, 512)
+        // Counts [600, 100, 0, 1, 2000]: tiles 1 and 3 need no merge, tile 0 needs
+        // 2 chunks (1 pass), tile 4 needs 4 chunks (2 passes).
+        let (entries, _, _) = GpuBinSpec.combine(counts: [600, 100, 0, 1, 2000])
+        let (chunks, maxChunks, passes) = GpuBinSpec.chunkTable(entries: entries)
+        XCTAssertEqual(chunks.count, 2 + 1 + 4)
+        XCTAssertEqual(maxChunks, 4)
+        XCTAssertEqual(passes, 2)
+        // Chunks tile tile 0's slice [0, 600) then tile 1's [600, 700), etc.
+        XCTAssertEqual(chunks[0].start, 0); XCTAssertEqual(chunks[0].len, 512)
+        XCTAssertEqual(chunks[1].start, 512); XCTAssertEqual(chunks[1].len, 88)
+        XCTAssertEqual(chunks[2].start, 600); XCTAssertEqual(chunks[2].len, 100)
+        XCTAssertEqual(chunks[3].start, 701); XCTAssertEqual(chunks[3].len, 512)
+        XCTAssertEqual(chunks[6].start, 701 + 512 * 3); XCTAssertEqual(chunks[6].len, 2000 - 512 * 3)
+        for c in chunks { XCTAssertLessThanOrEqual(Int(c.len), GpuBinSpec.sortChunkSize) }
+        // Nothing sortable → no chunks, no passes (sort dispatches skipped entirely).
+        let (e2, _, _) = GpuBinSpec.combine(counts: [0, 1, 1, 0])
+        let (ch2, mx2, p2) = GpuBinSpec.chunkTable(entries: e2)
+        XCTAssertTrue(ch2.isEmpty); XCTAssertEqual(mx2, 0); XCTAssertEqual(p2, 0)
+        // Exact multiple of the chunk size: no short tail, passes still ceil(log2).
+        let (e3, _, _) = GpuBinSpec.combine(counts: [1024])
+        let (ch3, mx3, p3) = GpuBinSpec.chunkTable(entries: e3)
+        XCTAssertEqual(ch3.count, 2); XCTAssertEqual(mx3, 2); XCTAssertEqual(p3, 1)
+        // Pass count is ceil(log2(maxChunks)): 3 chunks need 2 passes, 5 need 3.
+        let (e4, _, _) = GpuBinSpec.combine(counts: [1536])
+        XCTAssertEqual(GpuBinSpec.chunkTable(entries: e4).mergePasses, 2)
+        let (e5, _, _) = GpuBinSpec.combine(counts: [2560])
+        XCTAssertEqual(GpuBinSpec.chunkTable(entries: e5).mergePasses, 3)
     }
 
-    func testGatherMatchesScatterLists() {
-        // Locks the gather-path contract (`liveBinGatherCountKernel` +
-        // `liveBinGatherFillKernel`): walking segments in order and testing range
-        // membership must reproduce the exact ascending tile lists a stable
-        // (CPU-style) scatter produces — including the empty-sentinel skip.
-        // Ranges use absolute tile coords; (1,0,0,0) is the invalid sentinel.
-        let ranges: [(Int, Int, Int, Int)] = [
-            (0, 0, 2, 1), (1, 0, 0, 0), (1, 1, 3, 2), (0, 0, 0, 0),
-            (2, 0, 2, 2), (1, 0, 0, 0), (0, 2, 3, 2),
-        ]
-        let boxW = 4, boxH = 3, boxTiles = boxW * boxH
-        func covers(_ r: (Int, Int, Int, Int), _ tx: Int, _ ty: Int) -> Bool {
-            r.0 <= tx && tx <= r.2 && r.1 <= ty && ty <= r.3
-        }
-        // Reference: stable scatter in segment order, then per-tile ascending.
-        var refLists = [[Int]](repeating: [], count: boxTiles)
-        for gid in 0..<ranges.count {
-            let r = ranges[gid]
-            guard r.0 <= r.2 && r.1 <= r.3 else { continue }   // sentinel skip
-            for ty in r.1...r.3 {
-                for tx in r.0...r.2 {
-                    refLists[ty * boxW + tx].append(gid)
+    func testChunkSortMergeMatchesSorted() {
+        // Locks the GPU chunked-sort contract end to end: chunk heapsort + pairwise
+        // merge passes (runs doubling from one chunk, ping-ponging with the final pass
+        // landing in the tile list) must reproduce the exact ascending tile lists —
+        // including the dense single-tile worst case that stalled the old per-tile
+        // sort (zoomed-out complex.art packs ~2600 entries into one tile).
+        func run(tileCounts: [Int], order: [UInt32]) -> Bool {
+            let chunk = GpuBinSpec.sortChunkSize
+            let counts = tileCounts.map { UInt32($0) }
+            let (entries, _, total) = GpuBinSpec.combine(counts: counts)
+            guard total == order.count else { return false }
+            // Unordered scatter input (reversed per tile — atomic scatter is arbitrary).
+            var a = [UInt32](repeating: 0, count: total)
+            var cursor = 0
+            for (t, n) in tileCounts.enumerated() {
+                let rev = Array(order[cursor..<cursor + n].reversed())
+                a.replaceSubrange(Int(entries[t].start)..<Int(entries[t].start) + n, with: rev)
+                cursor += n
+            }
+            // Chunk heapsort in place (mirror of liveBinChunkSortKernel).
+            let (chunks, _, passes) = GpuBinSpec.chunkTable(entries: entries)
+            for c in chunks {
+                var slice = Array(a[Int(c.start)..<Int(c.start) + Int(c.len)])
+                heapSort(&slice)
+                a.replaceSubrange(Int(c.start)..<Int(c.start) + Int(c.len), with: slice)
+            }
+            // Merge passes (mirror of liveBinMergePassKernel).
+            var b = [UInt32](repeating: 0, count: total)
+            var runSize = chunk
+            for pass in 0..<passes {
+                let last = (pass == passes - 1)
+                let srcArr: [UInt32] = (pass % 2 == 1) ? b : a
+                for (t, e) in entries.enumerated() {
+                    let start = Int(e.start), count = Int(e.count)
+                    guard count > chunk else { continue }   // single chunk rests in `a`
+                    let S = runSize, twoS = S * 2
+                    var o = 0
+                    while o < count {
+                        let aLen = min(S, count - o)
+                        let bLen = (count - o > S) ? min(S, count - o - S) : 0
+                        var i = 0, j = 0
+                        var merged: [UInt32] = []
+                        merged.reserveCapacity(aLen + bLen)
+                        while i < aLen && j < bLen {
+                            if srcArr[start + o + i] <= srcArr[start + o + aLen + j] {
+                                merged.append(srcArr[start + o + i]); i += 1
+                            } else {
+                                merged.append(srcArr[start + o + aLen + j]); j += 1
+                            }
+                        }
+                        merged.append(contentsOf: srcArr[start + o + i..<start + o + aLen])
+                        merged.append(contentsOf: srcArr[start + o + aLen + j..<start + o + aLen + bLen])
+                        for (k, v) in merged.enumerated() {
+                            if last { a[start + o + k] = v }
+                            else if pass % 2 == 0 { b[start + o + k] = v }
+                            else { a[start + o + k] = v }
+                        }
+                        o += twoS
+                    }
                 }
+                runSize *= 2
             }
-        }
-        // Gather simulation: count pass, prefix (real combine), fill pass.
-        var counts = [UInt32](repeating: 0, count: boxTiles)
-        for t in 0..<boxTiles {
-            let tx = t % boxW, ty = t / boxW
-            var n: UInt32 = 0
-            for gid in 0..<ranges.count {
-                if covers(ranges[gid], tx, ty) { n += 1 }
+            // Every tile ascending and equal to the stably scattered reference.
+            cursor = 0
+            for (t, n) in tileCounts.enumerated() {
+                let ref = Array(order[cursor..<cursor + n]).sorted()
+                let got = Array(a[Int(entries[t].start)..<Int(entries[t].start) + n])
+                if got != ref { return false }
+                cursor += n
             }
-            counts[t] = n
+            return true
         }
-        let (entries, _, total) = GpuBinSpec.combine(counts: counts)
-        var tileList = [Int](repeating: -1, count: total)
-        for t in 0..<boxTiles {
-            let tx = t % boxW, ty = t / boxW
-            var dst = Int(entries[t].start)
-            let end = dst + Int(entries[t].count)
-            for gid in 0..<ranges.count where dst < end {
-                if covers(ranges[gid], tx, ty) {
-                    tileList[dst] = gid
-                    dst += 1
-                }
-            }
-            XCTAssertEqual(dst, end, "tile \(t) fill must exactly match its count")
+        // Dense single tile (zoomed-out worst case), multi-tile mixed, sparse.
+        XCTAssertTrue(run(tileCounts: [5000], order: Array(0 as UInt32..<5000)))
+        var rng: UInt64 = 0x9e3779b9
+        var seen = Set<UInt32>(); var uniq: [UInt32] = []
+        while uniq.count < 5000 {
+            rng = rng &* 6364136223846793005 &+ 1442695040888963407
+            let v = UInt32(truncatingIfNeeded: rng >> 33)
+            if seen.insert(v).inserted { uniq.append(v) }
         }
-        // Sentinel segments (gid 1 and 5) appear nowhere; every tile ascending.
-        XCTAssertFalse(tileList.contains(1))
-        XCTAssertFalse(tileList.contains(5))
-        for t in 0..<boxTiles {
-            let slice = Array(tileList[Int(entries[t].start)..<Int(entries[t].start) + Int(entries[t].count)])
-            XCTAssertEqual(slice, slice.sorted(), "tile \(t) must be ascending by construction")
-            XCTAssertEqual(slice, refLists[t], "tile \(t) must match the stable scatter")
-        }
+        XCTAssertTrue(run(tileCounts: [2600, 1300, 700, 300, 100], order: uniq))
+        XCTAssertTrue(run(tileCounts: [1, 0, 2, 511, 513], order: Array(0 as UInt32..<1027)))
+        XCTAssertTrue(run(tileCounts: [0, 0, 0], order: []))
     }
 }
 /// Per-tile eligibility: cuts and markers force per-stroke; noise is allowed (handled by

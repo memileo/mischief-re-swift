@@ -1404,7 +1404,7 @@ kernel void livePerTileNoiseCompositeKernel(
 // `LiveRenderCache.remap` + `buildSegmentTileIndicesBoxed` op order exactly, with the
 // same truncation-toward-zero int conversion and clamps. The padding is conservative
 // (~1px beyond the ink), so even a 1-ulp compiler difference can only add empty tiles,
-// never drop inked ones. Scatter order is restored by `liveBinSortTilesKernel`, so the
+// never drop inked ones. Scatter order is restored by the chunked sort below, so the
 // render kernels see the same ascending document order the CPU binner produces — the
 // render kernels themselves are UNTOUCHED by this work.
 //
@@ -1444,9 +1444,8 @@ struct LiveBinBoxParams {
 // `buildSegmentTileIndicesBoxed` with isMarker == false (per-tile layers never contain
 // markers): pad = 1.4 * rMax + 1, strict-inequality off-canvas cull,
 // truncation-toward-zero int conversion, clamp to the grid. Returns the
-// `SegTileRange.empty` sentinel (1,0,0,0) when off-canvas or degenerate. Shared by the
-// fused transform+count kernel and the pure transform kernel so the two binning paths
-// can never disagree on ranges.
+// `SegTileRange.empty` sentinel (1,0,0,0) when off-canvas or degenerate. Used by the
+// fused transform+count kernel.
 inline int4 liveBinRangeForSeg(constant LiveBinTransformParams &p,
                                float2 p1, float2 p2, float r0, float r1) {
     float rMax = max(r0, r1);
@@ -1537,156 +1536,10 @@ kernel void liveBinTransformCountKernel(
     }
 }
 
-// Pure camera transform + tile range (no counting). Used by the gather path, which
-// derives its counts contention-free below — running the fused kernel there would pay
-// for contended atomics whose results get overwritten anyway.
-kernel void liveBinTransformKernel(
-    constant LiveBinTransformParams &p [[buffer(0)]],
-    const device GPUSplineSegment *refSegs [[buffer(1)]],
-    const device uint *segStroke [[buffer(2)]],
-    const device uchar *strokeVisible [[buffer(3)]],
-    device GPUSplineSegment *outSegs [[buffer(4)]],
-    device int4 *outRanges [[buffer(5)]],
-    uint3 tpg [[thread_position_in_grid]])
-{
-    uint gid = tpg.x;
-    if (gid >= p.segCount) return;
-
-    GPUSplineSegment s = refSegs[gid];
-    uint sId = segStroke[gid];
-    if (strokeVisible[sId] == 0) {
-        outSegs[gid] = s;
-        outRanges[gid] = int4(1, 0, 0, 0);
-        return;
-    }
-
-    float2 p0 = float2(p.camA * s.p0.x + p.camC * s.p0.y + p.camTX,
-                       p.camB * s.p0.x + p.camD * s.p0.y + p.camTY);
-    float2 p1 = float2(p.camA * s.p1.x + p.camC * s.p1.y + p.camTX,
-                       p.camB * s.p1.x + p.camD * s.p1.y + p.camTY);
-    float2 p2 = float2(p.camA * s.p2.x + p.camC * s.p2.y + p.camTX,
-                       p.camB * s.p2.x + p.camD * s.p2.y + p.camTY);
-    float2 p3 = float2(p.camA * s.p3.x + p.camC * s.p3.y + p.camTX,
-                       p.camB * s.p3.x + p.camD * s.p3.y + p.camTY);
-    float r0 = s.radius0 * p.radiusFactor;
-    float r1 = s.radius1 * p.radiusFactor;
-    float prune = as_type<float>(s.padding1) * p.radiusFactor;
-
-    GPUSplineSegment o;
-    o.p0 = p0; o.p1 = p1; o.p2 = p2; o.p3 = p3;
-    o.radius0 = r0; o.radius1 = r1;
-    o.opacity0 = s.opacity0; o.opacity1 = s.opacity1;
-    o.noiseSeed = s.noiseSeed; o.segmentType = s.segmentType;
-    o.padding1 = as_type<uint>(prune); o.padding2 = s.padding2;
-    outSegs[gid] = o;
-    outRanges[gid] = liveBinRangeForSeg(p, p1, p2, r0, r1);
-}
-
-// Gather-path tile binning (clustered artwork / zoomed-out views): one thread per tile
-// walks ALL segments in document order and keeps the ones covering its tile. Zero
-// atomics, and the list comes out in ascending order BY CONSTRUCTION, so no sort is
-// needed. Segments stream through threadgroup-local 1024-entry windows (see below):
-// aggregate DRAM traffic is groups × segCount × 16B, NOT tiles × segCount — a naive
-// per-thread stream thrashes every cache on the chip (measured 10–100ms). Costs
-// O(boxTiles × segCount) local-memory tests, so the CPU picks this path only when
-// that product is small (see `GpuBinSpec.useGather`); the scatter+sort path stays
-// for large even distributions like kaos.
-
-// Pass 1: per-tile incidence counts. Plain stores (each tile written by exactly its
-// own thread) — the CPU prefix-sums these exactly like the atomic counts.
-kernel void liveBinGatherCountKernel(
-    constant LiveBinBoxParams &p [[buffer(0)]],
-    const device int4 *ranges [[buffer(1)]],
-    device uint *counts [[buffer(2)]],
-    uint3 tpg [[thread_position_in_grid]],
-    uint3 ttid [[thread_position_in_threadgroup]],
-    uint3 tptg [[threads_per_threadgroup]])
-{
-    uint t = tpg.x;
-    uint tileCount = uint(p.boxW) * uint(p.boxH);
-    threadgroup int4 window[1024];
-    uint tid = ttid.x;
-    uint tpw = tptg.x;
-    // No early return past this point: every lane must reach both barriers below
-    // (a diverged barrier hangs the group) — idle lanes wait via `active`.
-    bool active = t < tileCount;
-    int atx = 0, aty = 0;
-    if (active) {
-        atx = p.boxMinX + int(t % uint(p.boxW));
-        aty = p.boxMinY + int(t / uint(p.boxW));
-    }
-    uint n = 0;
-    for (uint c0 = 0; c0 < p.segCount; c0 += 1024u) {
-        uint clen = min(1024u, p.segCount - c0);
-        for (uint i = tid; i < clen; i += tpw) {
-            window[i] = ranges[c0 + i];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (active) {
-            for (uint i = 0; i < clen; ++i) {
-                int4 r = window[i];
-                // The empty sentinel (1,0,0,0) has x > z, so it is skipped by the test below.
-                if (r.x <= atx && atx <= r.z && r.y <= aty && aty <= r.w) ++n;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (active) counts[t] = n;
-}
-
-// Pass 2 (after the CPU prefix): fill each tile's slice in ascending segment order.
-// `dst < end` bounds the inner scan AND the writes: the count pass guarantees exactly
-// `count` matches, so the slice fills exactly. (It must NOT bound the chunk loop —
-// see NOTE below — or idle lanes would skip the barriers and hang the group.)
-kernel void liveBinGatherFillKernel(
-    constant LiveBinBoxParams &p [[buffer(0)]],
-    const device int4 *ranges [[buffer(1)]],
-    const device TileIndex *tiles [[buffer(2)]],
-    device uint *tileList [[buffer(3)]],
-    uint3 tpg [[thread_position_in_grid]],
-    uint3 ttid [[thread_position_in_threadgroup]],
-    uint3 tptg [[threads_per_threadgroup]])
-{
-    uint t = tpg.x;
-    uint tileCount = uint(p.boxW) * uint(p.boxH);
-    threadgroup int4 window[1024];
-    uint tid = ttid.x;
-    uint tpw = tptg.x;
-    bool active = t < tileCount;
-    int atx = 0, aty = 0;
-    uint dst = 0, end = 0;
-    if (active) {
-        atx = p.boxMinX + int(t % uint(p.boxW));
-        aty = p.boxMinY + int(t / uint(p.boxW));
-        dst = tiles[t].start;
-        end = dst + tiles[t].count;
-    }
-    // NOTE: the chunk loop bound is global on purpose — `dst < end` lives only on the
-    // inner scan. A per-lane outer bound would let idle lanes skip the barriers and
-    // hang the threadgroup.
-    for (uint c0 = 0; c0 < p.segCount; c0 += 1024u) {
-        uint clen = min(1024u, p.segCount - c0);
-        for (uint i = tid; i < clen; i += tpw) {
-            window[i] = ranges[c0 + i];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (active) {
-            for (uint i = 0; i < clen && dst < end; ++i) {
-                int4 r = window[i];
-                if (r.x <= atx && atx <= r.z && r.y <= aty && aty <= r.w) {
-                    tileList[dst] = c0 + i;
-                    ++dst;
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-}
-
 // Scatter segment indices into the tile list. `heads` are per-tile bump counters that
 // must be ZEROED before dispatch; each thread writes slot `starts[t] + bump(heads[t])`.
 // (Seeding heads with starts would add the base twice and store past the tile list.)
-// Deliberately unordered (parallel) — `liveBinSortTilesKernel` restores document order.
+// Deliberately unordered (parallel) — the chunked sort below restores document order.
 kernel void liveBinScatterKernel(
     constant LiveBinBoxParams &p [[buffer(0)]],
     const device int4 *ranges [[buffer(1)]],
@@ -1724,33 +1577,91 @@ inline void liveBinSiftDown(device uint *list, uint root, uint v, uint heapEnd) 
     list[root] = v;
 }
 
-// Restore ascending document order within each tile's slice (one thread per tile).
-// The CPU scatter is stable, so sorted-ascending == the exact CPU tile list, which is
-// what makes the per-tile render kernel's stroke grouping correct.
+// Ascending document order, restored with bounded work per thread (zoom-independent).
+// One thread sorting one whole tile goes latency-bound on dense tiles (thousands of
+// dependent global-memory steps) and leaves the GPU almost idle when only a few tiles
+// exist (zoomed-out). Instead the CPU splits every tile slice into fixed 512-entry
+// chunks (`GpuBinSpec.chunkTable`): one thread heapsorts one chunk in place, then
+// pairwise merge passes (runs doubling from one chunk, ping-ponging tileList/scratch
+// with the final pass landing in tileList) restore full order. Merges are linear with
+// sequential access — the cache-friendly kind — and the common case (every tile fits
+// one chunk) needs zero merge passes. The CPU scatter is stable, so
+// sorted-ascending == the exact CPU tile list, which is what makes the per-tile render
+// kernel's stroke grouping correct. Segment indices are unique, so only ascending
+// order matters.
 //
-// Heapsort (O(n log n) worst case), NOT insertion sort: clustered artwork packs
-// thousands of incidences into a few tiles, where insertion sort's O(n²) stalls a
-// whole GPU thread for hundreds of ms (evenly-spread docs never notice — ~200/tile).
-// Segment indices are unique, so stability is irrelevant; only ascending order matters.
-kernel void liveBinSortTilesKernel(
-    constant LiveBinBoxParams &p [[buffer(0)]],
-    const device TileIndex *tiles [[buffer(1)]],
+// Chunk size 512 must match `GpuBinSpec.sortChunkSize` (merge run sizes start at one
+// chunk and double from there).
+
+// `LiveBinSortParams` — must match the Swift struct field for field, in order.
+struct LiveBinSortParams {
+    uint chunkCount;
+    uint runSize;
+    int  boxW;
+    int  boxH;
+};
+
+// Sort one chunk in place (heapsort via `liveBinSiftDown`, O(n log n) worst case).
+// Chunks cover only slices with >= 2 entries and hold at most 512 of them, so
+// per-thread nonlinear work is bounded no matter how far the user zooms out.
+kernel void liveBinChunkSortKernel(
+    constant LiveBinSortParams &p [[buffer(0)]],
+    const device uint2 *chunks [[buffer(1)]],
     device uint *tileList [[buffer(2)]],
+    uint3 tpg [[thread_position_in_grid]])
+{
+    uint c = tpg.x;
+    if (c >= p.chunkCount) return;
+    uint start = chunks[c].x;
+    uint len = chunks[c].y;
+    if (len < 2) return;
+    device uint *list = tileList + start;
+    for (uint i = len / 2; i > 0; --i) {
+        liveBinSiftDown(list, i - 1, list[i - 1], len);
+    }
+    for (uint end = len; end > 1; --end) {
+        uint maxV = list[0];
+        // Move the tail into the root, restore the heap over [0, end - 1), park max.
+        liveBinSiftDown(list, 0, list[end - 1], end - 1);
+        list[end - 1] = maxV;
+    }
+}
+
+// One pairwise merge pass over every tile: runs of `runSize` merge into runs of
+// `2 * runSize`. One thread per tile, serial within the tile (linear work, sequential
+// reads/writes) and parallel across tiles. Single-chunk tiles (count <= 512) are
+// already sorted in place and are skipped — their data rests in `tileList` while
+// multi-chunk tiles ping-pong through the scratch buffer, with the CPU directing the
+// final pass back into `tileList`, so the render kernel always reads `tileList`.
+kernel void liveBinMergePassKernel(
+    constant LiveBinSortParams &p [[buffer(0)]],
+    const device TileIndex *tiles [[buffer(1)]],
+    const device uint *src [[buffer(2)]],
+    device uint *dst [[buffer(3)]],
     uint3 tpg [[thread_position_in_grid]])
 {
     uint t = tpg.x;
     uint tileCount = uint(p.boxW) * uint(p.boxH);
     if (t >= tileCount) return;
+    uint start = tiles[t].start;
     uint count = tiles[t].count;
-    if (count < 2) return;
-    device uint *list = tileList + tiles[t].start;
-    for (uint i = count / 2; i > 0; --i) {
-        liveBinSiftDown(list, i - 1, list[i - 1], count);
-    }
-    for (uint end = count; end > 1; --end) {
-        uint maxV = list[0];
-        // Move the tail into the root, restore the heap over [0, end - 1), park max.
-        liveBinSiftDown(list, 0, list[end - 1], end - 1);
-        list[end - 1] = maxV;
+    if (count <= 512u) return;
+    uint S = p.runSize;
+    uint twoS = S * 2u;
+    for (uint o = 0; o < count; o += twoS) {
+        uint aStart = start + o;
+        uint aLen = min(S, count - o);
+        uint bLen = (count - o > S) ? min(S, count - o - S) : 0u;
+        uint bStart = aStart + aLen;
+        uint d = start + o;
+        uint i = 0, j = 0;
+        while (i < aLen && j < bLen) {
+            uint a = src[aStart + i];
+            uint b = src[bStart + j];
+            if (a <= b) { dst[d] = a; ++i; } else { dst[d] = b; ++j; }
+            ++d;
+        }
+        while (i < aLen) { dst[d] = src[aStart + i]; ++i; ++d; }
+        while (j < bLen) { dst[d] = src[bStart + j]; ++j; ++d; }
     }
 }

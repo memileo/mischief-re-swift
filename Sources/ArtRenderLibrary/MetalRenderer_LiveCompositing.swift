@@ -101,6 +101,16 @@ struct LiveBinBoxParams {
     var tilesPerRow: UInt32
 }
 
+// Must match `LiveBinSortParams` in segmentKernels.metal field for field, in order.
+// 2×uint + 2×int = stride 16 on both sides. `runSize` doubles per merge pass from one
+// sort chunk (`GpuBinSpec.sortChunkSize`); the chunk-sort dispatch uses `chunkCount`.
+struct LiveBinSortParams {
+    var chunkCount: UInt32
+    var runSize: UInt32
+    var boxW: Int32
+    var boxH: Int32
+}
+
 // One layer's worth of per-tile data, as byte-slices into the single upload buffer.
 private struct PerTilePlan {
     var empty = true
@@ -208,11 +218,9 @@ extension MetalRenderer {
         // Missing ones are NOT in `failures` — they must never fail the whole live view.
         let binKernels: [(String, (MTLComputePipelineState?) -> Void)] = [
             ("liveBinTransformCountKernel", { self.liveBinTransformCountPipeline = $0 }),
-            ("liveBinTransformKernel", { self.liveBinTransformPipeline = $0 }),
-            ("liveBinGatherCountKernel", { self.liveBinGatherCountPipeline = $0 }),
-            ("liveBinGatherFillKernel", { self.liveBinGatherFillPipeline = $0 }),
             ("liveBinScatterKernel", { self.liveBinScatterPipeline = $0 }),
-            ("liveBinSortTilesKernel", { self.liveBinSortTilesPipeline = $0 }),
+            ("liveBinChunkSortKernel", { self.liveBinChunkSortPipeline = $0 }),
+            ("liveBinMergePassKernel", { self.liveBinMergePassPipeline = $0 }),
         ]
         for (name, assign) in binKernels {
             if let fn = library.makeFunction(name: name) {
@@ -735,17 +743,14 @@ extension MetalRenderer {
                                               opacity: Float) throws -> Bool {
         guard LiveConfig.gpuBinEnabled() else { return false }
         guard let compositePipeline = liveCompositeLayerPipeline else { return false }
-        // Two binning paths, either sufficient alone: scatter (fused transform+count,
-        // atomic scatter, sort) for large even spreads; gather (pure transform,
-        // per-tile count+fill, ordered by construction) for clustered/zoomed-out layers.
-        // A metallib predating one path still runs the other; ART_LIVE_GATHER=0 forces
-        // scatter for A/B. Missing both (or ART_LIVE_GPUBIN=0) → CPU below.
-        let fusedPipe = liveBinTransformCountPipeline
-        let canScatter = fusedPipe != nil
-            && liveBinScatterPipeline != nil && liveBinSortTilesPipeline != nil
-        let canGather = liveBinTransformPipeline != nil
-            && liveBinGatherCountPipeline != nil && liveBinGatherFillPipeline != nil
-        guard canScatter || canGather else { return false }
+        // One binning path for every zoom level: fused transform+count (segment-parallel),
+        // atomic scatter (segment-parallel), chunked sort + merge passes (bounded work per
+        // thread — no per-tile sort to go latency-bound when zoomed out). A metallib
+        // predating any of them (or ART_LIVE_GPUBIN=0) falls back to CPU below.
+        guard let fusedPipe = liveBinTransformCountPipeline,
+              let scatterPipe = liveBinScatterPipeline,
+              let chunkPipe = liveBinChunkSortPipeline,
+              let mergePipe = liveBinMergePassPipeline else { return false }
         guard position < cache.layers.count, let device = device, let queue = commandQueue else {
             return false
         }
@@ -854,18 +859,9 @@ extension MetalRenderer {
         try ensureRenderTargets(width: width, height: height)
         try clearTexture(gpuRenderTarget!)
 
-        // Path choice (per layer, per frame — box and segCount decide): gather below the
-        // budget (clustered/zoomed-out — contention-free, no sort), scatter above it
-        // (large even spreads like kaos). Either pipeline missing → take the other.
-        let useGather = canGather
-            && (!canScatter || GpuBinSpec.useGather(boxTiles: boxTiles,
-                                                   segCount: ref.segCount,
-                                                   budget: LiveConfig.gatherBudget()))
-
-        // ── CB1: ranges + counts, then copy counts to staging for the CPU prefix.
-        // Scatter: blit-zero counts, fused transform+count. Gather: pure transform,
-        // gather-count (plain per-tile stores — no zeroing, no atomics). Encoders in
-        // one command buffer retire in order. One wait; captured for BINTIME.
+        // ── CB1: blit-zero counts, fused transform+count, copy counts to staging for
+        // the CPU prefix. Encoders in one command buffer retire in order. One wait;
+        // captured for BINTIME.
         let binThreads = MTLSize(width: 256, height: 1, depth: 1)
         func binGroups(_ n: Int) -> MTLSize {
             MTLSize(width: (n + 255) / 256, height: 1, depth: 1)
@@ -873,43 +869,22 @@ extension MetalRenderer {
         let countBytes = boxTiles * MemoryLayout<UInt32>.size
         var clock = DispatchTime.now().uptimeNanoseconds
         var tXform = 0.0
-        guard let cb1 = queue.makeCommandBuffer() else { return false }
-        if useGather {
-            guard let xPipe = liveBinTransformPipeline,
-                  let gPipe = liveBinGatherCountPipeline,
-                  let enc1 = cb1.makeComputeCommandEncoder() else { return false }
-            enc1.setComputePipelineState(xPipe)
-            enc1.setBytes(&tp, length: MemoryLayout<LiveBinTransformParams>.stride, index: 0)
-            enc1.setBuffer(ref.refSegments, offset: 0, index: 1)
-            enc1.setBuffer(ref.segStroke, offset: 0, index: 2)
-            enc1.setBuffer(ref.strokeVisible, offset: 0, index: 3)
-            enc1.setBuffer(frameSegs, offset: 0, index: 4)
-            enc1.setBuffer(ranges, offset: 0, index: 5)
-            enc1.dispatchThreadgroups(binGroups(ref.segCount), threadsPerThreadgroup: binThreads)
-            enc1.setComputePipelineState(gPipe)
-            enc1.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 0)
-            enc1.setBuffer(ranges, offset: 0, index: 1)
-            enc1.setBuffer(counts, offset: 0, index: 2)
-            enc1.dispatchThreadgroups(binGroups(boxTiles), threadsPerThreadgroup: binThreads)
-            enc1.endEncoding()
-        } else {
-            guard let fPipe = fusedPipe,
-                  let zeroEnc = cb1.makeBlitCommandEncoder() else { return false }
-            zeroEnc.fill(buffer: counts, range: 0..<countBytes, value: 0)
-            zeroEnc.endEncoding()
-            guard let enc1 = cb1.makeComputeCommandEncoder() else { return false }
-            enc1.setComputePipelineState(fPipe)
-            enc1.setBytes(&tp, length: MemoryLayout<LiveBinTransformParams>.stride, index: 0)
-            enc1.setBuffer(ref.refSegments, offset: 0, index: 1)
-            enc1.setBuffer(ref.segStroke, offset: 0, index: 2)
-            enc1.setBuffer(ref.strokeVisible, offset: 0, index: 3)
-            enc1.setBuffer(frameSegs, offset: 0, index: 4)
-            enc1.setBuffer(ranges, offset: 0, index: 5)
-            enc1.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 6)
-            enc1.setBuffer(counts, offset: 0, index: 7)
-            enc1.dispatchThreadgroups(binGroups(ref.segCount), threadsPerThreadgroup: binThreads)
-            enc1.endEncoding()
-        }
+        guard let cb1 = queue.makeCommandBuffer(),
+              let zeroEnc = cb1.makeBlitCommandEncoder() else { return false }
+        zeroEnc.fill(buffer: counts, range: 0..<countBytes, value: 0)
+        zeroEnc.endEncoding()
+        guard let enc1 = cb1.makeComputeCommandEncoder() else { return false }
+        enc1.setComputePipelineState(fusedPipe)
+        enc1.setBytes(&tp, length: MemoryLayout<LiveBinTransformParams>.stride, index: 0)
+        enc1.setBuffer(ref.refSegments, offset: 0, index: 1)
+        enc1.setBuffer(ref.segStroke, offset: 0, index: 2)
+        enc1.setBuffer(ref.strokeVisible, offset: 0, index: 3)
+        enc1.setBuffer(frameSegs, offset: 0, index: 4)
+        enc1.setBuffer(ranges, offset: 0, index: 5)
+        enc1.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 6)
+        enc1.setBuffer(counts, offset: 0, index: 7)
+        enc1.dispatchThreadgroups(binGroups(ref.segCount), threadsPerThreadgroup: binThreads)
+        enc1.endEncoding()
         guard let copyEnc = cb1.makeBlitCommandEncoder() else { return false }
         copyEnc.copy(from: counts, sourceOffset: 0,
                      to: staging, destinationOffset: 0, size: countBytes)
@@ -941,13 +916,34 @@ extension MetalRenderer {
         if ref.tileListCap < total {
             let cap = max(total, ref.tileListCap * 2)
             guard let buf = device.makeBuffer(length: cap * MemoryLayout<UInt32>.size,
-                                              options: .storageModePrivate) else {
+                                              options: .storageModePrivate),
+                  let scratch = device.makeBuffer(length: cap * MemoryLayout<UInt32>.size,
+                                                  options: .storageModePrivate) else {
                 return false
             }
             ref.tileList = buf
+            ref.tileScratch = scratch
             ref.tileListCap = cap
         }
-        guard let tileList = ref.tileList else { return false }
+        guard let tileList = ref.tileList, let tileScratch = ref.tileScratch else { return false }
+        // Chunked sort plan (pure integer work on the counts we already have): split
+        // every sortable slice into fixed 512-entry chunks, one GPU thread each, plus
+        // the merge-pass count (0 when every tile fits one chunk — the common case).
+        let (sortChunks, _, mergePasses) = GpuBinSpec.chunkTable(entries: entries)
+        if ref.chunkCap < sortChunks.count {
+            let cap = max(sortChunks.count, max(ref.chunkCap * 2, 1))
+            guard let buf = device.makeBuffer(length: cap * MemoryLayout<GpuBinChunk>.stride,
+                                              options: .storageModeShared) else {
+                return false
+            }
+            ref.sortChunks = buf
+            ref.chunkCap = cap
+        }
+        sortChunks.withUnsafeBytes { raw in
+            if let src = raw.baseAddress, let dst = ref.sortChunks?.contents() {
+                memcpy(dst, src, raw.count)
+            }
+        }
         entries.withUnsafeBytes { raw in
             if let src = raw.baseAddress {
                 memcpy(tileIndexBuf.contents(), src, raw.count)   // GpuBinTileEntry == TileIndex
@@ -964,20 +960,67 @@ extension MetalRenderer {
         // Heads are .private — zeroed by blit fill in CB2 below, not by CPU memset.
         liveTiming.binMilliseconds += Self.milliseconds(since: prefixStart)
 
-        // ── CB2: build the tile list, then per-tile render + layer composite.
-        // Scatter path: blit-zero heads, atomic scatter, heapsort — one encoder, in
-        // order. Gather path: gather-fill only (ascending by construction: no heads,
-        // no atomics, no sort). ART_LIVE_BINTIME=1 splits stages into one command
-        // buffer each for attribution; steady state stays single-CB to save round trips.
+        // ── CB2: scatter + chunked sort + merge passes, then per-tile render +
+        // layer composite. ART_LIVE_BINTIME=1 splits stages into one command buffer
+        // each for attribution; steady state stays single-CB to save round trips.
         guard let canvas = liveCanvasTexture, let layerTex = gpuRenderTarget else { return false }
+        // Nil until the first sortable frame allocates it; encodeOrder only binds it
+        // when chunks exist (allocation above guarantees non-nil exactly then).
+        let sortChunkBuf = ref.sortChunks
         let stageTiming = LiveConfig.binStageTimingEnabled()
-        var tScatter = 0.0, tSort = 0.0, tFill = 0.0, tRender = 0.0
+        var tScatter = 0.0, tSort = 0.0, tRender = 0.0
         func sync(_ cb: MTLCommandBuffer) throws -> Double {
             let t = DispatchTime.now().uptimeNanoseconds
             cb.commit()
             cb.waitUntilCompleted()
             if let err = cb.error { throw err }
             return Self.milliseconds(since: t)
+        }
+        // Shared bin body, split for BINTIME attribution: unordered scatter, then
+        // chunked sort + merge passes restore ascending order. The sort half is a
+        // no-op when every slice holds < 2 entries (already ordered) and skips merges
+        // when every tile fits one chunk.
+        func encodeScatter(_ encoder: MTLComputeCommandEncoder) {
+            encoder.setComputePipelineState(scatterPipe)
+            encoder.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 0)
+            encoder.setBuffer(ranges, offset: 0, index: 1)
+            encoder.setBuffer(startsBuf, offset: 0, index: 2)
+            encoder.setBuffer(heads, offset: 0, index: 3)
+            encoder.setBuffer(tileList, offset: 0, index: 4)
+            encoder.dispatchThreadgroups(binGroups(ref.segCount), threadsPerThreadgroup: binThreads)
+        }
+        func encodeOrder(_ encoder: MTLComputeCommandEncoder) {
+            guard !sortChunks.isEmpty, let sortChunkBuf else { return }
+            var sp = LiveBinSortParams(chunkCount: UInt32(sortChunks.count),
+                                       runSize: UInt32(GpuBinSpec.sortChunkSize),
+                                       boxW: Int32(boxW), boxH: Int32(boxH))
+            encoder.setComputePipelineState(chunkPipe)
+            encoder.setBytes(&sp, length: MemoryLayout<LiveBinSortParams>.stride, index: 0)
+            encoder.setBuffer(sortChunkBuf, offset: 0, index: 1)
+            encoder.setBuffer(tileList, offset: 0, index: 2)
+            encoder.dispatchThreadgroups(binGroups(sortChunks.count),
+                                         threadsPerThreadgroup: binThreads)
+            var runSize = GpuBinSpec.sortChunkSize
+            for pass in 0..<mergePasses {
+                let last = (pass == mergePasses - 1)
+                // Ping-pong tileList/scratch; the final pass always lands in tileList,
+                // which is what the render kernel reads. Single-chunk tiles sit out every
+                // pass (already sorted in tileList).
+                let srcBuf: MTLBuffer = (pass % 2 == 1) ? tileScratch : tileList
+                let dstBuf: MTLBuffer = last ? tileList
+                    : ((pass % 2 == 0) ? tileScratch : tileList)
+                var mp = LiveBinSortParams(chunkCount: UInt32(sortChunks.count),
+                                           runSize: UInt32(runSize),
+                                           boxW: Int32(boxW), boxH: Int32(boxH))
+                encoder.setComputePipelineState(mergePipe)
+                encoder.setBytes(&mp, length: MemoryLayout<LiveBinSortParams>.stride, index: 0)
+                encoder.setBuffer(tileIndexBuf, offset: 0, index: 1)
+                encoder.setBuffer(srcBuf, offset: 0, index: 2)
+                encoder.setBuffer(dstBuf, offset: 0, index: 3)
+                encoder.dispatchThreadgroups(binGroups(boxTiles),
+                                             threadsPerThreadgroup: binThreads)
+                runSize *= 2
+            }
         }
         // Shared tail: per-tile render + layer composite onto `encoder`.
         func encodeTail(_ encoder: MTLComputeCommandEncoder) throws {
@@ -1002,63 +1045,30 @@ extension MetalRenderer {
                                          threadsPerThreadgroup: Self.liveThreads)
         }
         if stageTiming {
-            if useGather {
-                guard let fillPipe = liveBinGatherFillPipeline,
-                      let cbF = queue.makeCommandBuffer(),
-                      let encF = cbF.makeComputeCommandEncoder(),
-                      let cbR = queue.makeCommandBuffer(),
-                      let encR = cbR.makeComputeCommandEncoder() else { return false }
-                encF.setComputePipelineState(fillPipe)
-                encF.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 0)
-                encF.setBuffer(ranges, offset: 0, index: 1)
-                encF.setBuffer(tileIndexBuf, offset: 0, index: 2)
-                encF.setBuffer(tileList, offset: 0, index: 3)
-                encF.dispatchThreadgroups(binGroups(boxTiles), threadsPerThreadgroup: binThreads)
-                encF.endEncoding()
-                tFill = try sync(cbF)
-                try encodeTail(encR)
-                encR.endEncoding()
-                tRender = try sync(cbR)
-                liveTiming.gpuMilliseconds += tFill + tRender
-                print(String(format: "livebin layer %d gather: segs %d tiles %d — xform %.2f fill %.2f render+comp %.2f ms",
-                             position, ref.segCount, boxTiles, tXform, tFill, tRender))
-            } else {
-                guard let sPipe = liveBinScatterPipeline,
-                      let oPipe = liveBinSortTilesPipeline,
-                      let cbH = queue.makeCommandBuffer(),
-                      let fillH = cbH.makeBlitCommandEncoder(),
-                      let cbS = queue.makeCommandBuffer(),
-                      let encS = cbS.makeComputeCommandEncoder(),
-                      let cbO = queue.makeCommandBuffer(),
-                      let encO = cbO.makeComputeCommandEncoder(),
-                      let cbR = queue.makeCommandBuffer(),
-                      let encR = cbR.makeComputeCommandEncoder() else { return false }
-                fillH.fill(buffer: heads, range: 0..<countBytes, value: 0)
-                fillH.endEncoding()
-                _ = try sync(cbH)
-                encS.setComputePipelineState(sPipe)
-                encS.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 0)
-                encS.setBuffer(ranges, offset: 0, index: 1)
-                encS.setBuffer(startsBuf, offset: 0, index: 2)
-                encS.setBuffer(heads, offset: 0, index: 3)
-                encS.setBuffer(tileList, offset: 0, index: 4)
-                encS.dispatchThreadgroups(binGroups(ref.segCount), threadsPerThreadgroup: binThreads)
-                encS.endEncoding()
-                tScatter = try sync(cbS)
-                encO.setComputePipelineState(oPipe)
-                encO.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 0)
-                encO.setBuffer(tileIndexBuf, offset: 0, index: 1)
-                encO.setBuffer(tileList, offset: 0, index: 2)
-                encO.dispatchThreadgroups(binGroups(boxTiles), threadsPerThreadgroup: binThreads)
-                encO.endEncoding()
-                tSort = try sync(cbO)
-                try encodeTail(encR)
-                encR.endEncoding()
-                tRender = try sync(cbR)
-                liveTiming.gpuMilliseconds += tScatter + tSort + tRender
-                print(String(format: "livebin layer %d scatter: segs %d tiles %d — xform %.2f scatter %.2f sort %.2f render+comp %.2f ms",
-                             position, ref.segCount, boxTiles, tXform, tScatter, tSort, tRender))
-            }
+            guard let cbH = queue.makeCommandBuffer(),
+                  let fillH = cbH.makeBlitCommandEncoder(),
+                  let cbS = queue.makeCommandBuffer(),
+                  let encS = cbS.makeComputeCommandEncoder(),
+                  let cbO = queue.makeCommandBuffer(),
+                  let encO = cbO.makeComputeCommandEncoder(),
+                  let cbR = queue.makeCommandBuffer(),
+                  let encR = cbR.makeComputeCommandEncoder() else { return false }
+            fillH.fill(buffer: heads, range: 0..<countBytes, value: 0)
+            fillH.endEncoding()
+            _ = try sync(cbH)
+            encodeScatter(encS)
+            encS.endEncoding()
+            tScatter = try sync(cbS)
+            encodeOrder(encO)
+            encO.endEncoding()
+            tSort = try sync(cbO)
+            try encodeTail(encR)
+            encR.endEncoding()
+            tRender = try sync(cbR)
+            liveTiming.gpuMilliseconds += tScatter + tSort + tRender
+            print(String(format: "livebin layer %d: segs %d tiles %d chunks %d passes %d — xform %.2f scatter %.2f sort %.2f render+comp %.2f ms",
+                         position, ref.segCount, boxTiles, sortChunks.count, mergePasses,
+                         tXform, tScatter, tSort, tRender))
             liveTiming.dispatchedTiles += boxTiles
             liveTiming.sdfEvaluations += total * (liveTile * liveTile)
             liveTiming.strokes += visStrokeIDs.count
@@ -1067,51 +1077,21 @@ extension MetalRenderer {
             liveTiming.segments += segTotal
             return true
         }
-        if useGather {
-            guard let fillPipe = liveBinGatherFillPipeline,
-                  let cb2 = queue.makeCommandBuffer(),
-                  let enc2 = cb2.makeComputeCommandEncoder() else { return false }
-            enc2.setComputePipelineState(fillPipe)
-            enc2.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 0)
-            enc2.setBuffer(ranges, offset: 0, index: 1)
-            enc2.setBuffer(tileIndexBuf, offset: 0, index: 2)
-            enc2.setBuffer(tileList, offset: 0, index: 3)
-            enc2.dispatchThreadgroups(binGroups(boxTiles), threadsPerThreadgroup: binThreads)
-            try encodeTail(enc2)
-            enc2.endEncoding()
-            clock = DispatchTime.now().uptimeNanoseconds
-            cb2.commit()
-            cb2.waitUntilCompleted()
-            liveTiming.gpuMilliseconds += Self.milliseconds(since: clock)
-            if let err = cb2.error { throw err }
-        } else {
-            guard let sPipe = liveBinScatterPipeline,
-                  let oPipe = liveBinSortTilesPipeline,
-                  let cb2 = queue.makeCommandBuffer(),
-                  let fill2 = cb2.makeBlitCommandEncoder() else { return false }
-            fill2.fill(buffer: heads, range: 0..<countBytes, value: 0)
-            fill2.endEncoding()
-            guard let enc2 = cb2.makeComputeCommandEncoder() else { return false }
-            enc2.setComputePipelineState(sPipe)
-            enc2.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 0)
-            enc2.setBuffer(ranges, offset: 0, index: 1)
-            enc2.setBuffer(startsBuf, offset: 0, index: 2)
-            enc2.setBuffer(heads, offset: 0, index: 3)
-            enc2.setBuffer(tileList, offset: 0, index: 4)
-            enc2.dispatchThreadgroups(binGroups(ref.segCount), threadsPerThreadgroup: binThreads)
-            enc2.setComputePipelineState(oPipe)
-            enc2.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 0)
-            enc2.setBuffer(tileIndexBuf, offset: 0, index: 1)
-            enc2.setBuffer(tileList, offset: 0, index: 2)
-            enc2.dispatchThreadgroups(binGroups(boxTiles), threadsPerThreadgroup: binThreads)
-            try encodeTail(enc2)
-            enc2.endEncoding()
-            clock = DispatchTime.now().uptimeNanoseconds
-            cb2.commit()
-            cb2.waitUntilCompleted()
-            liveTiming.gpuMilliseconds += Self.milliseconds(since: clock)
-            if let err = cb2.error { throw err }
-        }
+        clock = DispatchTime.now().uptimeNanoseconds
+        guard let cb2 = queue.makeCommandBuffer(),
+              let fill2 = cb2.makeBlitCommandEncoder() else { return false }
+        fill2.fill(buffer: heads, range: 0..<countBytes, value: 0)
+        fill2.endEncoding()
+        guard let enc2 = cb2.makeComputeCommandEncoder() else { return false }
+        encodeScatter(enc2)
+        encodeOrder(enc2)
+        try encodeTail(enc2)
+        enc2.endEncoding()
+        clock = DispatchTime.now().uptimeNanoseconds
+        cb2.commit()
+        cb2.waitUntilCompleted()
+        liveTiming.gpuMilliseconds += Self.milliseconds(since: clock)
+        if let err = cb2.error { throw err }
 
         liveTiming.dispatchedTiles += boxTiles
         liveTiming.sdfEvaluations += total * (liveTile * liveTile)
