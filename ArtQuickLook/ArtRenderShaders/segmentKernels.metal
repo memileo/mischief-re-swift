@@ -1583,12 +1583,14 @@ kernel void liveBinTransformKernel(
 }
 
 // Gather-path tile binning (clustered artwork / zoomed-out views): one thread per tile
-// walks ALL segments in document order and keeps the ones covering its tile. Perfectly
-// load-balanced (every tile runs exactly segCount iterations — no divergence in loop
-// count), zero atomics, and the list comes out in ascending order BY CONSTRUCTION, so
-// no sort is needed. Costs O(boxTiles × segCount) cheap range tests, so the CPU picks
-// this path only when that product is small (see `GpuBinSpec.useGather`); the
-// scatter+sort path stays for large even distributions like kaos.
+// walks ALL segments in document order and keeps the ones covering its tile. Zero
+// atomics, and the list comes out in ascending order BY CONSTRUCTION, so no sort is
+// needed. Segments stream through threadgroup-local 1024-entry windows (see below):
+// aggregate DRAM traffic is groups × segCount × 16B, NOT tiles × segCount — a naive
+// per-thread stream thrashes every cache on the chip (measured 10–100ms). Costs
+// O(boxTiles × segCount) local-memory tests, so the CPU picks this path only when
+// that product is small (see `GpuBinSpec.useGather`); the scatter+sort path stays
+// for large even distributions like kaos.
 
 // Pass 1: per-tile incidence counts. Plain stores (each tile written by exactly its
 // own thread) — the CPU prefix-sums these exactly like the atomic counts.
@@ -1596,45 +1598,88 @@ kernel void liveBinGatherCountKernel(
     constant LiveBinBoxParams &p [[buffer(0)]],
     const device int4 *ranges [[buffer(1)]],
     device uint *counts [[buffer(2)]],
-    uint3 tpg [[thread_position_in_grid]])
+    uint3 tpg [[thread_position_in_grid]],
+    uint3 ttid [[thread_position_in_threadgroup]],
+    uint3 tptg [[threads_per_threadgroup]])
 {
     uint t = tpg.x;
     uint tileCount = uint(p.boxW) * uint(p.boxH);
-    if (t >= tileCount) return;
-    int atx = p.boxMinX + int(t % uint(p.boxW));
-    int aty = p.boxMinY + int(t / uint(p.boxW));
-    uint n = 0;
-    for (uint gid = 0; gid < p.segCount; ++gid) {
-        int4 r = ranges[gid];
-        // The empty sentinel (1,0,0,0) has x > z, so it fails this test automatically.
-        if (r.x <= atx && atx <= r.z && r.y <= aty && aty <= r.w) ++n;
+    threadgroup int4 window[1024];
+    uint tid = ttid.x;
+    uint tpw = tptg.x;
+    // No early return past this point: every lane must reach both barriers below
+    // (a diverged barrier hangs the group) — idle lanes wait via `active`.
+    bool active = t < tileCount;
+    int atx = 0, aty = 0;
+    if (active) {
+        atx = p.boxMinX + int(t % uint(p.boxW));
+        aty = p.boxMinY + int(t / uint(p.boxW));
     }
-    counts[t] = n;
+    uint n = 0;
+    for (uint c0 = 0; c0 < p.segCount; c0 += 1024u) {
+        uint clen = min(1024u, p.segCount - c0);
+        for (uint i = tid; i < clen; i += tpw) {
+            window[i] = ranges[c0 + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (uint i = 0; i < clen; ++i) {
+                int4 r = window[i];
+                // The empty sentinel (1,0,0,0) has x > z, so it is skipped by the test below.
+                if (r.x <= atx && atx <= r.z && r.y <= aty && aty <= r.w) ++n;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (active) counts[t] = n;
 }
 
 // Pass 2 (after the CPU prefix): fill each tile's slice in ascending segment order.
-// `dst < end` bounds the walk AND the writes: the count pass guarantees exactly
-// `count` matches, so the slice fills exactly.
+// `dst < end` bounds the inner scan AND the writes: the count pass guarantees exactly
+// `count` matches, so the slice fills exactly. (It must NOT bound the chunk loop —
+// see NOTE below — or idle lanes would skip the barriers and hang the group.)
 kernel void liveBinGatherFillKernel(
     constant LiveBinBoxParams &p [[buffer(0)]],
     const device int4 *ranges [[buffer(1)]],
     const device TileIndex *tiles [[buffer(2)]],
     device uint *tileList [[buffer(3)]],
-    uint3 tpg [[thread_position_in_grid]])
+    uint3 tpg [[thread_position_in_grid]],
+    uint3 ttid [[thread_position_in_threadgroup]],
+    uint3 tptg [[threads_per_threadgroup]])
 {
     uint t = tpg.x;
     uint tileCount = uint(p.boxW) * uint(p.boxH);
-    if (t >= tileCount) return;
-    int atx = p.boxMinX + int(t % uint(p.boxW));
-    int aty = p.boxMinY + int(t / uint(p.boxW));
-    uint dst = tiles[t].start;
-    uint end = dst + tiles[t].count;
-    for (uint gid = 0; gid < p.segCount && dst < end; ++gid) {
-        int4 r = ranges[gid];
-        if (r.x <= atx && atx <= r.z && r.y <= aty && aty <= r.w) {
-            tileList[dst] = gid;
-            ++dst;
+    threadgroup int4 window[1024];
+    uint tid = ttid.x;
+    uint tpw = tptg.x;
+    bool active = t < tileCount;
+    int atx = 0, aty = 0;
+    uint dst = 0, end = 0;
+    if (active) {
+        atx = p.boxMinX + int(t % uint(p.boxW));
+        aty = p.boxMinY + int(t / uint(p.boxW));
+        dst = tiles[t].start;
+        end = dst + tiles[t].count;
+    }
+    // NOTE: the chunk loop bound is global on purpose — `dst < end` lives only on the
+    // inner scan. A per-lane outer bound would let idle lanes skip the barriers and
+    // hang the threadgroup.
+    for (uint c0 = 0; c0 < p.segCount; c0 += 1024u) {
+        uint clen = min(1024u, p.segCount - c0);
+        for (uint i = tid; i < clen; i += tpw) {
+            window[i] = ranges[c0 + i];
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (uint i = 0; i < clen && dst < end; ++i) {
+                int4 r = window[i];
+                if (r.x <= atx && atx <= r.z && r.y <= aty && aty <= r.w) {
+                    tileList[dst] = c0 + i;
+                    ++dst;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
