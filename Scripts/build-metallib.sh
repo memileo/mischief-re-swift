@@ -85,16 +85,31 @@ REQUIRED_KERNELS=(
 
 # Names are matched as substrings: depending on the compiler a metallib stores them
 # standalone or with a suffix, and "close enough to be found" is what matters here.
-has_function() {
-    local file="$1" name="$2"
-    strings -a "$file" 2>/dev/null | grep -Fq -- "$name"
+# Two inspection methods — `metal-nm` knows the symbol table, `strings` sees through
+# almost anything else. A name counts as present when EITHER method sees it (each
+# method can silently yield nothing on some setups: missing CLI tools, unexpected
+# container layout — and "every kernel missing" then means the inspection failed,
+# not the metallib).
+inspect_symbols() {
+    local file="$1"
+    if command -v xcrun >/dev/null 2>&1; then
+        xcrun -sdk macosx metal-nm "$file" 2>/dev/null || true
+    fi
+    strings -a "$file" 2>/dev/null || true
 }
 
 verify() {
     local file="$1" missing=0 missing_live=0
     [[ -f "$file" ]] || { echo "  no such file: $file"; return 1; }
+    local haystack
+    haystack="$(inspect_symbols "$file")"
+    if [[ -z "${haystack//[[:space:]]/}" ]]; then
+        echo "  WARNING: neither metal-nm nor strings could read symbols from $file."
+        echo "  (inspection tools failed — this says nothing about the metallib itself;"
+        echo "   the runtime's makeFunction check at launch is authoritative.)"
+    fi
     for kernel in "${REQUIRED_KERNELS[@]}"; do
-        if ! has_function "$file" "$kernel"; then
+        if [[ "$haystack" != *"$kernel"* ]]; then
             echo "  MISSING: $kernel"
             missing=1
             [[ " ${LIVE_KERNELS[*]} " == *" $kernel "* ]] && missing_live=1

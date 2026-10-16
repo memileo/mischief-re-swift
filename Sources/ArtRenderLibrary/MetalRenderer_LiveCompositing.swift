@@ -946,23 +946,18 @@ extension MetalRenderer {
                 memcpy(dst, src, raw.count)
             }
         }
-        // Merge pairs for every pass, built upfront (pure integer work): pass 0 holds
-        // the most pairs, so one allocation covers all passes. A non-empty pass table
-        // with zero pairs is inconsistent — fall back to CPU rather than mis-sort.
-        var runSize0 = GpuBinSpec.sortChunkSize
-        var passPairs: [[GpuBinMergePair]] = []
-        passPairs.reserveCapacity(mergePasses)
-        var maxPairs = 0
-        for _ in 0..<mergePasses {
-            let prs = GpuBinSpec.mergePairs(entries: entries, runSize: runSize0)
-            maxPairs = max(maxPairs, prs.count)
-            passPairs.append(prs)
-            runSize0 *= 2
-        }
+        // Merge plan for every pass, built upfront (pure integer work): all passes live
+        // concatenated in ONE pair buffer with per-pass offsets. Rewriting one shared
+        // buffer per pass is a GPU hazard — dispatches in a command buffer read their
+        // buffers at EXECUTION time, so every pass would see the last pass's pairs and
+        // silently mis-sort. A pass table that is non-empty yet holds zero pairs is
+        // inconsistent — fall back to CPU rather than mis-sort.
+        let (passPairs, passOffsets, totalPairs) =
+            GpuBinSpec.mergePlan(entries: entries, mergePasses: mergePasses)
         if mergePasses > 0 {
-            guard maxPairs > 0, passPairs.allSatisfy({ !$0.isEmpty }) else { return false }
-            if ref.pairCap < maxPairs {
-                let cap = max(maxPairs, ref.pairCap * 2)
+            guard totalPairs > 0, passPairs.allSatisfy({ !$0.isEmpty }) else { return false }
+            if ref.pairCap < totalPairs {
+                let cap = max(totalPairs, ref.pairCap * 2)
                 guard let buf = device.makeBuffer(length: cap * MemoryLayout<GpuBinMergePair>.stride,
                                                   options: .storageModeShared) else {
                     return false
@@ -970,7 +965,17 @@ extension MetalRenderer {
                 ref.sortPairs = buf
                 ref.pairCap = cap
             }
-            guard ref.sortPairs != nil else { return false }
+            guard let pairBuf = ref.sortPairs else { return false }
+            let pairBase = pairBuf.contents()
+            for (pass, prs) in passPairs.enumerated() {
+                prs.withUnsafeBytes { raw in
+                    if let src = raw.baseAddress {
+                        memcpy(pairBase.advanced(by: passOffsets[pass]
+                                                * MemoryLayout<GpuBinMergePair>.stride),
+                               src, raw.count)
+                    }
+                }
+            }
         }
         // The render kernel reads whichever buffer the ping-pong leaves full: tileList
         // when no merge ran or after an even pass count, scratch after an odd one.
@@ -1021,7 +1026,7 @@ extension MetalRenderer {
             encoder.setBuffer(tileList, offset: 0, index: 4)
             encoder.dispatchThreadgroups(binGroups(ref.segCount), threadsPerThreadgroup: binThreads)
         }
-        func encodeOrder(_ encoder: MTLComputeCommandEncoder) throws {
+        func encodeChunkSort(_ encoder: MTLComputeCommandEncoder) throws {
             guard !sortChunks.isEmpty else { return }
             guard let sortChunkBuf else { throw MetalRendererError.bufferCreationFailed }
             // One 512-wide threadgroup per chunk (required: the kernel bitonic-sorts
@@ -1034,31 +1039,36 @@ extension MetalRenderer {
             encoder.setBuffer(tileList, offset: 0, index: 2)
             encoder.dispatchThreadgroups(MTLSize(width: sortChunks.count, height: 1, depth: 1),
                                          threadsPerThreadgroup: MTLSize(width: 512, height: 1, depth: 1))
-            var runSize = GpuBinSpec.sortChunkSize
-            for (pass, prs) in passPairs.enumerated() {
-                // Strict tileList/scratch alternation — src is never dst, so the merge
-                // can never clobber its own unread input (in-place merging corrupts).
-                // Copies carry finished tiles along; the final buffer holds everything.
-                guard let sortPairBuf = ref.sortPairs else {
-                    throw MetalRendererError.bufferCreationFailed
-                }
-                prs.withUnsafeBytes { raw in
-                    if let src = raw.baseAddress {
-                        memcpy(sortPairBuf.contents(), src, raw.count)
-                    }
-                }
-                let srcBuf: MTLBuffer = (pass % 2 == 1) ? tileScratch : tileList
-                let dstBuf: MTLBuffer = (pass % 2 == 1) ? tileList : tileScratch
-                var mp = LiveBinSortParams(unitCount: UInt32(prs.count),
-                                           runSize: UInt32(runSize))
-                encoder.setComputePipelineState(mergePipe)
-                encoder.setBytes(&mp, length: MemoryLayout<LiveBinSortParams>.stride, index: 0)
-                encoder.setBuffer(sortPairBuf, offset: 0, index: 1)
-                encoder.setBuffer(srcBuf, offset: 0, index: 2)
-                encoder.setBuffer(dstBuf, offset: 0, index: 3)
-                encoder.dispatchThreadgroups(binGroups(prs.count),
-                                             threadsPerThreadgroup: binThreads)
-                runSize *= 2
+        }
+        func encodeMergePass(_ encoder: MTLComputeCommandEncoder, pass: Int) throws {
+            let prs = passPairs[pass]
+            guard let sortPairBuf = ref.sortPairs else {
+                throw MetalRendererError.bufferCreationFailed
+            }
+            // Strict tileList/scratch alternation — src is never dst, so the merge
+            // can never clobber its own unread input (in-place merging corrupts).
+            // Copies carry finished tiles along; the final buffer holds everything.
+            // The pairs are bound at this pass's offset in the upfront-uploaded plan —
+            // never rewritten during encoding (same-command-buffer dispatches read
+            // buffers at execution time).
+            let srcBuf: MTLBuffer = (pass % 2 == 1) ? tileScratch : tileList
+            let dstBuf: MTLBuffer = (pass % 2 == 1) ? tileList : tileScratch
+            var mp = LiveBinSortParams(unitCount: UInt32(prs.count),
+                                       runSize: UInt32(GpuBinSpec.sortChunkSize << pass))
+            encoder.setComputePipelineState(mergePipe)
+            encoder.setBytes(&mp, length: MemoryLayout<LiveBinSortParams>.stride, index: 0)
+            encoder.setBuffer(sortPairBuf,
+                              offset: passOffsets[pass] * MemoryLayout<GpuBinMergePair>.stride,
+                              index: 1)
+            encoder.setBuffer(srcBuf, offset: 0, index: 2)
+            encoder.setBuffer(dstBuf, offset: 0, index: 3)
+            encoder.dispatchThreadgroups(binGroups(prs.count),
+                                         threadsPerThreadgroup: binThreads)
+        }
+        func encodeOrder(_ encoder: MTLComputeCommandEncoder) throws {
+            try encodeChunkSort(encoder)
+            for pass in passPairs.indices {
+                try encodeMergePass(encoder, pass: pass)
             }
         }
         // Shared tail: per-tile render + layer composite onto `encoder`.
@@ -1083,31 +1093,118 @@ extension MetalRenderer {
             encoder.dispatchThreadgroups(Self.liveGroups(width: width, height: height),
                                          threadsPerThreadgroup: Self.liveThreads)
         }
-        if stageTiming {
+        // ART_LIVE_BINCHECK=1: force the split-CB form and read the tile list back
+        // after every stage (scatter, chunk sort, each merge pass), verifying every
+        // index is in bounds and every finished run is ascending. Prints the first
+        // offender per stage — one run attributes the corruption to its stage.
+        // Diagnostic only (full readbacks); steady state stays single-CB.
+        let binCheck = LiveConfig.binCheckEnabled()
+        func readbackTileList(_ src: MTLBuffer) -> [UInt32]? {
+            guard total > 0 else { return [] }
+            let bytes = total * MemoryLayout<UInt32>.size
+            if ref.binCheckStaging == nil || ref.binCheckStaging!.length < bytes {
+                guard let buf = device.makeBuffer(length: bytes,
+                                                  options: .storageModeShared) else { return nil }
+                ref.binCheckStaging = buf
+            }
+            guard let staging = ref.binCheckStaging,
+                  let cb = queue.makeCommandBuffer(),
+                  let blit = cb.makeBlitCommandEncoder() else { return nil }
+            blit.copy(from: src, sourceOffset: 0, to: staging, destinationOffset: 0,
+                      size: bytes)
+            blit.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+            if cb.error != nil { return nil }
+            var arr = [UInt32](repeating: 0, count: total)
+            arr.withUnsafeMutableBytes { raw in
+                if let dst = raw.baseAddress { memcpy(dst, staging.contents(), bytes) }
+            }
+            return arr
+        }
+        func tileOfSlot(_ s: Int) -> Int? {
+            for (t, e) in entries.enumerated()
+                where s >= Int(e.start) && s < Int(e.start) + Int(e.count) { return t }
+            return nil
+        }
+        func checkBounds(_ arr: [UInt32], stage: String) {
+            for (s, v) in arr.enumerated() where Int(v) >= ref.segCount {
+                let where_ = tileOfSlot(s).map { "tile \($0)" } ?? "no tile (gap past total?)"
+                print("livebin-check layer \(position) \(stage): OOB value \(v) at slot " +
+                      "\(s) (\(where_), segs \(ref.segCount))")
+                return
+            }
+            print("livebin-check layer \(position) \(stage): bounds OK " +
+                  "(\(arr.count) slots, segs \(ref.segCount))")
+        }
+        func checkRuns(_ arr: [UInt32], stage: String, runs: [(start: Int, len: Int)]) {
+            for r in runs where r.len >= 2 {
+                var prev = arr[r.start]
+                for k in 1..<r.len {
+                    let v = arr[r.start + k]
+                    if v < prev {
+                        let where_ = tileOfSlot(r.start).map { "tile \($0)" } ?? "?"
+                        print("livebin-check layer \(position) \(stage): run not ascending " +
+                              "at slot \(r.start + k) (\(where_): ... \(prev) > \(v) ...)")
+                        return
+                    }
+                    prev = v
+                }
+            }
+            print("livebin-check layer \(position) \(stage): order OK (\(runs.count) runs)")
+        }
+        if stageTiming || binCheck {
             guard let cbH = queue.makeCommandBuffer(),
                   let fillH = cbH.makeBlitCommandEncoder(),
                   let cbS = queue.makeCommandBuffer(),
-                  let encS = cbS.makeComputeCommandEncoder(),
-                  let cbO = queue.makeCommandBuffer(),
-                  let encO = cbO.makeComputeCommandEncoder(),
-                  let cbR = queue.makeCommandBuffer(),
-                  let encR = cbR.makeComputeCommandEncoder() else { return false }
+                  let encS = cbS.makeComputeCommandEncoder() else { return false }
             fillH.fill(buffer: heads, range: 0..<countBytes, value: 0)
             fillH.endEncoding()
             _ = try sync(cbH)
             encodeScatter(encS)
             encS.endEncoding()
             tScatter = try sync(cbS)
-            try encodeOrder(encO)
-            encO.endEncoding()
-            tSort = try sync(cbO)
+            if binCheck, let scattered = readbackTileList(tileList) {
+                checkBounds(scattered, stage: "scatter")
+            }
+            guard let cbC = queue.makeCommandBuffer(),
+                  let encC = cbC.makeComputeCommandEncoder() else { return false }
+            try encodeChunkSort(encC)
+            encC.endEncoding()
+            tSort = try sync(cbC)
+            if binCheck, let sorted = readbackTileList(tileList) {
+                checkBounds(sorted, stage: "chunksort")
+                checkRuns(sorted, stage: "chunksort",
+                          runs: sortChunks.map { (Int($0.start), Int($0.len)) })
+            }
+            for pass in passPairs.indices {
+                guard let cbM = queue.makeCommandBuffer(),
+                      let encM = cbM.makeComputeCommandEncoder() else { return false }
+                try encodeMergePass(encM, pass: pass)
+                encM.endEncoding()
+                tSort += try sync(cbM)
+                if binCheck {
+                    // Pass p writes (p odd ? tileList : scratch) — read back the output.
+                    let outBuf: MTLBuffer = (pass % 2 == 1) ? tileList : tileScratch
+                    if let merged = readbackTileList(outBuf) {
+                        checkBounds(merged, stage: "merge\(pass)")
+                        checkRuns(merged, stage: "merge\(pass)",
+                                  runs: passPairs[pass].map {
+                                    (Int($0.dst), Int($0.aLen) + Int($0.bLen)) })
+                    }
+                }
+            }
+            guard let cbR = queue.makeCommandBuffer(),
+                  let encR = cbR.makeComputeCommandEncoder() else { return false }
             try encodeTail(encR)
             encR.endEncoding()
             tRender = try sync(cbR)
             liveTiming.gpuMilliseconds += tScatter + tSort + tRender
-            print(String(format: "livebin layer %d: segs %d tiles %d chunks %d passes %d — xform %.2f scatter %.2f sort %.2f render+comp %.2f ms",
-                         position, ref.segCount, boxTiles, sortChunks.count, mergePasses,
-                         tXform, tScatter, tSort, tRender))
+            if stageTiming {
+                print(String(format: "livebin layer %d: segs %d tiles %d chunks %d passes %d — xform %.2f scatter %.2f sort %.2f render+comp %.2f ms",
+                             position, ref.segCount, boxTiles, sortChunks.count, mergePasses,
+                             tXform, tScatter, tSort, tRender))
+            }
             liveTiming.dispatchedTiles += boxTiles
             liveTiming.sdfEvaluations += total * (liveTile * liveTile)
             liveTiming.strokes += visStrokeIDs.count

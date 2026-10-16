@@ -209,6 +209,12 @@ final class LiveConfigTests: XCTestCase {
         XCTAssertFalse(LiveConfig.binStageTimingEnabled(environment: ["ART_LIVE_BINTIME": "0"]))
     }
 
+    func testBinCheckDefaultsOff() {
+        XCTAssertFalse(LiveConfig.binCheckEnabled(environment: [:]))
+        XCTAssertTrue(LiveConfig.binCheckEnabled(environment: ["ART_LIVE_BINCHECK": "1"]))
+        XCTAssertFalse(LiveConfig.binCheckEnabled(environment: ["ART_LIVE_BINCHECK": "0"]))
+    }
+
     func testLiveTileSizeDefaultsSixteen() {
         XCTAssertEqual(LiveConfig.liveTileSize(environment: [:]), 16)
         XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_TILE_SIZE": "32"]), 32)
@@ -435,6 +441,38 @@ final class GpuBinSpecTests: XCTestCase {
         XCTAssertTrue(GpuBinSpec.mergePairs(entries: e2, runSize: 512).isEmpty)
     }
 
+    func testMergePlanOffsetsPackAllPasses() {
+        // Locks the GPU upload contract: every pass's pairs concatenated in one
+        // buffer, offsets[p] = pairs of all earlier passes. The kernel binds its
+        // pass at offsets[pass] — a wrong offset reads another pass's pairs and
+        // silently mis-sorts (the per-pass rewrite hazard this replaced).
+        let (entries, _, _) = GpuBinSpec.combine(counts: [600, 100, 0, 1, 2000])
+        let (_, _, passes) = GpuBinSpec.chunkTable(entries: entries)
+        XCTAssertGreaterThan(passes, 0)
+        let plan = GpuBinSpec.mergePlan(entries: entries, mergePasses: passes)
+        XCTAssertEqual(plan.pairs.count, passes)
+        XCTAssertEqual(plan.offsets.count, passes)
+        XCTAssertEqual(plan.offsets[0], 0)
+        var running = 0
+        var runSize = GpuBinSpec.sortChunkSize
+        for p in 0..<passes {
+            XCTAssertEqual(plan.offsets[p], running)
+            // Same tables the per-pass spec builds — the plan is packing, not
+            // recomputation.
+            XCTAssertEqual(plan.pairs[p].map { [$0.aStart, $0.aLen, $0.bLen, $0.dst] },
+                           GpuBinSpec.mergePairs(entries: entries, runSize: runSize)
+                               .map { [$0.aStart, $0.aLen, $0.bLen, $0.dst] })
+            running += plan.pairs[p].count
+            runSize *= 2
+        }
+        XCTAssertEqual(plan.totalPairs, running)
+        // Zero passes → empty plan (chunk sort only, render reads the tile list).
+        let empty = GpuBinSpec.mergePlan(entries: entries, mergePasses: 0)
+        XCTAssertTrue(empty.pairs.isEmpty)
+        XCTAssertTrue(empty.offsets.isEmpty)
+        XCTAssertEqual(empty.totalPairs, 0)
+    }
+
     func testChunkSortMergeMatchesSorted() {
         // Locks the GPU chunked-sort contract end to end, using the REAL specs: chunk
         // bitonic sort + per-pass pair tables with strict buffer alternation (render
@@ -460,13 +498,13 @@ final class GpuBinSpecTests: XCTestCase {
                 bitonicChunkSort(&slice)
                 a.replaceSubrange(Int(c.start)..<Int(c.start) + Int(c.len), with: slice)
             }
-            // Merge passes over the real pair tables with strict tileList/scratch
-            // alternation (mirror of liveBinMergePassV2Kernel's src != dst contract):
-            // each pass reads one buffer and writes the other, then they swap.
+            // Merge passes over the REAL plan (mirror of liveBinMergePassV2Kernel's
+            // src != dst contract): each pass reads one buffer and writes the other,
+            // then they swap. Uses mergePlan — the exact function the renderer
+            // uploads — so this test guards the shipped tables, not a re-derivation.
             var cur = a, nxt = [UInt32](repeating: 0, count: total)
-            var runSize = GpuBinSpec.sortChunkSize
-            for _ in 0..<passes {
-                let prs = GpuBinSpec.mergePairs(entries: entries, runSize: runSize)
+            let plan = GpuBinSpec.mergePlan(entries: entries, mergePasses: passes)
+            for prs in plan.pairs {
                 for pr in prs {
                     let aStart = Int(pr.aStart), aLen = Int(pr.aLen)
                     let bLen = Int(pr.bLen), d = Int(pr.dst)
@@ -483,7 +521,6 @@ final class GpuBinSpecTests: XCTestCase {
                     while ib < bLen { nxt[dd] = cur[aStart + aLen + ib]; ib += 1; dd += 1 }
                 }
                 swap(&cur, &nxt)
-                runSize *= 2
             }
             // Render reads whichever buffer the ping-pong leaves full.
             let final = cur

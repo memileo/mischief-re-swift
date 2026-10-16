@@ -281,6 +281,16 @@ public enum LiveConfig {
         return env["ART_LIVE_BINTIME"] == "1"
     }
 
+    /// Tile-list integrity check for the binned path (`ART_LIVE_BINCHECK=1`): forces
+    /// the split-CB form and reads the tile list back after every stage (scatter,
+    /// chunk sort, each merge pass), verifying every index is in bounds and every
+    /// finished run is ascending. Prints the first offender per stage. Diagnostic
+    /// only — slow (full readbacks), never on by default.
+    public static func binCheckEnabled(environment: [String: String]? = nil) -> Bool {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        return env["ART_LIVE_BINCHECK"] == "1"
+    }
+
     /// Tile size for the *live* binning/dispatch. Resolution order:
     /// `ART_LIVE_TILE_SIZE` → `ART_TILE_SIZE` → 16 (the measured default).
     /// The static path keeps its own default (32); only the live path uses this.
@@ -430,6 +440,32 @@ public enum GpuBinSpec {
             }
         }
         return pairs
+    }
+
+    /// Merge plan for all `mergePasses` passes: per-pass pair tables plus each pass's
+    /// slot offset in one concatenated pair buffer (`offsets[p]` = total pairs of all
+    /// earlier passes, `totalPairs` = grand total). The GPU needs every pass's pairs
+    /// resident at dispatch time — rewriting one shared buffer per pass is a hazard
+    /// (earlier dispatches in the same command buffer would read the LAST pass's
+    /// pairs, silently mis-sorting), so all passes are uploaded once up front and
+    /// each dispatch binds its own offset. Pure integer logic, runs on Linux.
+    public static func mergePlan(entries: [GpuBinTileEntry], mergePasses: Int,
+                                 chunkSize: Int = sortChunkSize)
+        -> (pairs: [[GpuBinMergePair]], offsets: [Int], totalPairs: Int) {
+        var pairs: [[GpuBinMergePair]] = []
+        pairs.reserveCapacity(mergePasses)
+        var offsets: [Int] = []
+        offsets.reserveCapacity(mergePasses)
+        var total = 0
+        var runSize = chunkSize
+        for _ in 0..<mergePasses {
+            offsets.append(total)
+            let prs = mergePairs(entries: entries, runSize: runSize)
+            pairs.append(prs)
+            total += prs.count
+            runSize *= 2
+        }
+        return (pairs, offsets, total)
     }
 
     /// Fixed sort work quantum (entries). Every GPU sort thread sorts at most this
