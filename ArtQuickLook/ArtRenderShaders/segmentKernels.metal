@@ -1579,15 +1579,15 @@ kernel void liveBinScatterKernel(
 }
 
 // Ascending document order, restored with bounded work per thread (zoom-independent).
-// One thread sorting even a 512-entry chunk in global memory goes latency-bound
-// (dependent loads nothing can hide), so: the CPU splits every tile slice into fixed
-// 512-entry chunks (`GpuBinSpec.chunkTable`), one *threadgroup* bitonic-sorts one
-// chunk entirely in threadgroup (SRAM) memory, then pairwise merge passes over a tiny
-// CPU-built pair table (`GpuBinSpec.mergePairs`, one thread per pair, sequential
-// runs) restore full order. The common case (every tile fits one chunk) needs zero
-// merge passes. The CPU scatter is stable, so sorted-ascending == the exact CPU tile
-// list, which is what makes the per-tile render kernel's stroke grouping correct.
-// Segment indices are unique, so only ascending order matters.
+// The CPU splits every tile slice into fixed 512-entry chunks (`GpuBinSpec.chunkTable`);
+// one thread heapsorts one chunk in place (`liveBinChunkSortV3Kernel`: no pads, no
+// barriers, no cross-thread cooperation — its failure mode is misordering, never
+// poison), then pairwise merge passes over a tiny CPU-built pair table
+// (`GpuBinSpec.mergePairs`, one thread per pair, sequential runs) restore full order. The common case (every tile fits
+// one chunk) needs zero merge passes. The CPU scatter is stable, so sorted-ascending
+// == the exact CPU tile list, which is what makes the per-tile render kernel's
+// stroke grouping correct. Segment indices are unique, so only ascending order
+// matters.
 //
 // Chunk size 512 must match `GpuBinSpec.sortChunkSize` (merge run sizes start at one
 // chunk and double from there).
@@ -1598,40 +1598,56 @@ struct LiveBinSortParams {
     uint runSize;
 };
 
-// Sort one 512-entry chunk in SRAM (bitonic network, 512 threads cooperating — the
-// dispatch MUST use 512 threads per threadgroup, one threadgroup per chunk).
-// Chunks cover only slices with >= 2 entries and hold at most 512 of them; shorter
-// chunks are padded with UINT_MAX in SRAM only (sinks to the end, never written back).
-kernel void liveBinChunkSortV2Kernel(
+// Sort one 512-entry chunk in place with a per-thread heapsort (O(n log n) worst
+// case). Deliberately NO cross-thread cooperation: no threadgroup memory, no pads,
+// no barriers — one thread owns its chunk start to finish, so the kernel can only
+// ever permute the scattered indices, never inject out-of-range values. (A 512-wide
+// cooperative bitonic tried here sorted correctly in review and in the Swift mirror
+// yet emitted UINT_MAX pads into the tile list on-device — BINCHECK attributed;
+// cooperation removed, class of failure removed.) Chunks hold at most 512 entries,
+// so per-thread work stays bounded at any zoom; the pair-parallel merges reassemble
+// full order. Chunk size 512 must match `GpuBinSpec.sortChunkSize` (merge run sizes
+// start at one chunk and double from there).
+
+// Max-heap sift-down over `list[0, heapEnd)`: drops `v` from `root` to its heap
+// position. Iterative (no recursion/stack) and in-place — Metal-2 safe.
+inline void liveBinSiftDown(device uint *list, uint root, uint v, uint heapEnd) {
+    for (;;) {
+        uint left = root * 2 + 1;
+        if (left >= heapEnd) break;
+        uint right = left + 1;
+        uint child = (right < heapEnd && list[right] > list[left]) ? right : left;
+        if (list[child] <= v) break;
+        list[root] = list[child];
+        root = child;
+    }
+    list[root] = v;
+}
+
+// Sort one chunk in place (heapsort via `liveBinSiftDown`). Chunks cover only
+// slices with >= 2 entries and hold at most 512 of them, so per-thread nonlinear
+// work is bounded no matter how far the user zooms out.
+kernel void liveBinChunkSortV3Kernel(
     constant LiveBinSortParams &p [[buffer(0)]],
     const device uint2 *chunks [[buffer(1)]],
     device uint *tileList [[buffer(2)]],
-    uint3 tpg [[threadgroup_position_in_grid]],
-    uint3 ttid [[thread_position_in_threadgroup]])
+    uint3 tpg [[thread_position_in_grid]])
 {
     uint c = tpg.x;
     if (c >= p.unitCount) return;
     uint start = chunks[c].x;
     uint len = chunks[c].y;
     if (len < 2) return;
-    // One whole chunk fits in SRAM (512 x 4B = 2KB of the 32KB threadgroup budget).
-    // Uniform per group (len is per-chunk), so the barriers below always converge.
-    threadgroup uint buf[512];
-    uint tid = ttid.x;
-    buf[tid] = (tid < len) ? tileList[start + tid] : 0xFFFFFFFFu;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint k = 2u; k <= 512u; k <<= 1) {
-        for (uint j = k >> 1; j > 0u; j >>= 1) {
-            uint ix = tid ^ j;
-            if (ix > tid) {
-                uint a = buf[tid], b = buf[ix];
-                bool up = ((tid & k) == 0u);
-                if ((a > b) == up) { buf[tid] = b; buf[ix] = a; }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
+    device uint *list = tileList + start;
+    for (uint i = len / 2; i > 0; --i) {
+        liveBinSiftDown(list, i - 1, list[i - 1], len);
     }
-    if (tid < len) tileList[start + tid] = buf[tid];
+    for (uint end = len; end > 1; --end) {
+        uint maxV = list[0];
+        // Move the tail into the root, restore the heap over [0, end - 1), park max.
+        liveBinSiftDown(list, 0, list[end - 1], end - 1);
+        list[end - 1] = maxV;
+    }
 }
 
 // One pairwise merge over the CPU-built pair table: one thread per pair, serial

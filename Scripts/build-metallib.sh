@@ -61,7 +61,7 @@ LIVE_KERNELS=(
     livePerTileNoiseCompositeKernel
     liveBinTransformCountKernel
     liveBinScatterKernel
-    liveBinChunkSortV2Kernel
+    liveBinChunkSortV3Kernel
     liveBinMergePassV2Kernel
 )
 REQUIRED_KERNELS=(
@@ -144,6 +144,22 @@ install() {
     return 1
 }
 
+# Portable command timeout for macOS (no `timeout(1)` there): runs the command in
+# the background and kills it after N seconds. Returns the command's status, or a
+# non-zero status on timeout. Callers under `set -e` must guard with `|| true`.
+with_timeout() {
+    local secs="$1"; shift
+    "$@" &
+    local pid=$!
+    (sleep "$secs"; kill -9 "$pid" 2>/dev/null) &
+    local watcher=$!
+    wait "$pid"
+    local rc=$?
+    kill "$watcher" 2>/dev/null
+    wait "$watcher" 2>/dev/null || true
+    return $rc
+}
+
 # Newest metallib under the given roots, newest first. Prints nothing if there is none.
 newest_metallib() {
     local roots=()
@@ -188,11 +204,28 @@ case "$mode" in
 
     from-xcode)
         FOUND=""
-        BUILT="$(products_dir_from_xcodebuild || true)"
-        if [[ -n "${BUILT:-}" ]]; then
-            echo "BUILT_PRODUCTS_DIR: $BUILT"
-            if [[ -f "$BUILT/ArtRenderShaders.metallib" ]]; then
-                FOUND="$BUILT/ArtRenderShaders.metallib"
+        # Fast escape hatch: point straight at the products dir, skipping both
+        # xcodebuild and the DerivedData search.
+        #   ART_METALLIB_DIR=.../Debug Scripts/build-metallib.sh --from-xcode
+        if [[ -n "${ART_METALLIB_DIR:-}" ]]; then
+            if [[ -f "$ART_METALLIB_DIR/ArtRenderShaders.metallib" ]]; then
+                echo "Using ART_METALLIB_DIR: $ART_METALLIB_DIR"
+                FOUND="$ART_METALLIB_DIR/ArtRenderShaders.metallib"
+            else
+                echo "ART_METALLIB_DIR is set but has no ArtRenderShaders.metallib: $ART_METALLIB_DIR" >&2
+                exit 1
+            fi
+        fi
+        if [[ -z "$FOUND" ]]; then
+            echo "Resolving BUILT_PRODUCTS_DIR via xcodebuild (one-off, can take a minute)…"
+            BUILT="$(with_timeout 120 products_dir_from_xcodebuild || true)"
+            if [[ -n "${BUILT:-}" ]]; then
+                echo "BUILT_PRODUCTS_DIR: $BUILT"
+                if [[ -f "$BUILT/ArtRenderShaders.metallib" ]]; then
+                    FOUND="$BUILT/ArtRenderShaders.metallib"
+                fi
+            else
+                echo "(xcodebuild probe timed out or failed — falling back to search)"
             fi
         fi
         if [[ -z "$FOUND" ]]; then

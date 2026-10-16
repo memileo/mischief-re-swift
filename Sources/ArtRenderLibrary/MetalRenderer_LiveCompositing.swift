@@ -218,7 +218,7 @@ extension MetalRenderer {
         let binKernels: [(String, (MTLComputePipelineState?) -> Void)] = [
             ("liveBinTransformCountKernel", { self.liveBinTransformCountPipeline = $0 }),
             ("liveBinScatterKernel", { self.liveBinScatterPipeline = $0 }),
-            ("liveBinChunkSortV2Kernel", { self.liveBinChunkSortPipeline = $0 }),
+            ("liveBinChunkSortV3Kernel", { self.liveBinChunkSortPipeline = $0 }),
             ("liveBinMergePassV2Kernel", { self.liveBinMergePassPipeline = $0 }),
         ]
         for (name, assign) in binKernels {
@@ -1029,16 +1029,16 @@ extension MetalRenderer {
         func encodeChunkSort(_ encoder: MTLComputeCommandEncoder) throws {
             guard !sortChunks.isEmpty else { return }
             guard let sortChunkBuf else { throw MetalRendererError.bufferCreationFailed }
-            // One 512-wide threadgroup per chunk (required: the kernel bitonic-sorts
-            // the whole chunk across exactly 512 lanes in SRAM).
+            // One thread per chunk, in place (the kernel is barrier- and pad-free, so
+            // any 1D grid shape works — the standard 256-wide bin grid).
             var sp = LiveBinSortParams(unitCount: UInt32(sortChunks.count),
                                        runSize: UInt32(GpuBinSpec.sortChunkSize))
             encoder.setComputePipelineState(chunkPipe)
             encoder.setBytes(&sp, length: MemoryLayout<LiveBinSortParams>.stride, index: 0)
             encoder.setBuffer(sortChunkBuf, offset: 0, index: 1)
             encoder.setBuffer(tileList, offset: 0, index: 2)
-            encoder.dispatchThreadgroups(MTLSize(width: sortChunks.count, height: 1, depth: 1),
-                                         threadsPerThreadgroup: MTLSize(width: 512, height: 1, depth: 1))
+            encoder.dispatchThreadgroups(binGroups(sortChunks.count),
+                                         threadsPerThreadgroup: binThreads)
         }
         func encodeMergePass(_ encoder: MTLComputeCommandEncoder, pass: Int) throws {
             let prs = passPairs[pass]

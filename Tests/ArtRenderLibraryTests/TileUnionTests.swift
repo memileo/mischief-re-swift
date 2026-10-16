@@ -294,54 +294,58 @@ final class GpuBinSpecTests: XCTestCase {
         XCTAssertEqual(MemoryLayout<GpuBinTileEntry>.size, 8)
     }
 
-    /// Swift mirror of `liveBinChunkSortV2Kernel`'s SRAM bitonic sort, kept
-    /// structurally identical (pad to 512 with UINT_MAX, same comparator network) so
-    /// this test guards the algorithm the GPU runs on every chunk. The sequential lane
-    /// loop replays the same disjoint compare-swaps one step performs in parallel.
-    private func bitonicChunkSort(_ list: inout [UInt32]) {
-        guard list.count >= 2 else { return }
-        precondition(list.count <= GpuBinSpec.sortChunkSize)
-        var buf = list + [UInt32](repeating: .max, count: GpuBinSpec.sortChunkSize - list.count)
-        var k = 2
-        while k <= GpuBinSpec.sortChunkSize {
-            var j = k / 2
-            while j > 0 {
-                for tid in 0..<GpuBinSpec.sortChunkSize {
-                    let ix = tid ^ j
-                    if ix > tid {
-                        let a = buf[tid], b = buf[ix]
-                        let up = (tid & k) == 0
-                        if (a > b) == up { buf[tid] = b; buf[ix] = a }
-                    }
-                }
-                j /= 2
+    /// Swift mirror of `liveBinChunkSortV3Kernel`'s in-place heapsort
+    /// (+ `liveBinSiftDown`), kept structurally identical so this test guards the
+    /// algorithm the GPU runs on every chunk.
+    private func heapSort(_ list: inout [UInt32]) {
+        func siftDown(_ list: inout [UInt32], _ root: Int, _ v: UInt32, _ heapEnd: Int) {
+            var root = root
+            while true {
+                let left = root * 2 + 1
+                if left >= heapEnd { break }
+                let right = left + 1
+                let child = (right < heapEnd && list[right] > list[left]) ? right : left
+                if list[child] <= v { break }
+                list[root] = list[child]
+                root = child
             }
-            k *= 2
+            list[root] = v
         }
-        list = Array(buf[0..<list.count])
+        let n = list.count
+        guard n >= 2 else { return }
+        var i = n / 2
+        while i > 0 {
+            i -= 1
+            siftDown(&list, i, list[i], n)
+        }
+        var end = n
+        while end > 1 {
+            end -= 1
+            let maxV = list[0]
+            siftDown(&list, 0, list[end], end)
+            list[end] = maxV
+        }
     }
 
-    func testBitonicChunkSortOrders() {
-        // Reverse-sorted full chunk.
-        var full = Array((0 as UInt32..<512).reversed())
-        bitonicChunkSort(&full)
-        XCTAssertEqual(full, Array(0 as UInt32..<512))
-        // Deterministic pseudo-random order at several lengths, plus edge sizes.
+    func testHeapSortOrdersAllDensities() {
+        // Reverse-sorted dense tile: the clustered worst case.
+        var dense = Array((0 as UInt32..<5000).reversed())
+        heapSort(&dense)
+        XCTAssertEqual(dense, Array(0 as UInt32..<5000))
+        // Deterministic pseudo-random order, plus edge sizes.
         var rng: UInt64 = 0x12345679
-        for n in [3, 100, 511, 512] {
-            var random = (0..<n).map { _ -> UInt32 in
-                rng = rng &* 6364136223846793005 &+ 1442695040888963407
-                return UInt32(truncatingIfNeeded: rng >> 33)
-            }
-            let expected = random.sorted()
-            bitonicChunkSort(&random)
-            XCTAssertEqual(random, expected, "length \(n)")
+        var random = (0..<3000).map { _ in
+            rng = rng &* 6364136223846793005 &+ 1442695040888963407
+            return UInt32(truncatingIfNeeded: rng >> 33)
         }
+        let expected = random.sorted()
+        heapSort(&random)
+        XCTAssertEqual(random, expected)
         var empty: [UInt32] = []
-        bitonicChunkSort(&empty)
+        heapSort(&empty)
         XCTAssertTrue(empty.isEmpty)
         var single: [UInt32] = [42]
-        bitonicChunkSort(&single)
+        heapSort(&single)
         XCTAssertEqual(single, [42])
     }
 
@@ -475,10 +479,10 @@ final class GpuBinSpecTests: XCTestCase {
 
     func testChunkSortMergeMatchesSorted() {
         // Locks the GPU chunked-sort contract end to end, using the REAL specs: chunk
-        // bitonic sort + per-pass pair tables with strict buffer alternation (render
+        // heapsort + per-pass pair tables with strict buffer alternation (render
         // reads whichever buffer the ping-pong leaves full) must reproduce the exact
         // ascending tile lists — including the dense single-tile worst case that
-        // stalled every per-thread sort tried so far (zoomed-out complex.art: ~2600/tile).
+        // stalled every per-thread sort tried so far (~2600 entries in one tile).
         func run(tileCounts: [Int], order: [UInt32]) -> Bool {
             let counts = tileCounts.map { UInt32($0) }
             let (entries, _, total) = GpuBinSpec.combine(counts: counts)
@@ -491,11 +495,11 @@ final class GpuBinSpecTests: XCTestCase {
                 a.replaceSubrange(Int(entries[t].start)..<Int(entries[t].start) + n, with: rev)
                 cursor += n
             }
-            // Chunk bitonic sort in place (mirror of liveBinChunkSortV2Kernel).
+            // Chunk heapsort in place (mirror of liveBinChunkSortV3Kernel).
             let (chunks, _, passes) = GpuBinSpec.chunkTable(entries: entries)
             for c in chunks {
                 var slice = Array(a[Int(c.start)..<Int(c.start) + Int(c.len)])
-                bitonicChunkSort(&slice)
+                heapSort(&slice)
                 a.replaceSubrange(Int(c.start)..<Int(c.start) + Int(c.len), with: slice)
             }
             // Merge passes over the REAL plan (mirror of liveBinMergePassV2Kernel's

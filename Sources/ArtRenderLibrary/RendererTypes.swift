@@ -387,7 +387,7 @@ public enum GpuBinSpec {
     }
 
     /// Splits every sortable tile slice (count >= 2) into fixed-size chunks for the
-    /// GPU chunked sort: one thread sorts one chunk in place (`liveBinChunkSortV2Kernel`),
+    /// GPU chunked sort: one thread sorts one chunk in place (`liveBinChunkSortV3Kernel`),
     /// then `mergePasses` pairwise merge passes (`liveBinMergePassV2Kernel`, runs doubling
     /// from one chunk) restore full ascending order. `mergePasses` is
     /// ceil(log2(maxChunks)) — 0 when every tile fits one chunk (the common case: no
@@ -470,7 +470,7 @@ public enum GpuBinSpec {
 
     /// Fixed sort work quantum (entries). Every GPU sort thread sorts at most this
     /// many entries, so per-thread nonlinear work is bounded no matter how far the
-    /// user zooms out. Must match the `512` in `liveBinChunkSortV2Kernel` /
+    /// user zooms out. Must match the `512` in `liveBinChunkSortV3Kernel` /
     /// `liveBinMergePassV2Kernel` (merge run sizes start at one chunk and double).
     public static let sortChunkSize = 512
 
