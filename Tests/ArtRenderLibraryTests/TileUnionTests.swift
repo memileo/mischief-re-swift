@@ -288,59 +288,54 @@ final class GpuBinSpecTests: XCTestCase {
         XCTAssertEqual(MemoryLayout<GpuBinTileEntry>.size, 8)
     }
 
-    /// Swift mirror of `liveBinChunkSortKernel`'s in-place heapsort
-    /// (+ `liveBinSiftDown`), kept structurally identical so this test guards the
-    /// algorithm the GPU runs on every chunk.
-    private func heapSort(_ list: inout [UInt32]) {
-        func siftDown(_ list: inout [UInt32], _ root: Int, _ v: UInt32, _ heapEnd: Int) {
-            var root = root
-            while true {
-                let left = root * 2 + 1
-                if left >= heapEnd { break }
-                let right = left + 1
-                let child = (right < heapEnd && list[right] > list[left]) ? right : left
-                if list[child] <= v { break }
-                list[root] = list[child]
-                root = child
+    /// Swift mirror of `liveBinChunkSortKernel`'s SRAM bitonic sort, kept
+    /// structurally identical (pad to 512 with UINT_MAX, same comparator network) so
+    /// this test guards the algorithm the GPU runs on every chunk. The sequential lane
+    /// loop replays the same disjoint compare-swaps one step performs in parallel.
+    private func bitonicChunkSort(_ list: inout [UInt32]) {
+        guard list.count >= 2 else { return }
+        precondition(list.count <= GpuBinSpec.sortChunkSize)
+        var buf = list + [UInt32](repeating: .max, count: GpuBinSpec.sortChunkSize - list.count)
+        var k = 2
+        while k <= GpuBinSpec.sortChunkSize {
+            var j = k / 2
+            while j > 0 {
+                for tid in 0..<GpuBinSpec.sortChunkSize {
+                    let ix = tid ^ j
+                    if ix > tid {
+                        let a = buf[tid], b = buf[ix]
+                        let up = (tid & k) == 0
+                        if (a > b) == up { buf[tid] = b; buf[ix] = a }
+                    }
+                }
+                j /= 2
             }
-            list[root] = v
+            k *= 2
         }
-        let n = list.count
-        guard n >= 2 else { return }
-        var i = n / 2
-        while i > 0 {
-            i -= 1
-            siftDown(&list, i, list[i], n)
-        }
-        var end = n
-        while end > 1 {
-            end -= 1
-            let maxV = list[0]
-            siftDown(&list, 0, list[end], end)
-            list[end] = maxV
-        }
+        list = Array(buf[0..<list.count])
     }
 
-    func testHeapSortOrdersAllDensities() {
-        // Reverse-sorted dense tile: the clustered worst case (insertion sort O(n²)).
-        var denseArr = (0 as UInt32..<5000).reversed()
-        var dense = Array(denseArr)
-        heapSort(&dense)
-        XCTAssertEqual(dense, Array(0 as UInt32..<5000))
-        // Deterministic pseudo-random order, plus edge sizes.
+    func testBitonicChunkSortOrders() {
+        // Reverse-sorted full chunk.
+        var full = Array((0 as UInt32..<512).reversed())
+        bitonicChunkSort(&full)
+        XCTAssertEqual(full, Array(0 as UInt32..<512))
+        // Deterministic pseudo-random order at several lengths, plus edge sizes.
         var rng: UInt64 = 0x12345679
-        var random = (0..<3000).map { _ in
-            rng = rng &* 6364136223846793005 &+ 1442695040888963407
-            return UInt32(truncatingIfNeeded: rng >> 33)
+        for n in [3, 100, 511, 512] {
+            var random = (0..<n).map { _ -> UInt32 in
+                rng = rng &* 6364136223846793005 &+ 1442695040888963407
+                return UInt32(truncatingIfNeeded: rng >> 33)
+            }
+            let expected = random.sorted()
+            bitonicChunkSort(&random)
+            XCTAssertEqual(random, expected, "length \(n)")
         }
-        let expected = random.sorted()
-        heapSort(&random)
-        XCTAssertEqual(random, expected)
         var empty: [UInt32] = []
-        heapSort(&empty)
+        bitonicChunkSort(&empty)
         XCTAssertTrue(empty.isEmpty)
         var single: [UInt32] = [42]
-        heapSort(&single)
+        bitonicChunkSort(&single)
         XCTAssertEqual(single, [42])
     }
 
@@ -403,14 +398,50 @@ final class GpuBinSpecTests: XCTestCase {
         XCTAssertEqual(GpuBinSpec.chunkTable(entries: e5).mergePasses, 3)
     }
 
+    func testMergePairsBoundWork() {
+        // Layout lock: the macOS side memcpys [GpuBinMergePair] into the uint4 buffer
+        // the merge kernel reads — four UInt32, stride 16.
+        XCTAssertEqual(MemoryLayout<GpuBinMergePair>.stride, 16)
+        XCTAssertEqual(MemoryLayout<GpuBinMergePair>.size, 16)
+        // Starts: tile0 [0,600), tile1 [600,700), tile2 empty, tile3 [700,701),
+        // tile4 [701,2701). Every non-empty tile gets pairs — real merges for
+        // multi-chunk runs, plain copies (bLen == 0) carrying the rest across the
+        // tileList/scratch ping-pong so src is never dst.
+        let (entries, _, _) = GpuBinSpec.combine(counts: [600, 100, 0, 1, 2000])
+        let p0 = GpuBinSpec.mergePairs(entries: entries, runSize: 512)
+        XCTAssertEqual(p0.count, 5)
+        XCTAssertEqual(p0[0].aStart, 0); XCTAssertEqual(p0[0].aLen, 512)
+        XCTAssertEqual(p0[0].bLen, 88); XCTAssertEqual(p0[0].dst, 0)
+        XCTAssertEqual(p0[1].aStart, 600); XCTAssertEqual(p0[1].aLen, 100)
+        XCTAssertEqual(p0[1].bLen, 0); XCTAssertEqual(p0[1].dst, 600)
+        XCTAssertEqual(p0[2].aStart, 700); XCTAssertEqual(p0[2].aLen, 1)
+        XCTAssertEqual(p0[2].bLen, 0)
+        XCTAssertEqual(p0[3].aStart, 701); XCTAssertEqual(p0[3].aLen, 512)
+        XCTAssertEqual(p0[3].bLen, 512); XCTAssertEqual(p0[3].dst, 701)
+        XCTAssertEqual(p0[4].aStart, 1725); XCTAssertEqual(p0[4].aLen, 512)
+        XCTAssertEqual(p0[4].bLen, 464); XCTAssertEqual(p0[4].dst, 1725)
+        for pr in p0 {
+            XCTAssertLessThanOrEqual(Int(pr.aLen) + Int(pr.bLen), 2 * GpuBinSpec.sortChunkSize)
+        }
+        // Next pass doubles the runs; the odd tail becomes a copy pair.
+        let p1 = GpuBinSpec.mergePairs(entries: entries, runSize: 1024)
+        XCTAssertEqual(p1.count, 4)   // tile0/1/3 copies + tile4's one full merge
+        XCTAssertEqual(p1[0].aStart, 0); XCTAssertEqual(p1[0].aLen, 600)
+        XCTAssertEqual(p1[0].bLen, 0); XCTAssertEqual(p1[0].dst, 0)
+        XCTAssertEqual(p1[3].aStart, 701); XCTAssertEqual(p1[3].aLen, 1024)
+        XCTAssertEqual(p1[3].bLen, 976); XCTAssertEqual(p1[3].dst, 701)
+        // All empty → no pairs at any run size.
+        let (e2, _, _) = GpuBinSpec.combine(counts: [0, 0, 0])
+        XCTAssertTrue(GpuBinSpec.mergePairs(entries: e2, runSize: 512).isEmpty)
+    }
+
     func testChunkSortMergeMatchesSorted() {
-        // Locks the GPU chunked-sort contract end to end: chunk heapsort + pairwise
-        // merge passes (runs doubling from one chunk, ping-ponging with the final pass
-        // landing in the tile list) must reproduce the exact ascending tile lists —
-        // including the dense single-tile worst case that stalled the old per-tile
-        // sort (zoomed-out complex.art packs ~2600 entries into one tile).
+        // Locks the GPU chunked-sort contract end to end, using the REAL specs: chunk
+        // bitonic sort + per-pass pair tables with strict buffer alternation (render
+        // reads whichever buffer the ping-pong leaves full) must reproduce the exact
+        // ascending tile lists — including the dense single-tile worst case that
+        // stalled every per-thread sort tried so far (zoomed-out complex.art: ~2600/tile).
         func run(tileCounts: [Int], order: [UInt32]) -> Bool {
-            let chunk = GpuBinSpec.sortChunkSize
             let counts = tileCounts.map { UInt32($0) }
             let (entries, _, total) = GpuBinSpec.combine(counts: counts)
             guard total == order.count else { return false }
@@ -422,54 +453,45 @@ final class GpuBinSpecTests: XCTestCase {
                 a.replaceSubrange(Int(entries[t].start)..<Int(entries[t].start) + n, with: rev)
                 cursor += n
             }
-            // Chunk heapsort in place (mirror of liveBinChunkSortKernel).
+            // Chunk bitonic sort in place (mirror of liveBinChunkSortKernel).
             let (chunks, _, passes) = GpuBinSpec.chunkTable(entries: entries)
             for c in chunks {
                 var slice = Array(a[Int(c.start)..<Int(c.start) + Int(c.len)])
-                heapSort(&slice)
+                bitonicChunkSort(&slice)
                 a.replaceSubrange(Int(c.start)..<Int(c.start) + Int(c.len), with: slice)
             }
-            // Merge passes (mirror of liveBinMergePassKernel).
-            var b = [UInt32](repeating: 0, count: total)
-            var runSize = chunk
-            for pass in 0..<passes {
-                let last = (pass == passes - 1)
-                let srcArr: [UInt32] = (pass % 2 == 1) ? b : a
-                for (t, e) in entries.enumerated() {
-                    let start = Int(e.start), count = Int(e.count)
-                    guard count > chunk else { continue }   // single chunk rests in `a`
-                    let S = runSize, twoS = S * 2
-                    var o = 0
-                    while o < count {
-                        let aLen = min(S, count - o)
-                        let bLen = (count - o > S) ? min(S, count - o - S) : 0
-                        var i = 0, j = 0
-                        var merged: [UInt32] = []
-                        merged.reserveCapacity(aLen + bLen)
-                        while i < aLen && j < bLen {
-                            if srcArr[start + o + i] <= srcArr[start + o + aLen + j] {
-                                merged.append(srcArr[start + o + i]); i += 1
-                            } else {
-                                merged.append(srcArr[start + o + aLen + j]); j += 1
-                            }
+            // Merge passes over the real pair tables with strict tileList/scratch
+            // alternation (mirror of liveBinMergePassKernel's src != dst contract):
+            // each pass reads one buffer and writes the other, then they swap.
+            var cur = a, nxt = [UInt32](repeating: 0, count: total)
+            var runSize = GpuBinSpec.sortChunkSize
+            for _ in 0..<passes {
+                let prs = GpuBinSpec.mergePairs(entries: entries, runSize: runSize)
+                for pr in prs {
+                    let aStart = Int(pr.aStart), aLen = Int(pr.aLen)
+                    let bLen = Int(pr.bLen), d = Int(pr.dst)
+                    var ia = 0, ib = 0, dd = d
+                    while ia < aLen && ib < bLen {
+                        if cur[aStart + ia] <= cur[aStart + aLen + ib] {
+                            nxt[dd] = cur[aStart + ia]; ia += 1
+                        } else {
+                            nxt[dd] = cur[aStart + aLen + ib]; ib += 1
                         }
-                        merged.append(contentsOf: srcArr[start + o + i..<start + o + aLen])
-                        merged.append(contentsOf: srcArr[start + o + aLen + j..<start + o + aLen + bLen])
-                        for (k, v) in merged.enumerated() {
-                            if last { a[start + o + k] = v }
-                            else if pass % 2 == 0 { b[start + o + k] = v }
-                            else { a[start + o + k] = v }
-                        }
-                        o += twoS
+                        dd += 1
                     }
+                    while ia < aLen { nxt[dd] = cur[aStart + ia]; ia += 1; dd += 1 }
+                    while ib < bLen { nxt[dd] = cur[aStart + aLen + ib]; ib += 1; dd += 1 }
                 }
+                swap(&cur, &nxt)
                 runSize *= 2
             }
+            // Render reads whichever buffer the ping-pong leaves full.
+            let final = cur
             // Every tile ascending and equal to the stably scattered reference.
             cursor = 0
             for (t, n) in tileCounts.enumerated() {
                 let ref = Array(order[cursor..<cursor + n]).sorted()
-                let got = Array(a[Int(entries[t].start)..<Int(entries[t].start) + n])
+                let got = Array(final[Int(entries[t].start)..<Int(entries[t].start) + n])
                 if got != ref { return false }
                 cursor += n
             }

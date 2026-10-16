@@ -1525,11 +1525,20 @@ kernel void liveBinTransformCountKernel(
     int4 r = liveBinRangeForSeg(p, p1, p2, r0, r1);
     outRanges[gid] = r;
     if (r.x > r.z || r.y > r.w) return;   // empty sentinel — nothing to count
+    // Clamp to the layer box: stroke-bounds boxes don't carry the full 1.4r+1 binning
+    // slop, so a fringe tile of the range can sit outside the box. Those incidences
+    // are never read (render dispatches cover the box only), while an unclamped index
+    // faults the atomic and drops the whole command buffer (missing tiles).
+    int minTX = max(r.x, b.boxMinX);
+    int maxTX = min(r.z, b.boxMinX + b.boxW - 1);
+    int minTY = max(r.y, b.boxMinY);
+    int maxTY = min(r.w, b.boxMinY + b.boxH - 1);
+    if (minTX > maxTX || minTY > maxTY) return;
     // Fused count over the layer box (box-local indexing): same totals the old
     // standalone count kernel produced, straight from registers.
-    for (int ty = r.y; ty <= r.w; ++ty) {
+    for (int ty = minTY; ty <= maxTY; ++ty) {
         int tbase = (ty - b.boxMinY) * b.boxW - b.boxMinX;
-        for (int tx = r.x; tx <= r.z; ++tx) {
+        for (int tx = minTX; tx <= maxTX; ++tx) {
             uint t = uint(tbase + tx);
             atomic_fetch_add_explicit(&counts[t], 1u, memory_order_relaxed);
         }
@@ -1552,9 +1561,16 @@ kernel void liveBinScatterKernel(
     if (gid >= p.segCount) return;
     int4 r = ranges[gid];
     if (r.x > r.z || r.y > r.w) return;
-    for (int ty = r.y; ty <= r.w; ++ty) {
+    // Same box clamp as the fused count loop: out-of-box tiles fault the atomic and
+    // drop the frame's render; in-box incidences are unaffected.
+    int minTX = max(r.x, p.boxMinX);
+    int maxTX = min(r.z, p.boxMinX + p.boxW - 1);
+    int minTY = max(r.y, p.boxMinY);
+    int maxTY = min(r.w, p.boxMinY + p.boxH - 1);
+    if (minTX > maxTX || minTY > maxTY) return;
+    for (int ty = minTY; ty <= maxTY; ++ty) {
         int tbase = (ty - p.boxMinY) * p.boxW - p.boxMinX;
-        for (int tx = r.x; tx <= r.z; ++tx) {
+        for (int tx = minTX; tx <= maxTX; ++tx) {
             uint t = uint(tbase + tx);
             uint pos = atomic_fetch_add_explicit(&heads[t], 1u, memory_order_relaxed);
             tileList[starts[t] + pos] = gid;
@@ -1562,106 +1578,88 @@ kernel void liveBinScatterKernel(
     }
 }
 
-// Max-heap sift-down over `list[0, heapEnd)`: drops `v` from `root` to its heap
-// position. Iterative (no recursion/stack) and in-place — Metal-2 safe.
-inline void liveBinSiftDown(device uint *list, uint root, uint v, uint heapEnd) {
-    for (;;) {
-        uint left = root * 2 + 1;
-        if (left >= heapEnd) break;
-        uint right = left + 1;
-        uint child = (right < heapEnd && list[right] > list[left]) ? right : left;
-        if (list[child] <= v) break;
-        list[root] = list[child];
-        root = child;
-    }
-    list[root] = v;
-}
-
 // Ascending document order, restored with bounded work per thread (zoom-independent).
-// One thread sorting one whole tile goes latency-bound on dense tiles (thousands of
-// dependent global-memory steps) and leaves the GPU almost idle when only a few tiles
-// exist (zoomed-out). Instead the CPU splits every tile slice into fixed 512-entry
-// chunks (`GpuBinSpec.chunkTable`): one thread heapsorts one chunk in place, then
-// pairwise merge passes (runs doubling from one chunk, ping-ponging tileList/scratch
-// with the final pass landing in tileList) restore full order. Merges are linear with
-// sequential access — the cache-friendly kind — and the common case (every tile fits
-// one chunk) needs zero merge passes. The CPU scatter is stable, so
-// sorted-ascending == the exact CPU tile list, which is what makes the per-tile render
-// kernel's stroke grouping correct. Segment indices are unique, so only ascending
-// order matters.
+// One thread sorting even a 512-entry chunk in global memory goes latency-bound
+// (dependent loads nothing can hide), so: the CPU splits every tile slice into fixed
+// 512-entry chunks (`GpuBinSpec.chunkTable`), one *threadgroup* bitonic-sorts one
+// chunk entirely in threadgroup (SRAM) memory, then pairwise merge passes over a tiny
+// CPU-built pair table (`GpuBinSpec.mergePairs`, one thread per pair, sequential
+// runs) restore full order. The common case (every tile fits one chunk) needs zero
+// merge passes. The CPU scatter is stable, so sorted-ascending == the exact CPU tile
+// list, which is what makes the per-tile render kernel's stroke grouping correct.
+// Segment indices are unique, so only ascending order matters.
 //
 // Chunk size 512 must match `GpuBinSpec.sortChunkSize` (merge run sizes start at one
 // chunk and double from there).
 
 // `LiveBinSortParams` — must match the Swift struct field for field, in order.
 struct LiveBinSortParams {
-    uint chunkCount;
+    uint unitCount;
     uint runSize;
-    int  boxW;
-    int  boxH;
 };
 
-// Sort one chunk in place (heapsort via `liveBinSiftDown`, O(n log n) worst case).
-// Chunks cover only slices with >= 2 entries and hold at most 512 of them, so
-// per-thread nonlinear work is bounded no matter how far the user zooms out.
+// Sort one 512-entry chunk in SRAM (bitonic network, 512 threads cooperating — the
+// dispatch MUST use 512 threads per threadgroup, one threadgroup per chunk).
+// Chunks cover only slices with >= 2 entries and hold at most 512 of them; shorter
+// chunks are padded with UINT_MAX in SRAM only (sinks to the end, never written back).
 kernel void liveBinChunkSortKernel(
     constant LiveBinSortParams &p [[buffer(0)]],
     const device uint2 *chunks [[buffer(1)]],
     device uint *tileList [[buffer(2)]],
-    uint3 tpg [[thread_position_in_grid]])
+    uint3 tpg [[threadgroup_position_in_grid]],
+    uint3 ttid [[thread_position_in_threadgroup]])
 {
     uint c = tpg.x;
-    if (c >= p.chunkCount) return;
+    if (c >= p.unitCount) return;
     uint start = chunks[c].x;
     uint len = chunks[c].y;
     if (len < 2) return;
-    device uint *list = tileList + start;
-    for (uint i = len / 2; i > 0; --i) {
-        liveBinSiftDown(list, i - 1, list[i - 1], len);
+    // One whole chunk fits in SRAM (512 x 4B = 2KB of the 32KB threadgroup budget).
+    // Uniform per group (len is per-chunk), so the barriers below always converge.
+    threadgroup uint buf[512];
+    uint tid = ttid.x;
+    buf[tid] = (tid < len) ? tileList[start + tid] : 0xFFFFFFFFu;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint k = 2u; k <= 512u; k <<= 1) {
+        for (uint j = k >> 1; j > 0u; j >>= 1) {
+            uint ix = tid ^ j;
+            if (ix > tid) {
+                uint a = buf[tid], b = buf[ix];
+                bool up = ((tid & k) == 0u);
+                if ((a > b) == up) { buf[tid] = b; buf[ix] = a; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
-    for (uint end = len; end > 1; --end) {
-        uint maxV = list[0];
-        // Move the tail into the root, restore the heap over [0, end - 1), park max.
-        liveBinSiftDown(list, 0, list[end - 1], end - 1);
-        list[end - 1] = maxV;
-    }
+    if (tid < len) tileList[start + tid] = buf[tid];
 }
 
-// One pairwise merge pass over every tile: runs of `runSize` merge into runs of
-// `2 * runSize`. One thread per tile, serial within the tile (linear work, sequential
-// reads/writes) and parallel across tiles. Single-chunk tiles (count <= 512) are
-// already sorted in place and are skipped — their data rests in `tileList` while
-// multi-chunk tiles ping-pong through the scratch buffer, with the CPU directing the
-// final pass back into `tileList`, so the render kernel always reads `tileList`.
+// One pairwise merge over the CPU-built pair table: one thread per pair, serial
+// two-finger merge (linear, sequential reads/writes) from `src` to `dst`. `src` and
+// `dst` are NEVER the same buffer: passes strictly alternate tileList/scratch, so an
+// in-place merge (which clobbers unread input) is impossible by construction. Pairs
+// with an empty B run are plain copies — they carry finished or single-chunk tiles
+// across the ping-pong, so after the final pass every non-empty tile rests in the
+// buffer the CPU directs the render kernel at. Empty tiles appear in no pair.
 kernel void liveBinMergePassKernel(
     constant LiveBinSortParams &p [[buffer(0)]],
-    const device TileIndex *tiles [[buffer(1)]],
+    const device uint4 *pairs [[buffer(1)]],
     const device uint *src [[buffer(2)]],
     device uint *dst [[buffer(3)]],
     uint3 tpg [[thread_position_in_grid]])
 {
-    uint t = tpg.x;
-    uint tileCount = uint(p.boxW) * uint(p.boxH);
-    if (t >= tileCount) return;
-    uint start = tiles[t].start;
-    uint count = tiles[t].count;
-    if (count <= 512u) return;
-    uint S = p.runSize;
-    uint twoS = S * 2u;
-    for (uint o = 0; o < count; o += twoS) {
-        uint aStart = start + o;
-        uint aLen = min(S, count - o);
-        uint bLen = (count - o > S) ? min(S, count - o - S) : 0u;
-        uint bStart = aStart + aLen;
-        uint d = start + o;
-        uint i = 0, j = 0;
-        while (i < aLen && j < bLen) {
-            uint a = src[aStart + i];
-            uint b = src[bStart + j];
-            if (a <= b) { dst[d] = a; ++i; } else { dst[d] = b; ++j; }
-            ++d;
-        }
-        while (i < aLen) { dst[d] = src[aStart + i]; ++i; ++d; }
-        while (j < bLen) { dst[d] = src[bStart + j]; ++j; ++d; }
+    uint i = tpg.x;
+    if (i >= p.unitCount) return;
+    uint4 pr = pairs[i];
+    uint aStart = pr.x, aLen = pr.y, bLen = pr.z, d = pr.w;
+    uint bStart = aStart + aLen;
+    uint ia = 0, ib = 0;
+    while (ia < aLen && ib < bLen) {
+        uint a = src[aStart + ia];
+        uint b = src[bStart + ib];
+        if (a <= b) { dst[d] = a; ++ia; } else { dst[d] = b; ++ib; }
+        ++d;
     }
+    while (ia < aLen) { dst[d] = src[aStart + ia]; ++ia; ++d; }
+    while (ib < bLen) { dst[d] = src[bStart + ib]; ++ib; ++d; }
 }

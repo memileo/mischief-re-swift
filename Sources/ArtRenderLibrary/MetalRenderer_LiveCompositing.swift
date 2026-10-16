@@ -102,13 +102,12 @@ struct LiveBinBoxParams {
 }
 
 // Must match `LiveBinSortParams` in segmentKernels.metal field for field, in order.
-// 2×uint + 2×int = stride 16 on both sides. `runSize` doubles per merge pass from one
-// sort chunk (`GpuBinSpec.sortChunkSize`); the chunk-sort dispatch uses `chunkCount`.
+// 2×uint = stride 8 on both sides. The chunk-sort dispatch uses `unitCount` as the
+// chunk count (one 512-wide threadgroup each); each merge dispatch reuses it as the
+// pair count, with `runSize` doubling per pass from one sort chunk.
 struct LiveBinSortParams {
-    var chunkCount: UInt32
+    var unitCount: UInt32
     var runSize: UInt32
-    var boxW: Int32
-    var boxH: Int32
 }
 
 // One layer's worth of per-tile data, as byte-slices into the single upload buffer.
@@ -944,6 +943,36 @@ extension MetalRenderer {
                 memcpy(dst, src, raw.count)
             }
         }
+        // Merge pairs for every pass, built upfront (pure integer work): pass 0 holds
+        // the most pairs, so one allocation covers all passes. A non-empty pass table
+        // with zero pairs is inconsistent — fall back to CPU rather than mis-sort.
+        var runSize0 = GpuBinSpec.sortChunkSize
+        var passPairs: [[GpuBinMergePair]] = []
+        passPairs.reserveCapacity(mergePasses)
+        var maxPairs = 0
+        for _ in 0..<mergePasses {
+            let prs = GpuBinSpec.mergePairs(entries: entries, runSize: runSize0)
+            maxPairs = max(maxPairs, prs.count)
+            passPairs.append(prs)
+            runSize0 *= 2
+        }
+        if mergePasses > 0 {
+            guard maxPairs > 0, passPairs.allSatisfy({ !$0.isEmpty }) else { return false }
+            if ref.pairCap < maxPairs {
+                let cap = max(maxPairs, ref.pairCap * 2)
+                guard let buf = device.makeBuffer(length: cap * MemoryLayout<GpuBinMergePair>.stride,
+                                                  options: .storageModeShared) else {
+                    return false
+                }
+                ref.sortPairs = buf
+                ref.pairCap = cap
+            }
+            guard ref.sortPairs != nil else { return false }
+        }
+        // The render kernel reads whichever buffer the ping-pong leaves full: tileList
+        // when no merge ran or after an even pass count, scratch after an odd one.
+        // (Pass 0 moves tileList→scratch, pass 1 back, and so on.)
+        let finalTileList: MTLBuffer = (mergePasses == 0 || mergePasses % 2 == 0) ? tileList : tileScratch
         entries.withUnsafeBytes { raw in
             if let src = raw.baseAddress {
                 memcpy(tileIndexBuf.contents(), src, raw.count)   // GpuBinTileEntry == TileIndex
@@ -989,35 +1018,42 @@ extension MetalRenderer {
             encoder.setBuffer(tileList, offset: 0, index: 4)
             encoder.dispatchThreadgroups(binGroups(ref.segCount), threadsPerThreadgroup: binThreads)
         }
-        func encodeOrder(_ encoder: MTLComputeCommandEncoder) {
-            guard !sortChunks.isEmpty, let sortChunkBuf else { return }
-            var sp = LiveBinSortParams(chunkCount: UInt32(sortChunks.count),
-                                       runSize: UInt32(GpuBinSpec.sortChunkSize),
-                                       boxW: Int32(boxW), boxH: Int32(boxH))
+        func encodeOrder(_ encoder: MTLComputeCommandEncoder) throws {
+            guard !sortChunks.isEmpty else { return }
+            guard let sortChunkBuf else { throw MetalRendererError.bufferCreationFailed }
+            // One 512-wide threadgroup per chunk (required: the kernel bitonic-sorts
+            // the whole chunk across exactly 512 lanes in SRAM).
+            var sp = LiveBinSortParams(unitCount: UInt32(sortChunks.count),
+                                       runSize: UInt32(GpuBinSpec.sortChunkSize))
             encoder.setComputePipelineState(chunkPipe)
             encoder.setBytes(&sp, length: MemoryLayout<LiveBinSortParams>.stride, index: 0)
             encoder.setBuffer(sortChunkBuf, offset: 0, index: 1)
             encoder.setBuffer(tileList, offset: 0, index: 2)
-            encoder.dispatchThreadgroups(binGroups(sortChunks.count),
-                                         threadsPerThreadgroup: binThreads)
+            encoder.dispatchThreadgroups(MTLSize(width: sortChunks.count, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 512, height: 1, depth: 1))
             var runSize = GpuBinSpec.sortChunkSize
-            for pass in 0..<mergePasses {
-                let last = (pass == mergePasses - 1)
-                // Ping-pong tileList/scratch; the final pass always lands in tileList,
-                // which is what the render kernel reads. Single-chunk tiles sit out every
-                // pass (already sorted in tileList).
+            for (pass, prs) in passPairs.enumerated() {
+                // Strict tileList/scratch alternation — src is never dst, so the merge
+                // can never clobber its own unread input (in-place merging corrupts).
+                // Copies carry finished tiles along; the final buffer holds everything.
+                guard let sortPairBuf = ref.sortPairs else {
+                    throw MetalRendererError.bufferCreationFailed
+                }
+                prs.withUnsafeBytes { raw in
+                    if let src = raw.baseAddress {
+                        memcpy(sortPairBuf.contents(), src, raw.count)
+                    }
+                }
                 let srcBuf: MTLBuffer = (pass % 2 == 1) ? tileScratch : tileList
-                let dstBuf: MTLBuffer = last ? tileList
-                    : ((pass % 2 == 0) ? tileScratch : tileList)
-                var mp = LiveBinSortParams(chunkCount: UInt32(sortChunks.count),
-                                           runSize: UInt32(runSize),
-                                           boxW: Int32(boxW), boxH: Int32(boxH))
+                let dstBuf: MTLBuffer = (pass % 2 == 1) ? tileList : tileScratch
+                var mp = LiveBinSortParams(unitCount: UInt32(prs.count),
+                                           runSize: UInt32(runSize))
                 encoder.setComputePipelineState(mergePipe)
                 encoder.setBytes(&mp, length: MemoryLayout<LiveBinSortParams>.stride, index: 0)
-                encoder.setBuffer(tileIndexBuf, offset: 0, index: 1)
+                encoder.setBuffer(sortPairBuf, offset: 0, index: 1)
                 encoder.setBuffer(srcBuf, offset: 0, index: 2)
                 encoder.setBuffer(dstBuf, offset: 0, index: 3)
-                encoder.dispatchThreadgroups(binGroups(boxTiles),
+                encoder.dispatchThreadgroups(binGroups(prs.count),
                                              threadsPerThreadgroup: binThreads)
                 runSize *= 2
             }
@@ -1028,7 +1064,7 @@ extension MetalRenderer {
             try encodePerTileBuffers(segBuffer: frameSegs, segOffset: 0,
                                      strokeOfSegBuffer: ref.segStroke, strokeOfSegOffset: 0,
                                      tileStartCountBuffer: tileIndexBuf, tileStartCountOffset: 0,
-                                     tileListBuffer: tileList, tileListOffset: 0,
+                                     tileListBuffer: finalTileList, tileListOffset: 0,
                                      strokeColorBuffer: ref.strokeColors, strokeColorOffset: 0,
                                      strokeFlagsBuffer: ref.strokeFlags, strokeFlagsOffset: 0,
                                      boxMinX: box.minX, boxMinY: box.minY,
@@ -1059,7 +1095,7 @@ extension MetalRenderer {
             encodeScatter(encS)
             encS.endEncoding()
             tScatter = try sync(cbS)
-            encodeOrder(encO)
+            try encodeOrder(encO)
             encO.endEncoding()
             tSort = try sync(cbO)
             try encodeTail(encR)
@@ -1084,7 +1120,7 @@ extension MetalRenderer {
         fill2.endEncoding()
         guard let enc2 = cb2.makeComputeCommandEncoder() else { return false }
         encodeScatter(enc2)
-        encodeOrder(enc2)
+        try encodeOrder(enc2)
         try encodeTail(enc2)
         enc2.endEncoding()
         clock = DispatchTime.now().uptimeNanoseconds

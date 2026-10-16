@@ -324,6 +324,22 @@ public struct GpuBinChunk {
     }
 }
 
+/// One pairwise merge unit for the GPU sort. Layout-identical to a Metal `uint4`:
+/// (aStart, aLen, bLen, dst) — B starts at aStart + aLen; bLen == 0 is a plain copy
+/// carrying a finished run across the ping-pong. Stride 16.
+public struct GpuBinMergePair {
+    public var aStart: UInt32
+    public var aLen: UInt32
+    public var bLen: UInt32
+    public var dst: UInt32
+    public init(aStart: UInt32, aLen: UInt32, bLen: UInt32, dst: UInt32) {
+        self.aStart = aStart
+        self.aLen = aLen
+        self.bLen = bLen
+        self.dst = dst
+    }
+}
+
 public enum GpuBinSpec {
     /// Tile grid dimensions for a viewport. Mirrors `(w + tile - 1) / tile` on both sides.
     public static func tileGrid(viewportWidth: Int, viewportHeight: Int,
@@ -388,6 +404,32 @@ public enum GpuBinSpec {
         var k = maxChunks
         while k > 1 { k = (k + 1) / 2; passes += 1 }
         return (chunks, maxChunks, passes)
+    }
+
+    /// Pairwise merge units for one merge pass at `runSize` (runs of `runSize` merge
+    /// into runs of `2 * runSize`). Covers every non-empty tile: multi-chunk slices
+    /// get real merges, everything else plain copies (bLen == 0) that carry finished
+    /// data across the tileList/scratch ping-pong — src and dst are never the same
+    /// buffer, so an in-place merge (which clobbers unread input) cannot happen.
+    /// Every emitted pair does at most `2 * runSize` sequential steps, so per-thread
+    /// work stays bounded at any zoom. Pure integer logic, runs on Linux.
+    public static func mergePairs(entries: [GpuBinTileEntry], runSize: Int) -> [GpuBinMergePair] {
+        var pairs: [GpuBinMergePair] = []
+        let twoS = runSize * 2
+        for e in entries {
+            let n = Int(e.count)
+            guard n >= 1 else { continue }
+            var o = 0
+            while o < n {
+                let aLen = min(runSize, n - o)
+                let bLen = (n - o > runSize) ? min(runSize, n - o - runSize) : 0
+                pairs.append(GpuBinMergePair(aStart: e.start + UInt32(o),
+                                             aLen: UInt32(aLen), bLen: UInt32(bLen),
+                                             dst: e.start + UInt32(o)))
+                o += twoS
+            }
+        }
+        return pairs
     }
 
     /// Fixed sort work quantum (entries). Every GPU sort thread sorts at most this
