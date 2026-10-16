@@ -288,7 +288,7 @@ final class GpuBinSpecTests: XCTestCase {
         XCTAssertEqual(MemoryLayout<GpuBinTileEntry>.size, 8)
     }
 
-    /// Swift mirror of `liveBinChunkSortKernel`'s SRAM bitonic sort, kept
+    /// Swift mirror of `liveBinChunkSortV2Kernel`'s SRAM bitonic sort, kept
     /// structurally identical (pad to 512 with UINT_MAX, same comparator network) so
     /// this test guards the algorithm the GPU runs on every chunk. The sequential lane
     /// loop replays the same disjoint compare-swaps one step performs in parallel.
@@ -453,7 +453,7 @@ final class GpuBinSpecTests: XCTestCase {
                 a.replaceSubrange(Int(entries[t].start)..<Int(entries[t].start) + n, with: rev)
                 cursor += n
             }
-            // Chunk bitonic sort in place (mirror of liveBinChunkSortKernel).
+            // Chunk bitonic sort in place (mirror of liveBinChunkSortV2Kernel).
             let (chunks, _, passes) = GpuBinSpec.chunkTable(entries: entries)
             for c in chunks {
                 var slice = Array(a[Int(c.start)..<Int(c.start) + Int(c.len)])
@@ -461,7 +461,7 @@ final class GpuBinSpecTests: XCTestCase {
                 a.replaceSubrange(Int(c.start)..<Int(c.start) + Int(c.len), with: slice)
             }
             // Merge passes over the real pair tables with strict tileList/scratch
-            // alternation (mirror of liveBinMergePassKernel's src != dst contract):
+            // alternation (mirror of liveBinMergePassV2Kernel's src != dst contract):
             // each pass reads one buffer and writes the other, then they swap.
             var cur = a, nxt = [UInt32](repeating: 0, count: total)
             var runSize = GpuBinSpec.sortChunkSize

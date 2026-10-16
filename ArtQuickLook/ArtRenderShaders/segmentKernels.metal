@@ -1602,7 +1602,7 @@ struct LiveBinSortParams {
 // dispatch MUST use 512 threads per threadgroup, one threadgroup per chunk).
 // Chunks cover only slices with >= 2 entries and hold at most 512 of them; shorter
 // chunks are padded with UINT_MAX in SRAM only (sinks to the end, never written back).
-kernel void liveBinChunkSortKernel(
+kernel void liveBinChunkSortV2Kernel(
     constant LiveBinSortParams &p [[buffer(0)]],
     const device uint2 *chunks [[buffer(1)]],
     device uint *tileList [[buffer(2)]],
@@ -1641,7 +1641,7 @@ kernel void liveBinChunkSortKernel(
 // with an empty B run are plain copies — they carry finished or single-chunk tiles
 // across the ping-pong, so after the final pass every non-empty tile rests in the
 // buffer the CPU directs the render kernel at. Empty tiles appear in no pair.
-kernel void liveBinMergePassKernel(
+kernel void liveBinMergePassV2Kernel(
     constant LiveBinSortParams &p [[buffer(0)]],
     const device uint4 *pairs [[buffer(1)]],
     const device uint *src [[buffer(2)]],

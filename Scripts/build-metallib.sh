@@ -61,8 +61,8 @@ LIVE_KERNELS=(
     livePerTileNoiseCompositeKernel
     liveBinTransformCountKernel
     liveBinScatterKernel
-    liveBinChunkSortKernel
-    liveBinMergePassKernel
+    liveBinChunkSortV2Kernel
+    liveBinMergePassV2Kernel
 )
 REQUIRED_KERNELS=(
     clearKernel

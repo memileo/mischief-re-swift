@@ -58,7 +58,7 @@
          <EnvironmentVariable
             key = "ART_LIVE_BINTIME"
             value = "1"
-            isEnabled = "NO">
+            isEnabled = "YES">
          </EnvironmentVariable>
          <EnvironmentVariable
             key = "ART_LIVE_GPUBIN"

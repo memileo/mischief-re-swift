@@ -218,8 +218,8 @@ extension MetalRenderer {
         let binKernels: [(String, (MTLComputePipelineState?) -> Void)] = [
             ("liveBinTransformCountKernel", { self.liveBinTransformCountPipeline = $0 }),
             ("liveBinScatterKernel", { self.liveBinScatterPipeline = $0 }),
-            ("liveBinChunkSortKernel", { self.liveBinChunkSortPipeline = $0 }),
-            ("liveBinMergePassKernel", { self.liveBinMergePassPipeline = $0 }),
+            ("liveBinChunkSortV2Kernel", { self.liveBinChunkSortPipeline = $0 }),
+            ("liveBinMergePassV2Kernel", { self.liveBinMergePassPipeline = $0 }),
         ]
         for (name, assign) in binKernels {
             if let fn = library.makeFunction(name: name) {
@@ -234,7 +234,10 @@ extension MetalRenderer {
                 assign(nil)
             }
         }
-        if liveBinTransformCountPipeline != nil {
+        if liveBinTransformCountPipeline != nil,
+           liveBinScatterPipeline != nil,
+           liveBinChunkSortPipeline != nil,
+           liveBinMergePassPipeline != nil {
             print("Live view: GPU tile binning ready")
         }
 

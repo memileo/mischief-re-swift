@@ -377,8 +377,8 @@ public enum GpuBinSpec {
     }
 
     /// Splits every sortable tile slice (count >= 2) into fixed-size chunks for the
-    /// GPU chunked sort: one thread sorts one chunk in place (`liveBinChunkSortKernel`),
-    /// then `mergePasses` pairwise merge passes (`liveBinMergePassKernel`, runs doubling
+    /// GPU chunked sort: one thread sorts one chunk in place (`liveBinChunkSortV2Kernel`),
+    /// then `mergePasses` pairwise merge passes (`liveBinMergePassV2Kernel`, runs doubling
     /// from one chunk) restore full ascending order. `mergePasses` is
     /// ceil(log2(maxChunks)) — 0 when every tile fits one chunk (the common case: no
     /// merge dispatches at all). Pure integer logic, runs on Linux.
@@ -434,8 +434,8 @@ public enum GpuBinSpec {
 
     /// Fixed sort work quantum (entries). Every GPU sort thread sorts at most this
     /// many entries, so per-thread nonlinear work is bounded no matter how far the
-    /// user zooms out. Must match the `512` in `liveBinChunkSortKernel` /
-    /// `liveBinMergePassKernel` (merge run sizes start at one chunk and double).
+    /// user zooms out. Must match the `512` in `liveBinChunkSortV2Kernel` /
+    /// `liveBinMergePassV2Kernel` (merge run sizes start at one chunk and double).
     public static let sortChunkSize = 512
 
     /// Prefix-sums per-tile counts into per-tile (start, count) entries plus the grand
