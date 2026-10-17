@@ -446,35 +446,137 @@ final class GpuBinSpecTests: XCTestCase {
     }
 
     func testMergePlanOffsetsPackAllPasses() {
-        // Locks the GPU upload contract: every pass's pairs concatenated in one
-        // buffer, offsets[p] = pairs of all earlier passes. The kernel binds its
-        // pass at offsets[pass] — a wrong offset reads another pass's pairs and
+        // Locks the GPU upload contract: every pass's units concatenated in one
+        // buffer, offsets[p] = units of all earlier passes. The kernel binds its
+        // pass at offsets[pass] — a wrong offset reads another pass's data and
         // silently mis-sorts (the per-pass rewrite hazard this replaced).
+        XCTAssertEqual(MemoryLayout<GpuBinMergeUnit>.stride, 24)
+        XCTAssertEqual(MemoryLayout<GpuBinMergeUnit>.size, 24)
         let (entries, _, _) = GpuBinSpec.combine(counts: [600, 100, 0, 1, 2000])
         let (_, _, passes) = GpuBinSpec.chunkTable(entries: entries)
         XCTAssertGreaterThan(passes, 0)
         let plan = GpuBinSpec.mergePlan(entries: entries, mergePasses: passes)
-        XCTAssertEqual(plan.pairs.count, passes)
+        XCTAssertEqual(plan.units.count, passes)
         XCTAssertEqual(plan.offsets.count, passes)
         XCTAssertEqual(plan.offsets[0], 0)
         var running = 0
-        var runSize = GpuBinSpec.sortChunkSize
         for p in 0..<passes {
             XCTAssertEqual(plan.offsets[p], running)
-            // Same tables the per-pass spec builds — the plan is packing, not
-            // recomputation.
-            XCTAssertEqual(plan.pairs[p].map { [$0.aStart, $0.aLen, $0.bLen, $0.dst] },
-                           GpuBinSpec.mergePairs(entries: entries, runSize: runSize)
-                               .map { [$0.aStart, $0.aLen, $0.bLen, $0.dst] })
-            running += plan.pairs[p].count
-            runSize *= 2
+            XCTAssertFalse(plan.units[p].isEmpty)
+            for u in plan.units[p] {
+                // Every unit inside its pair, covering [dst, dst+aLen+bLen) exactly
+                // once across the pair's units; each unit bounded by mergeUnitSize.
+                XCTAssertLessThanOrEqual(Int(u.partLen), GpuBinSpec.mergeUnitSize)
+                XCTAssertGreaterThan(Int(u.partLen), 0)
+                XCTAssertLessThanOrEqual(Int(u.part) + Int(u.partLen),
+                                         Int(u.aLen) + Int(u.bLen))
+            }
+            // Units of each pair tile its output range without gaps or overlaps.
+            var byPair: [[GpuBinMergeUnit]] = []
+            var cur: [GpuBinMergeUnit] = []
+            var curKey = -1
+            for u in plan.units[p] {
+                let key = Int(u.aStart) * 1_000_000_007 + Int(u.dst)
+                if key != curKey { if !cur.isEmpty { byPair.append(cur) }; cur = []; curKey = key }
+                cur.append(u)
+            }
+            if !cur.isEmpty { byPair.append(cur) }
+            for group in byPair {
+                let total = Int(group[0].aLen) + Int(group[0].bLen)
+                var covered = 0
+                for u in group {
+                    XCTAssertEqual(Int(u.part), covered)
+                    covered += Int(u.partLen)
+                }
+                XCTAssertEqual(covered, total)
+            }
+            running += plan.units[p].count
         }
-        XCTAssertEqual(plan.totalPairs, running)
+        XCTAssertEqual(plan.totalUnits, running)
+        // A pair smaller than one unit stays a single unit (common case: no extra
+        // threads for small tiles).
+        let (e2, _, _) = GpuBinSpec.combine(counts: [600])
+        let small = GpuBinSpec.mergePlan(entries: e2, mergePasses: 1)
+        XCTAssertEqual(small.units.count, 1)
+        XCTAssertEqual(small.units[0].count, 1)
+        XCTAssertEqual(small.units[0][0].part, 0)
+        XCTAssertEqual(small.units[0][0].partLen, 600)
         // Zero passes → empty plan (chunk sort only, render reads the tile list).
         let empty = GpuBinSpec.mergePlan(entries: entries, mergePasses: 0)
-        XCTAssertTrue(empty.pairs.isEmpty)
+        XCTAssertTrue(empty.units.isEmpty)
         XCTAssertTrue(empty.offsets.isEmpty)
-        XCTAssertEqual(empty.totalPairs, 0)
+        XCTAssertEqual(empty.totalUnits, 0)
+    }
+
+    /// Swift mirror of `liveBinMergePassV3Kernel`'s per-unit work, kept
+    /// structurally identical (co-rank binary search, then a bounded serial merge)
+    /// so the end-to-end test guards the algorithm the GPU runs on every unit.
+    private func coRankMergeUnit(src: [UInt32], dst: inout [UInt32], u: GpuBinMergeUnit) {
+        let aStart = Int(u.aStart), aLen = Int(u.aLen), bLen = Int(u.bLen)
+        let bStart = aStart + aLen
+        let part = Int(u.part), partLen = Int(u.partLen)
+        var lo = part > bLen ? part - bLen : 0
+        var hi = part < aLen ? part : aLen
+        while lo < hi {
+            let ia = (lo + hi) / 2
+            let ib = part - ia
+            let tooSmall = ib > 0 && ia < aLen && src[aStart + ia] < src[bStart + ib - 1]
+            if tooSmall { lo = ia + 1 } else { hi = ia }
+        }
+        var ia = lo, ib = part - lo
+        var d = Int(u.dst) + part
+        let end = d + partLen
+        while d < end {
+            let takeA = ib >= bLen || (ia < aLen && src[aStart + ia] <= src[bStart + ib])
+            if takeA { dst[d] = src[aStart + ia]; ia += 1 }
+            else { dst[d] = src[bStart + ib]; ib += 1 }
+            d += 1
+        }
+    }
+
+    func testCoRankUnitsReassembleSortedRuns() {
+        // Fuzz the split logic independent of any tile layout: random sorted runs at
+        // awkward sizes (empty B, odd tails, duplicates, size-1 runs), every
+        // partition boundary, small unit sizes to force many splits. Each unit's
+        // output slice must equal the corresponding slice of the true merge.
+        var rng: UInt64 = 0x51ab3f29
+        func next(_ lo: Int, _ hi: Int) -> Int {
+            rng = rng &* 6364136223846793005 &+ 1442695040888963407
+            return lo + Int(rng % UInt64(max(hi - lo, 1)))
+        }
+        for _ in 0..<200 {
+            let aLen = next(0, 40), bLen = next(0, 40)
+            var a = (0..<aLen).map { _ in UInt32(next(0, 50)) }.sorted()
+            var b = (0..<bLen).map { _ in UInt32(next(0, 50)) }.sorted()
+            // Lay out as one pair: A @ 0, B @ aLen, dst @ 0.
+            let src = a + b
+            var expect = src
+            // True merge for reference.
+            var merged: [UInt32] = []
+            var ia = 0, ib = 0
+            while ia < aLen && ib < bLen {
+                if a[ia] <= b[ib] { merged.append(a[ia]); ia += 1 }
+                else { merged.append(b[ib]); ib += 1 }
+            }
+            merged.append(contentsOf: a[ia...]) 
+            merged.append(contentsOf: b[ib...])
+            let total = aLen + bLen
+            guard total > 0 else { continue }
+            for unitSize in [1, 2, 3, 7, 1024] {
+                var dst = [UInt32](repeating: .max, count: total)
+                var part = 0
+                while part < total {
+                    let partLen = min(unitSize, total - part)
+                    let u = GpuBinMergeUnit(aStart: 0, aLen: UInt32(aLen),
+                                            bLen: UInt32(bLen), dst: 0,
+                                            part: UInt32(part), partLen: UInt32(partLen))
+                    coRankMergeUnit(src: src, dst: &dst, u: u)
+                    part += partLen
+                }
+                XCTAssertEqual(dst, merged,
+                               "aLen \(aLen) bLen \(bLen) unit \(unitSize)")
+            }
+        }
     }
 
     func testChunkSortMergeMatchesSorted() {
@@ -502,27 +604,16 @@ final class GpuBinSpecTests: XCTestCase {
                 heapSort(&slice)
                 a.replaceSubrange(Int(c.start)..<Int(c.start) + Int(c.len), with: slice)
             }
-            // Merge passes over the REAL plan (mirror of liveBinMergePassV2Kernel's
+            // Merge passes over the REAL plan (mirror of liveBinMergePassV3Kernel's
             // src != dst contract): each pass reads one buffer and writes the other,
             // then they swap. Uses mergePlan — the exact function the renderer
             // uploads — so this test guards the shipped tables, not a re-derivation.
+            // Each unit co-rank-merges only its own partition.
             var cur = a, nxt = [UInt32](repeating: 0, count: total)
             let plan = GpuBinSpec.mergePlan(entries: entries, mergePasses: passes)
-            for prs in plan.pairs {
-                for pr in prs {
-                    let aStart = Int(pr.aStart), aLen = Int(pr.aLen)
-                    let bLen = Int(pr.bLen), d = Int(pr.dst)
-                    var ia = 0, ib = 0, dd = d
-                    while ia < aLen && ib < bLen {
-                        if cur[aStart + ia] <= cur[aStart + aLen + ib] {
-                            nxt[dd] = cur[aStart + ia]; ia += 1
-                        } else {
-                            nxt[dd] = cur[aStart + aLen + ib]; ib += 1
-                        }
-                        dd += 1
-                    }
-                    while ia < aLen { nxt[dd] = cur[aStart + ia]; ia += 1; dd += 1 }
-                    while ib < bLen { nxt[dd] = cur[aStart + aLen + ib]; ib += 1; dd += 1 }
+            for uns in plan.units {
+                for u in uns {
+                    coRankMergeUnit(src: cur, dst: &nxt, u: u)
                 }
                 swap(&cur, &nxt)
             }

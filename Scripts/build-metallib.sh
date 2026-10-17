@@ -62,7 +62,7 @@ LIVE_KERNELS=(
     liveBinTransformCountKernel
     liveBinScatterKernel
     liveBinChunkSortV3Kernel
-    liveBinMergePassV2Kernel
+    liveBinMergePassV3Kernel
 )
 REQUIRED_KERNELS=(
     clearKernel

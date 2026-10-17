@@ -1582,8 +1582,10 @@ kernel void liveBinScatterKernel(
 // The CPU splits every tile slice into fixed 512-entry chunks (`GpuBinSpec.chunkTable`);
 // one thread heapsorts one chunk in place (`liveBinChunkSortV3Kernel`: no pads, no
 // barriers, no cross-thread cooperation — its failure mode is misordering, never
-// poison), then pairwise merge passes over a tiny CPU-built pair table
-// (`GpuBinSpec.mergePairs`, one thread per pair, sequential runs) restore full order. The common case (every tile fits
+// poison), then pairwise merge passes over a tiny CPU-built unit table
+// (`GpuBinSpec.mergePlan`: each pair's output split into ≤1024-entry units, one
+// thread per unit locating its input split with a co-rank binary search, then
+// serial-merging only its partition) restore full order. The common case (every tile fits
 // one chunk) needs zero merge passes. The CPU scatter is stable, so sorted-ascending
 // == the exact CPU tile list, which is what makes the per-tile render kernel's
 // stroke grouping correct. Segment indices are unique, so only ascending order
@@ -1650,32 +1652,59 @@ kernel void liveBinChunkSortV3Kernel(
     }
 }
 
-// One pairwise merge over the CPU-built pair table: one thread per pair, serial
-// two-finger merge (linear, sequential reads/writes) from `src` to `dst`. `src` and
-// `dst` are NEVER the same buffer: passes strictly alternate tileList/scratch, so an
-// in-place merge (which clobbers unread input) is impossible by construction. Pairs
-// with an empty B run are plain copies — they carry finished or single-chunk tiles
-// across the ping-pong, so after the final pass every non-empty tile rests in the
-// buffer the CPU directs the render kernel at. Empty tiles appear in no pair.
-kernel void liveBinMergePassV2Kernel(
+// One thread's share of a pairwise merge: the pair bounds plus the output partition
+// [dst+part, dst+part+partLen) this thread owns. Must match `GpuBinMergeUnit` field
+// for field (six uints, stride 24).
+struct LiveBinMergeUnit {
+    uint aStart;
+    uint aLen;
+    uint bLen;
+    uint dst;
+    uint part;
+    uint partLen;
+};
+
+// One partitioned merge over the CPU-built unit table: one thread per unit, each
+// owning at most `mergeUnitSize` outputs. The thread locates its input split with a
+// co-rank binary search (no inter-thread communication, no barriers), then
+// serial-merges only its partition from `src` to `dst`. Passes strictly alternate
+// tileList/scratch (src is never dst); units with an empty B run degenerate to plain
+// copies of their slice, carrying finished tiles across the ping-pong. No pads, no
+// literals written — output values are always exactly the input values, permuted.
+// A unit's dst partitions tile its pair's range and pairs tile their slices, so dst
+// regions are disjoint across all threads of a pass: race-free by construction.
+kernel void liveBinMergePassV3Kernel(
     constant LiveBinSortParams &p [[buffer(0)]],
-    const device uint4 *pairs [[buffer(1)]],
+    const device LiveBinMergeUnit *units [[buffer(1)]],
     const device uint *src [[buffer(2)]],
     device uint *dst [[buffer(3)]],
     uint3 tpg [[thread_position_in_grid]])
 {
     uint i = tpg.x;
     if (i >= p.unitCount) return;
-    uint4 pr = pairs[i];
-    uint aStart = pr.x, aLen = pr.y, bLen = pr.z, d = pr.w;
-    uint bStart = aStart + aLen;
-    uint ia = 0, ib = 0;
-    while (ia < aLen && ib < bLen) {
-        uint a = src[aStart + ia];
-        uint b = src[bStart + ib];
-        if (a <= b) { dst[d] = a; ++ia; } else { dst[d] = b; ++ib; }
+    LiveBinMergeUnit u = units[i];
+    uint bStart = u.aStart + u.aLen;
+    // Co-rank: find (ia, ib) with ia + ib == u.part, A[ia-1] <= B[ib] and
+    // B[ib-1] <= A[ia] (missing neighbours count as satisfied). Binary search on ia
+    // over [max(0, part-bLen), min(aLen, part)]; guarded reads only, nothing written.
+    uint lo = (u.part > u.bLen) ? (u.part - u.bLen) : 0u;
+    uint hi = (u.part < u.aLen) ? u.part : u.aLen;
+    while (lo < hi) {
+        uint ia = (lo + hi) >> 1;
+        uint ib = u.part - ia;
+        bool tooSmall = (ib > 0u) && (ia < u.aLen)
+            && (src[u.aStart + ia] < src[bStart + ib - 1]);
+        if (tooSmall) { lo = ia + 1u; } else { hi = ia; }
+    }
+    uint ia = lo, ib = u.part - lo;
+    // Serial two-finger merge over exactly this partition (linear, sequential).
+    uint d = u.dst + u.part;
+    uint end = d + u.partLen;
+    while (d < end) {
+        bool takeA = (ib >= u.bLen)
+            || ((ia < u.aLen) && (src[u.aStart + ia] <= src[bStart + ib]));
+        if (takeA) { dst[d] = src[u.aStart + ia]; ++ia; }
+        else { dst[d] = src[bStart + ib]; ++ib; }
         ++d;
     }
-    while (ia < aLen) { dst[d] = src[aStart + ia]; ++ia; ++d; }
-    while (ib < bLen) { dst[d] = src[bStart + ib]; ++ib; ++d; }
 }

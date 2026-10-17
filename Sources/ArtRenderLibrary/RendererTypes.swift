@@ -350,6 +350,31 @@ public struct GpuBinMergePair {
     }
 }
 
+/// One thread's share of a merge pair for the GPU sort. Layout-identical to the
+/// Metal `LiveBinMergeUnit`: the pair bounds (aStart, aLen, bLen, dst) plus the
+/// output partition [dst+part, dst+part+partLen) this thread owns. Six UInt32,
+/// stride 24. The kernel locates the partition's input split with a co-rank binary
+/// search, then serial-merges only its partition — so per-thread work stays bounded
+/// no matter how dense the tile (the old one-thread-per-pair tail did up to 65K
+/// serial steps in a single thread, stalling zoomed-out frames).
+public struct GpuBinMergeUnit {
+    public var aStart: UInt32
+    public var aLen: UInt32
+    public var bLen: UInt32
+    public var dst: UInt32
+    public var part: UInt32
+    public var partLen: UInt32
+    public init(aStart: UInt32, aLen: UInt32, bLen: UInt32, dst: UInt32,
+                part: UInt32, partLen: UInt32) {
+        self.aStart = aStart
+        self.aLen = aLen
+        self.bLen = bLen
+        self.dst = dst
+        self.part = part
+        self.partLen = partLen
+    }
+}
+
 public enum GpuBinSpec {
     /// Tile grid dimensions for a viewport. Mirrors `(w + tile - 1) / tile` on both sides.
     public static func tileGrid(viewportWidth: Int, viewportHeight: Int,
@@ -442,31 +467,51 @@ public enum GpuBinSpec {
         return pairs
     }
 
-    /// Merge plan for all `mergePasses` passes: per-pass pair tables plus each pass's
-    /// slot offset in one concatenated pair buffer (`offsets[p]` = total pairs of all
-    /// earlier passes, `totalPairs` = grand total). The GPU needs every pass's pairs
-    /// resident at dispatch time — rewriting one shared buffer per pass is a hazard
-    /// (earlier dispatches in the same command buffer would read the LAST pass's
-    /// pairs, silently mis-sorting), so all passes are uploaded once up front and
-    /// each dispatch binds its own offset. Pure integer logic, runs on Linux.
+    /// Merge plan for all `mergePasses` passes: per-pass thread-unit tables plus each
+    /// pass's slot offset in one concatenated unit buffer (`offsets[p]` = total units
+    /// of all earlier passes, `totalUnits` = grand total). Every pair's output range
+    /// is split into units of at most `unitSize` entries, so no thread ever
+    /// serial-merges more than one unit — the pairwise tail that stalled dense tiles
+    /// is gone. The GPU needs every pass's units resident at dispatch time —
+    /// rewriting one shared buffer per pass is a hazard (earlier dispatches in the
+    /// same command buffer would read the LAST pass's data and silently mis-sort),
+    /// so all passes are uploaded once up front and each dispatch binds its own
+    /// offset. Pure integer logic, runs on Linux.
     public static func mergePlan(entries: [GpuBinTileEntry], mergePasses: Int,
-                                 chunkSize: Int = sortChunkSize)
-        -> (pairs: [[GpuBinMergePair]], offsets: [Int], totalPairs: Int) {
-        var pairs: [[GpuBinMergePair]] = []
-        pairs.reserveCapacity(mergePasses)
+                                 chunkSize: Int = sortChunkSize,
+                                 unitSize: Int = mergeUnitSize)
+        -> (units: [[GpuBinMergeUnit]], offsets: [Int], totalUnits: Int) {
+        var units: [[GpuBinMergeUnit]] = []
+        units.reserveCapacity(mergePasses)
         var offsets: [Int] = []
         offsets.reserveCapacity(mergePasses)
         var total = 0
         var runSize = chunkSize
         for _ in 0..<mergePasses {
             offsets.append(total)
-            let prs = mergePairs(entries: entries, runSize: runSize)
-            pairs.append(prs)
-            total += prs.count
+            var passUnits: [GpuBinMergeUnit] = []
+            for pr in mergePairs(entries: entries, runSize: runSize) {
+                let len = Int(pr.aLen) + Int(pr.bLen)
+                var part = 0
+                while part < len {
+                    let partLen = min(unitSize, len - part)
+                    passUnits.append(GpuBinMergeUnit(aStart: pr.aStart, aLen: pr.aLen,
+                                                     bLen: pr.bLen, dst: pr.dst,
+                                                     part: UInt32(part),
+                                                     partLen: UInt32(partLen)))
+                    part += partLen
+                }
+            }
+            units.append(passUnits)
+            total += passUnits.count
             runSize *= 2
         }
-        return (pairs, offsets, total)
+        return (units, offsets, total)
     }
+
+    /// Maximum output entries one merge thread owns. Bounds per-thread serial work
+    /// at any zoom; smaller means more threads, larger means longer tails.
+    public static let mergeUnitSize = 1024
 
     /// Fixed sort work quantum (entries). Every GPU sort thread sorts at most this
     /// many entries, so per-thread nonlinear work is bounded no matter how far the

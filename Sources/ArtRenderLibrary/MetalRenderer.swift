@@ -125,13 +125,13 @@ internal final class LiveBinRefLayer {
     var tileList: MTLBuffer?         // incidences × UInt32 (.private)
     var tileScratch: MTLBuffer?      // incidences × UInt32, merge ping-pong (.private)
     var sortChunks: MTLBuffer?       // sort chunks × uint2 (start, len) (.shared)
-    var sortPairs: MTLBuffer?        // merge pairs × uint4, ALL passes concatenated (.shared)
+    var sortUnits: MTLBuffer?        // merge units (6×uint32), ALL passes concatenated (.shared)
                                                    // (per-pass offsets — never rewritten during encoding)
     var binCheckStaging: MTLBuffer?  // tile-list readback scratch for ART_LIVE_BINCHECK=1 (.shared)
     var boxCap = 0                   // boxTiles currently allocated
     var tileListCap = 0              // incidences currently allocated
     var chunkCap = 0                 // sort chunks currently allocated
-    var pairCap = 0                  // merge-pair slots currently allocated (all passes)
+    var unitCap = 0                  // merge-unit slots currently allocated (all passes)
 
     init(docID: ObjectIdentifier, segCount: Int, strokeCount: Int,
          refSegments: MTLBuffer, segStroke: MTLBuffer,

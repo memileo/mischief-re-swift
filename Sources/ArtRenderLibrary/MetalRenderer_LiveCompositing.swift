@@ -219,7 +219,7 @@ extension MetalRenderer {
             ("liveBinTransformCountKernel", { self.liveBinTransformCountPipeline = $0 }),
             ("liveBinScatterKernel", { self.liveBinScatterPipeline = $0 }),
             ("liveBinChunkSortV3Kernel", { self.liveBinChunkSortPipeline = $0 }),
-            ("liveBinMergePassV2Kernel", { self.liveBinMergePassPipeline = $0 }),
+            ("liveBinMergePassV3Kernel", { self.liveBinMergePassPipeline = $0 }),
         ]
         for (name, assign) in binKernels {
             if let fn = library.makeFunction(name: name) {
@@ -947,31 +947,31 @@ extension MetalRenderer {
             }
         }
         // Merge plan for every pass, built upfront (pure integer work): all passes live
-        // concatenated in ONE pair buffer with per-pass offsets. Rewriting one shared
+        // concatenated in ONE unit buffer with per-pass offsets. Rewriting one shared
         // buffer per pass is a GPU hazard — dispatches in a command buffer read their
-        // buffers at EXECUTION time, so every pass would see the last pass's pairs and
-        // silently mis-sort. A pass table that is non-empty yet holds zero pairs is
+        // buffers at EXECUTION time, so every pass would see the last pass's data and
+        // silently mis-sort. A pass table that is non-empty yet holds zero units is
         // inconsistent — fall back to CPU rather than mis-sort.
-        let (passPairs, passOffsets, totalPairs) =
+        let (passUnits, passOffsets, totalUnits) =
             GpuBinSpec.mergePlan(entries: entries, mergePasses: mergePasses)
         if mergePasses > 0 {
-            guard totalPairs > 0, passPairs.allSatisfy({ !$0.isEmpty }) else { return false }
-            if ref.pairCap < totalPairs {
-                let cap = max(totalPairs, ref.pairCap * 2)
-                guard let buf = device.makeBuffer(length: cap * MemoryLayout<GpuBinMergePair>.stride,
+            guard totalUnits > 0, passUnits.allSatisfy({ !$0.isEmpty }) else { return false }
+            if ref.unitCap < totalUnits {
+                let cap = max(totalUnits, ref.unitCap * 2)
+                guard let buf = device.makeBuffer(length: cap * MemoryLayout<GpuBinMergeUnit>.stride,
                                                   options: .storageModeShared) else {
                     return false
                 }
-                ref.sortPairs = buf
-                ref.pairCap = cap
+                ref.sortUnits = buf
+                ref.unitCap = cap
             }
-            guard let pairBuf = ref.sortPairs else { return false }
-            let pairBase = pairBuf.contents()
-            for (pass, prs) in passPairs.enumerated() {
-                prs.withUnsafeBytes { raw in
+            guard let unitBuf = ref.sortUnits else { return false }
+            let unitBase = unitBuf.contents()
+            for (pass, uns) in passUnits.enumerated() {
+                uns.withUnsafeBytes { raw in
                     if let src = raw.baseAddress {
-                        memcpy(pairBase.advanced(by: passOffsets[pass]
-                                                * MemoryLayout<GpuBinMergePair>.stride),
+                        memcpy(unitBase.advanced(by: passOffsets[pass]
+                                                * MemoryLayout<GpuBinMergeUnit>.stride),
                                src, raw.count)
                     }
                 }
@@ -1041,33 +1041,34 @@ extension MetalRenderer {
                                          threadsPerThreadgroup: binThreads)
         }
         func encodeMergePass(_ encoder: MTLComputeCommandEncoder, pass: Int) throws {
-            let prs = passPairs[pass]
-            guard let sortPairBuf = ref.sortPairs else {
+            let uns = passUnits[pass]
+            guard let sortUnitBuf = ref.sortUnits else {
                 throw MetalRendererError.bufferCreationFailed
             }
             // Strict tileList/scratch alternation — src is never dst, so the merge
             // can never clobber its own unread input (in-place merging corrupts).
             // Copies carry finished tiles along; the final buffer holds everything.
-            // The pairs are bound at this pass's offset in the upfront-uploaded plan —
+            // The units are bound at this pass's offset in the upfront-uploaded plan —
             // never rewritten during encoding (same-command-buffer dispatches read
-            // buffers at execution time).
+            // buffers at execution time). Each unit owns ≤1024 outputs located by
+            // co-rank, so no thread ever runs the old 65K-entry serial tail.
             let srcBuf: MTLBuffer = (pass % 2 == 1) ? tileScratch : tileList
             let dstBuf: MTLBuffer = (pass % 2 == 1) ? tileList : tileScratch
-            var mp = LiveBinSortParams(unitCount: UInt32(prs.count),
+            var mp = LiveBinSortParams(unitCount: UInt32(uns.count),
                                        runSize: UInt32(GpuBinSpec.sortChunkSize << pass))
             encoder.setComputePipelineState(mergePipe)
             encoder.setBytes(&mp, length: MemoryLayout<LiveBinSortParams>.stride, index: 0)
-            encoder.setBuffer(sortPairBuf,
-                              offset: passOffsets[pass] * MemoryLayout<GpuBinMergePair>.stride,
+            encoder.setBuffer(sortUnitBuf,
+                              offset: passOffsets[pass] * MemoryLayout<GpuBinMergeUnit>.stride,
                               index: 1)
             encoder.setBuffer(srcBuf, offset: 0, index: 2)
             encoder.setBuffer(dstBuf, offset: 0, index: 3)
-            encoder.dispatchThreadgroups(binGroups(prs.count),
+            encoder.dispatchThreadgroups(binGroups(uns.count),
                                          threadsPerThreadgroup: binThreads)
         }
         func encodeOrder(_ encoder: MTLComputeCommandEncoder) throws {
             try encodeChunkSort(encoder)
-            for pass in passPairs.indices {
+            for pass in passUnits.indices {
                 try encodeMergePass(encoder, pass: pass)
             }
         }
@@ -1177,7 +1178,7 @@ extension MetalRenderer {
                 checkRuns(sorted, stage: "chunksort",
                           runs: sortChunks.map { (Int($0.start), Int($0.len)) })
             }
-            for pass in passPairs.indices {
+            for pass in passUnits.indices {
                 guard let cbM = queue.makeCommandBuffer(),
                       let encM = cbM.makeComputeCommandEncoder() else { return false }
                 try encodeMergePass(encM, pass: pass)
@@ -1189,8 +1190,8 @@ extension MetalRenderer {
                     if let merged = readbackTileList(outBuf) {
                         checkBounds(merged, stage: "merge\(pass)")
                         checkRuns(merged, stage: "merge\(pass)",
-                                  runs: passPairs[pass].map {
-                                    (Int($0.dst), Int($0.aLen) + Int($0.bLen)) })
+                                  runs: passUnits[pass].map {
+                                    (Int($0.dst) + Int($0.part), Int($0.partLen)) })
                     }
                 }
             }
