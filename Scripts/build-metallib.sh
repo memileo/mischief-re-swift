@@ -229,8 +229,8 @@ case "$mode" in
             fi
         fi
         if [[ -z "$FOUND" ]]; then
-            echo "Not in BUILT_PRODUCTS_DIR — searching DerivedData for the newest build…"
-            FOUND="$(newest_metallib \
+            echo "Not in BUILT_PRODUCTS_DIR — searching DerivedData (up to 120s)…"
+            FOUND="$(with_timeout 120 newest_metallib \
                 "$HOME/Library/Developer/Xcode/DerivedData" \
                 "$HOME/Library/Developer/Xcode/Archives" \
                 "$ROOT/build" || true)"
@@ -240,7 +240,9 @@ case "$mode" in
             echo "Build it first:" >&2
             echo "  xcodebuild -project \"$PROJECT\" -scheme $SCHEME -configuration Release build" >&2
             echo "or build the $SCHEME scheme in Xcode, then re-run this script." >&2
-            echo "Already have the file somewhere? Scripts/build-metallib.sh --install <path>" >&2
+            echo "Already have the file somewhere? Skip the probe entirely:" >&2
+            echo "  ART_METALLIB_DIR=<dir-with-metallib> Scripts/build-metallib.sh --from-xcode" >&2
+            echo "or verify a known file directly: Scripts/build-metallib.sh --verify-only" >&2
             exit 1
         fi
         echo "Using $FOUND"

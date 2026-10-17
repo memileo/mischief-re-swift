@@ -56,11 +56,16 @@
          <EnvironmentVariable
             key = "ART_LIVE_BINTIME"
             value = "1"
-            isEnabled = "YES">
+            isEnabled = "NO">
          </EnvironmentVariable>
          <EnvironmentVariable
             key = "ART_LIVE_GPUBIN"
             value = "0"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "ART_LIVE_MERGE_UNIT"
+            value = "32"
             isEnabled = "NO">
          </EnvironmentVariable>
       </EnvironmentVariables>

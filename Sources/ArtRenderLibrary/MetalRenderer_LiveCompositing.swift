@@ -953,7 +953,8 @@ extension MetalRenderer {
         // silently mis-sort. A pass table that is non-empty yet holds zero units is
         // inconsistent — fall back to CPU rather than mis-sort.
         let (passUnits, passOffsets, totalUnits) =
-            GpuBinSpec.mergePlan(entries: entries, mergePasses: mergePasses)
+            GpuBinSpec.mergePlan(entries: entries, mergePasses: mergePasses,
+                                 unitSize: LiveConfig.mergeUnitSize())
         if mergePasses > 0 {
             guard totalUnits > 0, passUnits.allSatisfy({ !$0.isEmpty }) else { return false }
             if ref.unitCap < totalUnits {
@@ -1050,8 +1051,8 @@ extension MetalRenderer {
             // Copies carry finished tiles along; the final buffer holds everything.
             // The units are bound at this pass's offset in the upfront-uploaded plan —
             // never rewritten during encoding (same-command-buffer dispatches read
-            // buffers at execution time). Each unit owns ≤1024 outputs located by
-            // co-rank, so no thread ever runs the old 65K-entry serial tail.
+            // buffers at execution time). Each unit owns at most `mergeUnitSize`
+            // outputs located by co-rank, so no thread runs a long serial tail.
             let srcBuf: MTLBuffer = (pass % 2 == 1) ? tileScratch : tileList
             let dstBuf: MTLBuffer = (pass % 2 == 1) ? tileList : tileScratch
             var mp = LiveBinSortParams(unitCount: UInt32(uns.count),

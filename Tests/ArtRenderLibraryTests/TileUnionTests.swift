@@ -222,6 +222,18 @@ final class LiveConfigTests: XCTestCase {
         XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_TILE_SIZE": "32",
                                                               "ART_LIVE_TILE_SIZE": "8"]), 8)
     }
+
+    func testMergeUnitSizeDefaultsAndClamps() {
+        XCTAssertEqual(LiveConfig.mergeUnitSize(environment: [:]),
+                       GpuBinSpec.mergeUnitSize)
+        XCTAssertEqual(GpuBinSpec.mergeUnitSize, 64)
+        XCTAssertEqual(LiveConfig.mergeUnitSize(environment: ["ART_LIVE_MERGE_UNIT": "256"]), 256)
+        XCTAssertEqual(LiveConfig.mergeUnitSize(environment: ["ART_LIVE_MERGE_UNIT": "16"]), 16)
+        // Out-of-range or malformed values fall back to the default, never crash.
+        XCTAssertEqual(LiveConfig.mergeUnitSize(environment: ["ART_LIVE_MERGE_UNIT": "0"]), 64)
+        XCTAssertEqual(LiveConfig.mergeUnitSize(environment: ["ART_LIVE_MERGE_UNIT": "8192"]), 64)
+        XCTAssertEqual(LiveConfig.mergeUnitSize(environment: ["ART_LIVE_MERGE_UNIT": "abc"]), 64)
+    }
 }
 
 /// GPU binning spec: grid sizing, conservative layer-box math, count prefixing.
@@ -493,14 +505,24 @@ final class GpuBinSpecTests: XCTestCase {
             running += plan.units[p].count
         }
         XCTAssertEqual(plan.totalUnits, running)
-        // A pair smaller than one unit stays a single unit (common case: no extra
-        // threads for small tiles).
+        // A pair at or under one unit stays a single unit (common case: no extra
+        // threads for small tiles); a larger pair splits into bounded units.
         let (e2, _, _) = GpuBinSpec.combine(counts: [600])
         let small = GpuBinSpec.mergePlan(entries: e2, mergePasses: 1)
+        let unitLen = GpuBinSpec.mergeUnitSize
         XCTAssertEqual(small.units.count, 1)
-        XCTAssertEqual(small.units[0].count, 1)
+        XCTAssertEqual(small.units[0].count, (600 + unitLen - 1) / unitLen)
         XCTAssertEqual(small.units[0][0].part, 0)
-        XCTAssertEqual(small.units[0][0].partLen, 600)
+        var smallCovered = 0
+        for u in small.units[0] {
+            XCTAssertLessThanOrEqual(Int(u.partLen), unitLen)
+            smallCovered += Int(u.partLen)
+        }
+        XCTAssertEqual(smallCovered, 600)
+        let (e3, _, _) = GpuBinSpec.combine(counts: [40])
+        let tiny = GpuBinSpec.mergePlan(entries: e3, mergePasses: 1)
+        XCTAssertEqual(tiny.units[0].count, 1)
+        XCTAssertEqual(tiny.units[0][0].partLen, 40)
         // Zero passes → empty plan (chunk sort only, render reads the tile list).
         let empty = GpuBinSpec.mergePlan(entries: entries, mergePasses: 0)
         XCTAssertTrue(empty.units.isEmpty)
@@ -562,7 +584,7 @@ final class GpuBinSpecTests: XCTestCase {
             merged.append(contentsOf: b[ib...])
             let total = aLen + bLen
             guard total > 0 else { continue }
-            for unitSize in [1, 2, 3, 7, 1024] {
+            for unitSize in [1, 2, 3, 7, 64, 1024] {
                 var dst = [UInt32](repeating: .max, count: total)
                 var part = 0
                 while part < total {

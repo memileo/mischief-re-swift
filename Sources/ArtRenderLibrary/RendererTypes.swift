@@ -291,6 +291,16 @@ public enum LiveConfig {
         return env["ART_LIVE_BINCHECK"] == "1"
     }
 
+    /// Merge unit size for the GPU sort (`ART_LIVE_MERGE_UNIT`, clamped 16…4096,
+    /// default `GpuBinSpec.mergeUnitSize`). Tuning knob: lower means more threads
+    /// per merge pass and a shorter per-thread dependency chain (better for dense
+    /// zoom-out tiles); higher means fewer units to build and upload per frame.
+    public static func mergeUnitSize(environment: [String: String]? = nil) -> Int {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        if let v = env["ART_LIVE_MERGE_UNIT"], let n = Int(v), n >= 16, n <= 4096 { return n }
+        return GpuBinSpec.mergeUnitSize
+    }
+
     /// Tile size for the *live* binning/dispatch. Resolution order:
     /// `ART_LIVE_TILE_SIZE` → `ART_TILE_SIZE` → 16 (the measured default).
     /// The static path keeps its own default (32); only the live path uses this.
@@ -510,8 +520,12 @@ public enum GpuBinSpec {
     }
 
     /// Maximum output entries one merge thread owns. Bounds per-thread serial work
-    /// at any zoom; smaller means more threads, larger means longer tails.
-    public static let mergeUnitSize = 1024
+    /// at any zoom. Small on purpose: the two-finger merge's next load address
+    /// depends on the previous compare, so per-thread work is a dependency chain —
+    /// on dense zoom-out tiles 1024-entry units left only ~300 threads per pass,
+    /// each stalling ~1K dependent memory steps (~2 ms per pass). 64-entry units
+    /// give the same pass 16× the threads and a 16× shorter chain.
+    public static let mergeUnitSize = 64
 
     /// Fixed sort work quantum (entries). Every GPU sort thread sorts at most this
     /// many entries, so per-thread nonlinear work is bounded no matter how far the
