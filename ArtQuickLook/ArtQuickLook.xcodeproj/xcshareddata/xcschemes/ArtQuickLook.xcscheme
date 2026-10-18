@@ -40,9 +40,7 @@
       ignoresPersistentStateOnLaunch = "NO"
       debugDocumentVersioning = "YES"
       debugServiceExtension = "internal"
-      enableGPUShaderValidationMode = "2"
-      showGraphicsOverview = "Yes"
-      logGraphicsOverview = "Yes"
+      enableGPUValidationMode = "1"
       allowLocationSimulation = "YES">
       <BuildableProductRunnable
          runnableDebuggingMode = "0">
@@ -58,16 +56,11 @@
          <EnvironmentVariable
             key = "ART_LIVE_BINTIME"
             value = "1"
-            isEnabled = "NO">
+            isEnabled = "YES">
          </EnvironmentVariable>
          <EnvironmentVariable
             key = "ART_LIVE_GPUBIN"
             value = "0"
-            isEnabled = "NO">
-         </EnvironmentVariable>
-         <EnvironmentVariable
-            key = "ART_LIVE_MERGE_UNIT"
-            value = "32"
             isEnabled = "NO">
          </EnvironmentVariable>
       </EnvironmentVariables>

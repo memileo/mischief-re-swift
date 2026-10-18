@@ -96,6 +96,7 @@ class MetalRenderer {
     /// path, prune disabled): one zeroed header with group count 0 — the kernels then
     /// walk segments exactly as they did before the table existed. Lazily built.
     internal var liveEmptyGroupHeader: MTLBuffer?
+    internal var liveEmptyGroupHeaderCap = 0
     internal var liveEmptyStrokeGroups: MTLBuffer?
 
 /// One layer's GPU-binning state. Reference-space geometry is uploaded ONCE per

@@ -638,18 +638,31 @@ extension MetalRenderer {
 
     /// Binds the per-tile plan and dispatches ONE compute over the layer's tile box.
     /// Count-0 stand-in group buffers for dispatches without a stroke-group table.
-    /// Metal buffers are not guaranteed zeroed, so they are memset once at creation.
-    private func ensureEmptyGroupBuffers(device: MTLDevice) -> Bool {
-        if liveEmptyGroupHeader == nil || liveEmptyStrokeGroups == nil {
-            guard let hd = device.makeBuffer(length: 2 * MemoryLayout<UInt32>.size,
-                                             options: .storageModeShared),
-                  let gr = device.makeBuffer(length: MemoryLayout<GpuBinStrokeGroup>.stride,
-                                             options: .storageModeShared) else {
+    /// The composite kernels index the header by box-local tile UNCONDITIONALLY
+    /// (`strokeGroupTiles[localTile]`, even with count 0), so the stand-in header must
+    /// cover the caller's whole tile grid — grown on demand and memset (Metal buffer
+    /// contents are not guaranteed zeroed).
+    private func ensureEmptyGroupBuffers(device: MTLDevice, tileCount: Int) -> Bool {
+        let tiles = max(tileCount, 1)
+        if liveEmptyGroupHeader == nil || liveEmptyGroupHeaderCap < tiles {
+            let cap = max(tiles, liveEmptyGroupHeaderCap * 2, 64)
+            guard let hd = device.makeBuffer(
+                length: cap * 2 * MemoryLayout<UInt32>.size,
+                options: .storageModeShared) else {
                 return false
             }
             memset(hd.contents(), 0, hd.length)
-            memset(gr.contents(), 0, gr.length)
             liveEmptyGroupHeader = hd
+            liveEmptyGroupHeaderCap = cap
+        }
+        if liveEmptyStrokeGroups == nil {
+            // The entries stand-in is never dereferenced while counts are 0 (the
+            // cursor loop short-circuits on the count), so one zeroed slot suffices.
+            guard let gr = device.makeBuffer(length: MemoryLayout<GpuBinStrokeGroup>.stride,
+                                             options: .storageModeShared) else {
+                return false
+            }
+            memset(gr.contents(), 0, gr.length)
             liveEmptyStrokeGroups = gr
         }
         return true
@@ -659,7 +672,8 @@ extension MetalRenderer {
         guard let arena = liveArena else { throw MetalRendererError.bufferCreationFailed }
         // The static plan path has no stroke-group table: bind the count-0 stand-in so
         // the kernels keep their exact pre-table behaviour.
-        guard let device = device, ensureEmptyGroupBuffers(device: device),
+        guard let device = device,
+              ensureEmptyGroupBuffers(device: device, tileCount: plan.boxWidth * plan.boxHeight),
               let emptyHeader = liveEmptyGroupHeader,
               let emptyGroups = liveEmptyStrokeGroups else {
             throw MetalRendererError.bufferCreationFailed
@@ -982,7 +996,7 @@ extension MetalRenderer {
         // exceeded) or ART_LIVE_STROKE_PRUNE=0 leaves behaviour identical, just slower.
         var groupHeaderBuf: MTLBuffer
         var groupEntryBuf: MTLBuffer
-        guard ensureEmptyGroupBuffers(device: device) else { return false }
+        guard ensureEmptyGroupBuffers(device: device, tileCount: boxTiles) else { return false }
         if LiveConfig.strokePruneEnabled() {
             let table = GpuBinSpec.strokeGroupTable(
                 strokeIDs: visStrokeIDs.map { UInt32($0) },

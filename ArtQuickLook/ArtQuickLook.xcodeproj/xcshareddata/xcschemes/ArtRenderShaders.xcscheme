@@ -61,9 +61,7 @@
       debugDocumentVersioning = "YES"
       debugServiceExtension = "internal"
       enableGPUFrameCaptureMode = "3"
-      enableGPUShaderValidationMode = "2"
-      showGraphicsOverview = "Yes"
-      logGraphicsOverview = "Yes"
+      enableGPUValidationMode = "1"
       allowLocationSimulation = "YES">
    </LaunchAction>
    <ProfileAction
