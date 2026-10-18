@@ -234,6 +234,12 @@ final class LiveConfigTests: XCTestCase {
         XCTAssertEqual(LiveConfig.mergeUnitSize(environment: ["ART_LIVE_MERGE_UNIT": "8192"]), 64)
         XCTAssertEqual(LiveConfig.mergeUnitSize(environment: ["ART_LIVE_MERGE_UNIT": "abc"]), 64)
     }
+
+    func testStrokePruneDefaultsOn() {
+        XCTAssertTrue(LiveConfig.strokePruneEnabled(environment: [:]))
+        XCTAssertTrue(LiveConfig.strokePruneEnabled(environment: ["ART_LIVE_STROKE_PRUNE": "1"]))
+        XCTAssertFalse(LiveConfig.strokePruneEnabled(environment: ["ART_LIVE_STROKE_PRUNE": "0"]))
+    }
 }
 
 /// GPU binning spec: grid sizing, conservative layer-box math, count prefixing.
@@ -533,6 +539,82 @@ final class GpuBinSpecTests: XCTestCase {
     /// Swift mirror of `liveBinMergePassV3Kernel`'s per-unit work, kept
     /// structurally identical (co-rank binary search, then a bounded serial merge)
     /// so the end-to-end test guards the algorithm the GPU runs on every unit.
+    func testStrokeGroupTableStrideLock() {
+        // Layout lock: macOS memcpys [GpuBinStrokeGroup] into the uint+4-float table
+        // the composite kernels read (uint + 4 × float, stride 20).
+        XCTAssertEqual(MemoryLayout<GpuBinStrokeGroup>.stride, 20)
+        XCTAssertEqual(MemoryLayout<GpuBinStrokeGroup>.size, 20)
+    }
+
+    func testStrokeGroupTableOrderingGatingAndBudget() {
+        // Doc-ascending strokes 3, 7, 9 over a 2×2 layer box; only tile (1,1) is dense.
+        let ids: [UInt32] = [3, 7, 9]
+        let boxes: [SIMD4<Float>] = [
+            SIMD4<Float>(-10, -10, 10, 10),
+            SIMD4<Float>(0, 0, 200, 200),
+            SIMD4<Float>(150, 150, 260, 260),
+        ]
+        let tileBoxes: [(minX: Int, minY: Int, maxX: Int, maxY: Int)] = [
+            (0, 0, 0, 0),   // stroke 3: only the sparse tile (0,0) → never in the table
+            (0, 0, 1, 1),   // stroke 7: covers everything, dense tile included
+            (1, 1, 1, 1),   // stroke 9: dense tile only
+        ]
+        let counts: [UInt32] = [10, 10, 10, 128]   // only local tile 3 = (1,1) is dense
+        let table = GpuBinSpec.strokeGroupTable(
+            strokeIDs: ids, strokeBoxes: boxes, strokeTileBoxes: tileBoxes,
+            tileCounts: counts, box: (0, 0, 1, 1))
+        XCTAssertEqual(table.totalGroups, 2)
+        // Sparse tiles carry no groups; the dense tile carries two in doc order.
+        for t in 0..<3 {
+            XCTAssertEqual(table.header[t * 2 + 1], 0, "tile \(t)")
+        }
+        XCTAssertEqual(table.header[3 * 2], 0)
+        XCTAssertEqual(table.header[3 * 2 + 1], 2)
+        XCTAssertEqual(table.entries.count, 2)
+        XCTAssertEqual(table.entries[0].strokeID, 7)
+        XCTAssertEqual(table.entries[1].strokeID, 9)
+        // The kernel's monotone cursor against this table: known ids hit their box,
+        // absent ids (gap below/between/above) resolve to "no skip".
+        func lookup(id: UInt32) -> SIMD4<Float>? {
+            var cursor = 0
+            let start = Int(table.header[3 * 2]), count = Int(table.header[3 * 2 + 1])
+            var hit: SIMD4<Float>? = nil
+            while cursor < count {
+                let e = table.entries[start + cursor]
+                if e.strokeID < id { cursor += 1; continue }
+                if e.strokeID == id { hit = SIMD4<Float>(e.minX, e.minY, e.maxX, e.maxY) }
+                break
+            }
+            return hit
+        }
+        XCTAssertEqual(lookup(id: 7), boxes[1])
+        XCTAssertEqual(lookup(id: 9), boxes[2])
+        XCTAssertNil(lookup(id: 6))
+        XCTAssertNil(lookup(id: 8))
+        XCTAssertNil(lookup(id: 12))
+        // Density gate: same inputs with the dense tile lowered below the threshold
+        // drop the whole table (no dense tiles → empty header, direct walk).
+        let sparse = GpuBinSpec.strokeGroupTable(
+            strokeIDs: ids, strokeBoxes: boxes, strokeTileBoxes: tileBoxes,
+            tileCounts: [10, 10, 10,
+                         UInt32(GpuBinSpec.strokePruneMinTileEntries - 1)],
+            box: (0, 0, 1, 1))
+        XCTAssertEqual(sparse.totalGroups, 0)
+        XCTAssertEqual(sparse.entries.count, 0)
+        XCTAssertTrue(sparse.header.allSatisfy { $0 == 0 })
+        // Budget: exceed it → table dropped, header stays zero (kernels fall back).
+        let countsHuge: [UInt32] = [10, 10, 10, 128]
+        let idsHuge: [UInt32] = [0, 1, 2, 3]
+        let boxesHuge = [SIMD4<Float>](repeating: SIMD4<Float>(0, 0, 1, 1), count: 4)
+        let tilesHuge = [(1, 1, 1, 1), (1, 1, 1, 1), (1, 1, 1, 1), (1, 1, 1, 1)] as
+            [(minX: Int, minY: Int, maxX: Int, maxY: Int)]
+        let dropped = GpuBinSpec.strokeGroupTable(
+            strokeIDs: idsHuge, strokeBoxes: boxesHuge, strokeTileBoxes: tilesHuge,
+            tileCounts: countsHuge, box: (0, 0, 1, 1), budget: 3)
+        XCTAssertEqual(dropped.totalGroups, 0)
+        XCTAssertTrue(dropped.header.allSatisfy { $0 == 0 })
+    }
+
     private func coRankMergeUnit(src: [UInt32], dst: inout [UInt32], u: GpuBinMergeUnit) {
         let aStart = Int(u.aStart), aLen = Int(u.aLen), bLen = Int(u.bLen)
         let bStart = aStart + aLen

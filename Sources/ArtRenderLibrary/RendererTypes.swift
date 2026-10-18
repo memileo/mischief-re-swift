@@ -301,6 +301,15 @@ public enum LiveConfig {
         return GpuBinSpec.mergeUnitSize
     }
 
+    /// Stroke-box pruning in the per-tile composite kernels (default on; set
+    /// `ART_LIVE_STROKE_PRUNE=0` to A/B against the direct segment walk). Only dense
+    /// tiles participate (see `GpuBinSpec.strokePruneMinTileEntries`) and a dropped
+    /// table (budget exceeded) keeps the exact behaviour, just slower.
+    public static func strokePruneEnabled(environment: [String: String]? = nil) -> Bool {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        return env["ART_LIVE_STROKE_PRUNE"] != "0"
+    }
+
     /// Tile size for the *live* binning/dispatch. Resolution order:
     /// `ART_LIVE_TILE_SIZE` → `ART_TILE_SIZE` → 16 (the measured default).
     /// The static path keeps its own default (32); only the live path uses this.
@@ -367,6 +376,27 @@ public struct GpuBinMergePair {
 /// search, then serial-merges only its partition — so per-thread work stays bounded
 /// no matter how dense the tile (the old one-thread-per-pair tail did up to 65K
 /// serial steps in a single thread, stalling zoomed-out frames).
+/// One clickable stroke unit for the per-tile composite's box pruning. Layout-identical
+/// to the Metal `LiveStrokeGroupBox`: the stroke ID plus its conservative half-open
+/// device-space stamp box `[min, max)` (five 4-byte fields, stride 20). The composite
+/// kernels consult it per stroke-group change; a pixel outside the box provably
+/// stamps nothing for that stroke (the pad covers both the AA and the noise cutoff),
+/// so skipping changes no output value — it only skips provably-zero work.
+public struct GpuBinStrokeGroup {
+    public var strokeID: UInt32
+    public var minX: Float
+    public var minY: Float
+    public var maxX: Float
+    public var maxY: Float
+    public init(strokeID: UInt32, minX: Float, minY: Float, maxX: Float, maxY: Float) {
+        self.strokeID = strokeID
+        self.minX = minX
+        self.minY = minY
+        self.maxX = maxX
+        self.maxY = maxY
+    }
+}
+
 public struct GpuBinMergeUnit {
     public var aStart: UInt32
     public var aLen: UInt32
@@ -551,6 +581,110 @@ public enum GpuBinSpec {
             running += UInt64(c)
         }
         return (entries, starts, Int(running))
+    }
+
+    // MARK: Stroke-group table for composite box pruning
+
+    /// Minimum entries a tile needs before the per-pixel composite kernel switches to
+    /// the stroke-group box walk. Sparse tiles (the overwhelmingly common case at base
+    /// zoom) walk segments directly — the table costs nothing and changes nothing.
+    public static let strokePruneMinTileEntries = 64
+
+    /// Upper bound on table entries accepted per frame. Beyond it the table is dropped
+    /// for that frame (kernels fall back to the direct segment walk) instead of
+    /// ballooning CPU plan time / upload traffic.
+    public static let strokePruneBudget = 2_000_000
+
+    /// Builds the per-tile stroke-group table the composite kernels use to skip whole
+    /// strokes whose padded device box misses a pixel. Inputs (all parallel):
+    /// `strokeIDs` = visible strokes in document order, `strokeBoxes` = their padded
+    /// half-open device-space boxes `[min, max)` (pad ≥ 1.4·maxRadius·radiusFactor+3.5
+    /// covers both the AA and noise stamp cutoffs), `strokeTileRanges` = per stroke the
+    /// canvas-tile range its transformed AABB covers, `tileCounts` = per box-local tile
+    /// entry count (density gate), `box` = the layer box in canvas tile coords.
+    /// Output: `header` (two UInt32 per box-local tile: [start, count) into `entries`,
+    /// entry list flat buffer) and per-tile flat group entries in ascending stroke-ID
+    /// order. A tile below the density gate gets no entries — the kernel walks its
+    /// segments directly, exactly as before. If the total exceeds `budget`, the table
+    /// is dropped (empty header) for this frame. Pure integer/float logic, runs on
+    /// Linux; the Metal kernels mirror the walk order (document order == ascending
+    /// segment index == ascending stroke level within any tile).
+    public static func strokeGroupTable(strokeIDs: [UInt32],
+                                        strokeBoxes: [SIMD4<Float>],
+                                        strokeTileBoxes: [(minX: Int, minY: Int,
+                                                           maxX: Int, maxY: Int)],
+                                        tileCounts: [UInt32],
+                                        box: (minX: Int, minY: Int, maxX: Int, maxY: Int),
+                                        minEntries: Int = strokePruneMinTileEntries,
+                                        budget: Int = strokePruneBudget)
+        -> (header: [UInt32], entries: [GpuBinStrokeGroup], totalGroups: Int) {
+        let boxW = max(box.maxX - box.minX + 1, 0)
+        let boxH = max(box.maxY - box.minY + 1, 0)
+        let boxTiles = boxW * boxH
+        var header = [UInt32](repeating: 0, count: boxTiles * 2)
+        guard boxTiles > 0, tileCounts.count >= boxTiles,
+              strokeIDs.count == strokeBoxes.count,
+              strokeIDs.count == strokeTileBoxes.count else { return (header, [], 0) }
+
+        // Pass 1: how many groups qualify per box-local tile.
+        var perTile = [Int](repeating: 0, count: boxTiles)
+        for s in 0..<strokeIDs.count {
+            let tb = strokeTileBoxes[s]
+            let loX = max(tb.minX, box.minX), hiX = min(tb.maxX, box.maxX)
+            let loY = max(tb.minY, box.minY), hiY = min(tb.maxY, box.maxY)
+            guard loX <= hiX, loY <= hiY else { continue }
+            var ly = loY
+            while ly <= hiY {
+                var lx = loX
+                while lx <= hiX {
+                    let t = (ly - box.minY) * boxW + (lx - box.minX)
+                    if Int(tileCounts[t]) >= minEntries { perTile[t] += 1 }
+                    lx += 1
+                }
+                ly += 1
+            }
+        }
+        var total = perTile.reduce(0, +)
+        if total > budget { return (header, [], 0) }
+        // Pass 2: prefix Start offsets, then fill. Strokes iterate in document
+        // (ascending-ID) order, so each tile's list is ascending with no checks;
+        // within a tile every stroke occurs at most once (its segments are the
+        // contiguous ID range the tile list carries in order).
+        var start = 0
+        for t in 0..<boxTiles {
+            header[t * 2] = UInt32(start)
+            header[t * 2 + 1] = UInt32(perTile[t])
+            start += perTile[t]
+        }
+        var cursor = perTile
+        for (t, c) in perTile.enumerated() { cursor[t] = 0 }
+        var entries = [GpuBinStrokeGroup](
+            repeating: GpuBinStrokeGroup(strokeID: 0xFFFF_FFFF,
+                                         minX: 0, minY: 0, maxX: 0, maxY: 0),
+            count: total)
+        for s in 0..<strokeIDs.count {
+            let boxf = strokeBoxes[s]
+            let e = GpuBinStrokeGroup(strokeID: strokeIDs[s],
+                                      minX: boxf.x, minY: boxf.y,
+                                      maxX: boxf.z, maxY: boxf.w)
+            let tb = strokeTileBoxes[s]
+            let loX = max(tb.minX, box.minX), hiX = min(tb.maxX, box.maxX)
+            let loY = max(tb.minY, box.minY), hiY = min(tb.maxY, box.maxY)
+            var ly = loY
+            while ly <= hiY {
+                var lx = loX
+                while lx <= hiX {
+                    let t = (ly - box.minY) * boxW + (lx - box.minX)
+                    if Int(tileCounts[t]) >= minEntries {
+                        entries[Int(header[t * 2]) + cursor[t]] = e
+                        cursor[t] += 1
+                    }
+                    lx += 1
+                }
+                ly += 1
+            }
+        }
+        return (header, entries, total)
     }
 }
 

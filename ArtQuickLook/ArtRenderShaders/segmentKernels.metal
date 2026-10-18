@@ -1176,6 +1176,23 @@ struct PerTileParams {
     uint tileSize;
 };
 
+// MARK: - Per-tile AA composite (one dispatch per layer, AA only), stroke-box pruning
+//
+// One stroke group: the stroke ID plus its conservative half-open device-space stamp
+// box [min, max). Must match `GpuBinStrokeGroup` field for field (uint + 4 floats,
+// stride 20). The pad (CPU side: 1.4·maxRadius·radiusFactor + 3.5 px) covers every
+// stamp cutoff (AA cov > 0 needs signedDist < 0.44 ⇒ liveSegDist < r(t)+0.44; noise
+// cov > 0 needs liveSegDist < 1.375·max(r,1); the stored prune gate only tightens).
+// A pixel outside the box therefore provably stamps nothing for the whole stroke —
+// skipping it changes no output value, it only skips provably-zero work.
+struct LiveStrokeGroupBox {
+    uint strokeID;
+    float minX;
+    float minY;
+    float maxX;
+    float maxY;
+};
+
 kernel void livePerTileAACompositeKernel(
     const device PerTileParams &params    [[buffer(0)]],
     const device GPUSplineSegment *segments [[buffer(1)]],   // global, document (stroke) order
@@ -1184,6 +1201,8 @@ kernel void livePerTileAACompositeKernel(
     const device uint32_t *tileList [[buffer(4)]],            // global segIdx, ascending (= doc order)
     const device float4 *strokeColor [[buffer(5)]],           // per stroke: pen colour
     const device uint32_t *strokeFlags [[buffer(6)]],         // per stroke: bit0 = eraser
+    const device uint2 *strokeGroupTiles [[buffer(7)]],       // per box-local tile: (start, count) groups
+    const device LiveStrokeGroupBox *strokeGroups [[buffer(8)]], // flat group table
     texture2d<float, access::read_write> target [[texture(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
@@ -1199,6 +1218,12 @@ kernel void livePerTileAACompositeKernel(
     TileIndex tc = tileStartCount[localTile];
     float2 pos = float2(pixel.x, pixel.y) + float2(0.5f, 0.5f);
 
+    // Stroke skip table: group ids ascend with the tile list's ascending stroke ids,
+    // so a monotone cursor resolves each stroke change. Count 0 = no table (sparse
+    // tile, prune off, or a dropped table) → direct segment walk, exactly as before.
+    uint2 groupsInfo = strokeGroupTiles[localTile];
+    uint groupCursor = 0u;
+    bool strokeActive = true;
     float4 acc = float4(0.0f);          // canvas is cleared before the layer, so start transparent
     uint curStroke = 0xFFFFFFFFu;       // no stroke yet
     float curMax = 0.0f;
@@ -1211,9 +1236,25 @@ kernel void livePerTileAACompositeKernel(
                 float4 col = strokeColor[curStroke];
                 perTileCompositeStroke(acc, col, strokeFlags[curStroke], curMax * col.a);
             }
+            bool active = true;
+            if (groupsInfo.y > 0u) {
+                while (groupCursor < groupsInfo.y &&
+                       strokeGroups[groupsInfo.x + groupCursor].strokeID < sId) {
+                    ++groupCursor;
+                }
+                if (groupCursor < groupsInfo.y &&
+                    strokeGroups[groupsInfo.x + groupCursor].strokeID == sId) {
+                    LiveStrokeGroupBox g = strokeGroups[groupsInfo.x + groupCursor];
+                    active = (pos.x >= g.minX && pos.y >= g.minY &&
+                              pos.x < g.maxX  && pos.y < g.maxY);
+                    ++groupCursor;    // each stroke occurs at most once per tile
+                }
+            }
+            strokeActive = active;
             curStroke = sId;
             curMax = 0.0f;
         }
+        if (!strokeActive) continue;    // box-missed stroke: every segment stamps nothing
 
         GPUSplineSegment seg = segments[segIdx];
         float pruneRadius = (seg.padding1 != 0u) ? as_type<float>(seg.padding1) : 3.4e38f;
@@ -1266,6 +1307,8 @@ kernel void livePerTileNoiseCompositeKernel(
     const device uint32_t *tileList [[buffer(4)]],
     const device float4 *strokeColor [[buffer(5)]],
     const device uint32_t *strokeFlags [[buffer(6)]],   // bit0 = eraser, bit1 = hasNoise
+    const device uint2 *strokeGroupTiles [[buffer(7)]],       // per box-local tile: (start, count) groups
+    const device LiveStrokeGroupBox *strokeGroups [[buffer(8)]], // flat group table
     texture2d<float, access::read_write> target [[texture(0)]],
     texture2d<float, access::sample> noiseTex [[texture(1)]],
     sampler noiseSampler [[sampler(0)]],
@@ -1291,6 +1334,11 @@ kernel void livePerTileNoiseCompositeKernel(
     }
 
     float4 acc = float4(0.0f);
+    // Stroke skip table (same contract as livePerTileAACompositeKernel): monotone
+    // cursor over this tile's ascending group ids; count 0 = no table → direct walk.
+    uint2 groupsInfo = strokeGroupTiles[localTile];
+    uint groupCursor = 0u;
+    bool strokeActive = true;
     uint curStroke = 0xFFFFFFFFu;
     float curMax = 0.0f;
     bool curNoisy = false;
@@ -1317,10 +1365,26 @@ kernel void livePerTileNoiseCompositeKernel(
                     }
                 }
             }
+            bool active = true;
+            if (groupsInfo.y > 0u) {
+                while (groupCursor < groupsInfo.y &&
+                       strokeGroups[groupsInfo.x + groupCursor].strokeID < sId) {
+                    ++groupCursor;
+                }
+                if (groupCursor < groupsInfo.y &&
+                    strokeGroups[groupsInfo.x + groupCursor].strokeID == sId) {
+                    LiveStrokeGroupBox g = strokeGroups[groupsInfo.x + groupCursor];
+                    active = (pos.x >= g.minX && pos.y >= g.minY &&
+                              pos.x < g.maxX  && pos.y < g.maxY);
+                    ++groupCursor;    // each stroke occurs at most once per tile
+                }
+            }
+            strokeActive = active;
             curStroke = sId;
             curMax = 0.0f;
             curNoisy = (strokeFlags[sId] & 0x2u) != 0u;
         }
+        if (!strokeActive) continue;    // box-missed stroke: every segment stamps nothing
 
         GPUSplineSegment seg = segments[segIdx];
         float pruneRadius = (seg.padding1 != 0u) ? as_type<float>(seg.padding1) : 3.4e38f;

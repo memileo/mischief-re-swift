@@ -92,6 +92,11 @@ class MetalRenderer {
     /// the document changes — reference-space geometry never crosses documents.
     internal var liveBinLayers: [Int: LiveBinRefLayer] = [:]
     internal var liveBinDocID: ObjectIdentifier?
+    /// Stand-in stroke-group buffers for dispatches with no table (static per-tile
+    /// path, prune disabled): one zeroed header with group count 0 — the kernels then
+    /// walk segments exactly as they did before the table existed. Lazily built.
+    internal var liveEmptyGroupHeader: MTLBuffer?
+    internal var liveEmptyStrokeGroups: MTLBuffer?
 
 /// One layer's GPU-binning state. Reference-space geometry is uploaded ONCE per
 /// document/layer (it never changes across frames — only the camera does); frame buffers
@@ -110,6 +115,8 @@ internal final class LiveBinRefLayer {
     var strokeIsMarker: [Bool]       // S
     var strokeHasNoise: [Bool]       // S
     var strokeSegCounts: [Int]       // S, segments per stroke (timing counters)
+    var strokeMaxRadius: [Float]     // S, max(radius0, radius1) over segments, doc space —
+                                     // pads the composite stroke-group boxes conservatively
     // Frame buffers (sized geometrically, reused across frames):
     var frameSegments: MTLBuffer?    // N × GPUSplineSegment, device space (.private)
     var ranges: MTLBuffer?           // N × int4 tile ranges (.private)
@@ -127,17 +134,26 @@ internal final class LiveBinRefLayer {
     var sortChunks: MTLBuffer?       // sort chunks × uint2 (start, len) (.shared)
     var sortUnits: MTLBuffer?        // merge units (6×uint32), ALL passes concatenated (.shared)
                                                    // (per-pass offsets — never rewritten during encoding)
+    var groupHeader: MTLBuffer?      // boxTiles × uint2 (start, count) stroke groups (.shared)
+    var strokeGroups: MTLBuffer?     // groups × LiveStrokeGroupBox (uint + 4 floats, stride 20,
+                                                   // half-open device box) (.shared)
+    var emptyGroupHeader: MTLBuffer? // 1-tile zeroed header for paths with no table —
+                                                   // count 0 makes the kernels walk segments
+                                                   // exactly as they did before this table
+    var emptyStrokeGroups: MTLBuffer?
     var binCheckStaging: MTLBuffer?  // tile-list readback scratch for ART_LIVE_BINCHECK=1 (.shared)
     var boxCap = 0                   // boxTiles currently allocated
     var tileListCap = 0              // incidences currently allocated
     var chunkCap = 0                 // sort chunks currently allocated
     var unitCap = 0                  // merge-unit slots currently allocated (all passes)
+    var groupHeaderCap = 0           // group-header slots currently allocated (2 per box tile)
+    var groupCap = 0                 // stroke-group entries currently allocated
 
     init(docID: ObjectIdentifier, segCount: Int, strokeCount: Int,
          refSegments: MTLBuffer, segStroke: MTLBuffer,
          strokeColors: MTLBuffer, strokeFlags: MTLBuffer, strokeVisible: MTLBuffer,
          strokeBounds: [CGRect], strokeIsMarker: [Bool], strokeHasNoise: [Bool],
-         strokeSegCounts: [Int]) {
+         strokeSegCounts: [Int], strokeMaxRadius: [Float]) {
         self.docID = docID
         self.segCount = segCount
         self.strokeCount = strokeCount
@@ -150,6 +166,7 @@ internal final class LiveBinRefLayer {
         self.strokeIsMarker = strokeIsMarker
         self.strokeHasNoise = strokeHasNoise
         self.strokeSegCounts = strokeSegCounts
+        self.strokeMaxRadius = strokeMaxRadius
     }
 }
 
