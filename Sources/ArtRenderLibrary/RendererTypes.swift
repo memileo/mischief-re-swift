@@ -323,6 +323,45 @@ public enum LiveConfig {
         return max(64, min(1024, v))
     }
 
+    /// Segment-parallel splat composite for small-stamp views (default ON; set
+    /// `ART_LIVE_SPLAT=0` for the per-pixel walk A/B). Only used when the view's
+    /// `radiusFactor` and pixel budget admit it (see below) — otherwise the walk runs
+    /// unchanged. Output is byte-identical by construction (see `SPLAT-DESIGN.md`).
+    public static func splatEnabled(environment: [String: String]? = nil) -> Bool {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        return env["ART_LIVE_SPLAT"] != "0"
+    }
+
+    /// Largest `radiusFactor` (camera scale) at which the splat path is exact. For
+    /// `radiusFactor ≤ 1` the segment prune radius is ≤ the binning box pad, so the
+    /// prune disk is a subset of the tile range and the splat's pixel set equals the
+    /// walk's (`ART_LIVE_SPLAT_MAX_RF`, default 1.0, clamped 0…4).
+    public static func splatMaxRadiusFactor(environment: [String: String]? = nil) -> Float {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        guard let v = env["ART_LIVE_SPLAT_MAX_RF"], let f = Float(v) else { return 1.0 }
+        return max(0, min(4, f))
+    }
+
+    /// Slots per pixel = visible strokes handled per splat batch
+    /// (`ART_LIVE_SPLAT_BATCH`, clamped 8…512, default 128). Larger = fewer dispatches
+    /// but a wider per-pixel composite loop; the total composite work (pixels × visible
+    /// strokes) is independent of it.
+    public static func splatBatchSlots(environment: [String: String]? = nil) -> Int {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        guard let v = env["ART_LIVE_SPLAT_BATCH"], let n = Int(v) else { return 128 }
+        return max(8, min(512, n))
+    }
+
+    /// Budget for the splat scratch (`ART_LIVE_SPLAT_SLOT_BUDGET`, in slots = pixels ×
+    /// batch, default 16M = 64 MB of uint + 256 MB of float4 acc… the acc is sized by
+    /// pixels only). Frames that would exceed it fall back to the walk, so deep zoom-in
+    /// (huge boxes) never allocates a monster.
+    public static func splatSlotBudget(environment: [String: String]? = nil) -> Int {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        guard let v = env["ART_LIVE_SPLAT_SLOT_BUDGET"], let n = Int(v) else { return 16_000_000 }
+        return max(65_536, n)
+    }
+
     /// Whether the live chunk sort uses the v4 threadgroup bitonic (default ON).
     /// `ART_LIVE_SORT_BITONIC=0` reverts to the v3 per-thread heapsort for A/B
     /// gates and regression comparisons; the merge passes are unchanged either

@@ -808,6 +808,70 @@ final class GpuBinSpecTests: XCTestCase {
         XCTAssertEqual(LiveConfig.sortChunkSize(environment: ["ART_LIVE_SORT_CHUNK": "abc"]), 512)
     }
 
+    func testSplatConfigDefaultsAndClamps() {
+        XCTAssertTrue(LiveConfig.splatEnabled(environment: [:]))
+        XCTAssertFalse(LiveConfig.splatEnabled(environment: ["ART_LIVE_SPLAT": "0"]))
+        XCTAssertTrue(LiveConfig.splatEnabled(environment: ["ART_LIVE_SPLAT": "1"]))
+        XCTAssertEqual(LiveConfig.splatMaxRadiusFactor(environment: [:]), 1.0)
+        XCTAssertEqual(LiveConfig.splatMaxRadiusFactor(environment: ["ART_LIVE_SPLAT_MAX_RF": "0.25"]), 0.25)
+        XCTAssertEqual(LiveConfig.splatMaxRadiusFactor(environment: ["ART_LIVE_SPLAT_MAX_RF": "9"]), 4.0)
+        XCTAssertEqual(LiveConfig.splatMaxRadiusFactor(environment: ["ART_LIVE_SPLAT_MAX_RF": "-3"]), 0.0)
+        XCTAssertEqual(LiveConfig.splatMaxRadiusFactor(environment: ["ART_LIVE_SPLAT_MAX_RF": "abc"]), 1.0)
+        XCTAssertEqual(LiveConfig.splatBatchSlots(environment: [:]), 128)
+        XCTAssertEqual(LiveConfig.splatBatchSlots(environment: ["ART_LIVE_SPLAT_BATCH": "64"]), 64)
+        XCTAssertEqual(LiveConfig.splatBatchSlots(environment: ["ART_LIVE_SPLAT_BATCH": "1000"]), 512)
+        XCTAssertEqual(LiveConfig.splatBatchSlots(environment: ["ART_LIVE_SPLAT_BATCH": "4"]), 8)
+        XCTAssertEqual(LiveConfig.splatSlotBudget(environment: [:]), 16_000_000)
+        XCTAssertEqual(LiveConfig.splatSlotBudget(environment: ["ART_LIVE_SPLAT_SLOT_BUDGET": "1"]), 65_536)
+        XCTAssertEqual(LiveConfig.splatSlotBudget(environment: ["ART_LIVE_SPLAT_SLOT_BUDGET": "5000000"]), 5_000_000)
+    }
+
+    /// The splat's whole correctness rests on two inequalities for `radiusFactor ≤ 1`
+    /// (see SPLAT-DESIGN.md):
+    /// 1. the prune radius (measured from the chord) covers the AA ink tail, so the disk
+    ///    contains every pixel the walk can stamp; and
+    /// 2. prune ≤ box pad, so the disk is a subset of the binning box — i.e. every disk
+    ///    pixel is in the segment's tile range, exactly the walk's contributing set.
+    func testSplatPruneDiskInsideBoxAtZoomOut() {
+        let cases: [(Float, Float)] = [(0.02, 0.02), (0.2, 0.05), (0.5, 0.3), (1, 1),
+                                       (2.5, 0.1), (4, 1), (12, 0.5), (40, 1)]
+        for (r, rf) in cases {
+            let p0 = SIMD2<Float>(0, 0), p1 = SIMD2<Float>(0, 0)
+            let p2 = SIMD2<Float>(10, 4), p3 = SIMD2<Float>(10, 4)
+            let pruneDoc = SegmentPrune.radius(p0: p0, p1: p1, p2: p2, p3: p3,
+                                               radius0: r, radius1: r,
+                                               segmentType: 0, isMarker: false)
+            // (1) the prune radius still covers the 0.44 px AA ink tail beyond the
+            // radius, so every AA-contributing pixel is inside the splat disk. (The
+            // noisy tail is pruned identically by walk and splat — sharing the same
+            // `padding1` is what makes them match there.)
+            XCTAssertGreaterThanOrEqual(pruneDoc - r, 0.44, "AA tail uncovered r=\(r)")
+            let pruneDev = pruneDoc * rf
+            let pad = 1.4 * r * rf + 1
+            // (2) disk ⊆ box for radiusFactor ≤ 1.
+            if rf <= 1 {
+                XCTAssertLessThanOrEqual(pruneDev, pad + 1e-4, "disk escapes box r=\(r) rf=\(rf)")
+            }
+        }
+    }
+
+    /// A strongly curved spline at full zoom has farOffChord large enough that
+    /// `prune > box pad` — the case the splat kernel handles by iterating the tile
+    /// range instead of the disk. The predicate must be reachable (and, at zoom-out
+    /// scales, must resolve back to the cheap disk path).
+    func testSplatWideBranchOnlyForCurvedSplinesAtZoomIn() {
+        let p0 = SIMD2<Float>(0, 40), p1 = SIMD2<Float>(0, 0)
+        let p2 = SIMD2<Float>(10, 0), p3 = SIMD2<Float>(10, 40)
+        let r: Float = 2
+        let pruneDoc = SegmentPrune.radius(p0: p0, p1: p1, p2: p2, p3: p3,
+                                           radius0: r, radius1: r,
+                                           segmentType: 1, isMarker: false)
+        // Curve bulge (40) dominates: prune far exceeds the box pad at rf = 1.
+        XCTAssertGreaterThan(pruneDoc * 1.0, 1.4 * r * 1.0 + 1)
+        // At a zoom-out scale the same segment flips to the cheap disk path.
+        XCTAssertLessThanOrEqual(pruneDoc * 0.02, 1.4 * r * 0.02 + 1)
+    }
+
     private func coRankMergeUnit(src: [UInt32], dst: inout [UInt32], u: GpuBinMergeUnit) {
         let aStart = Int(u.aStart), aLen = Int(u.aLen), bLen = Int(u.bLen)
         let bStart = aStart + aLen

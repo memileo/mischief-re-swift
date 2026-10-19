@@ -90,6 +90,10 @@ class MetalRenderer {
     internal var liveBinChunkSortPipeline: MTLComputePipelineState?
     internal var liveBinChunkSortBitonicPipeline: MTLComputePipelineState?
     internal var liveBinMergePassPipeline: MTLComputePipelineState?
+    /// Paths for the segment-parallel splat composite (small-stamp regime).
+    internal var liveSplatPipeline: MTLComputePipelineState?
+    internal var liveSplatCompositePipeline: MTLComputePipelineState?
+    internal var liveSplatWritePipeline: MTLComputePipelineState?
     /// Per-layer GPU-binning state, keyed by layer index. Entries are validated against
     /// the owning cache (`ObjectIdentifier`) + segment count and dropped wholesale when
     /// the document changes — reference-space geometry never crosses documents.
@@ -155,6 +159,14 @@ internal final class LiveBinRefLayer {
                                                    // exactly as they did before this table
     var emptyStrokeGroups: MTLBuffer?
     var binCheckStaging: MTLBuffer?  // tile-list readback scratch for ART_LIVE_BINCHECK=1 (.shared)
+    // Splat path (segment-parallel composite) scratch, lazily sized. `splatMax` holds
+    // pixels × batch slots (atomicMax), `splatAcc` one float4 per box pixel.
+    var splatMax: MTLBuffer?         // (.private)
+    var splatAcc: MTLBuffer?         // (.private)
+    var visOrd: MTLBuffer?           // strokeCount × UInt32: visible ordinal | 0xFFFFFFFF (.shared)
+    var visStrokeIDsBuf: MTLBuffer?  // visible ordinal -> stroke id (.shared)
+    var splatMaxCap = 0              // slots (pixels × batch) currently allocated
+    var splatAccCap = 0              // pixels currently allocated
     var boxCap = 0                   // boxTiles currently allocated
     var tileListCap = 0              // incidences currently allocated
     var chunkCap = 0                 // sort chunks currently allocated
@@ -211,6 +223,10 @@ internal final class LiveBinRefLayer {
     
     // Textures and buffers
     internal var noiseTexture: MTLTexture?
+    /// 1×1 stand-in for the splat composite's noise binding when a layer has no noisy
+    /// strokes (never sampled — the kernel's noise flag is 0 — but a valid texture must
+    /// still be bound, and the real target may not be bound as both writable and read).
+    internal var liveSplatDummyTexture: MTLTexture?
     internal var stampBuffer: MTLBuffer?
     //    private var tileIndexBuffer: MTLBuffer? // unused?
     internal var paramsBuffer: MTLBuffer?

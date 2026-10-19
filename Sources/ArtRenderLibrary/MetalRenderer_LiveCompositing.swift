@@ -110,6 +110,23 @@ struct LiveBinSortParams {
     var runSize: UInt32
 }
 
+// Must match `LiveSplatParams` in segmentKernels.metal field for field, in order.
+// 8×uint + 4×int = stride 48 on both sides.
+struct LiveSplatParams {
+    var segCount: UInt32
+    var slotsPerPixel: UInt32
+    var batchStart: UInt32
+    var batchCount: UInt32
+    var tileSize: UInt32
+    var boxTilesPerRow: UInt32
+    var boxTilesPerCol: UInt32
+    var flags: UInt32
+    var originPxX: Int32
+    var originPxY: Int32
+    var boxPixW: Int32
+    var boxPixH: Int32
+}
+
 // One layer's worth of per-tile data, as byte-slices into the single upload buffer.
 private struct PerTilePlan {
     var empty = true
@@ -221,6 +238,11 @@ extension MetalRenderer {
             ("liveBinChunkSortV3Kernel", { self.liveBinChunkSortPipeline = $0 }),
             ("liveBinChunkSortV4Kernel", { self.liveBinChunkSortBitonicPipeline = $0 }),
             ("liveBinMergePassV3Kernel", { self.liveBinMergePassPipeline = $0 }),
+            // Segment-parallel splat composite (small-stamp regime). All optional:
+            // a metallib without them (or ART_LIVE_SPLAT=0) falls back to the walk.
+            ("liveSplatKernel", { self.liveSplatPipeline = $0 }),
+            ("liveSplatCompositeKernel", { self.liveSplatCompositePipeline = $0 }),
+            ("liveSplatWriteKernel", { self.liveSplatWritePipeline = $0 }),
         ]
         for (name, assign) in binKernels {
             if let fn = library.makeFunction(name: name) {
@@ -803,8 +825,9 @@ extension MetalRenderer {
         // predating any of them (or ART_LIVE_GPUBIN=0) falls back to CPU below.
         guard let fusedPipe = liveBinTransformCountPipeline,
               let scatterPipe = liveBinScatterPipeline,
-//              let chunkPipe = liveBinChunkSortPipeline,
-              let mergePipe = liveBinMergePassPipeline else { return false }
+              let mergePipe = liveBinMergePassPipeline,
+              liveBinChunkSortBitonicPipeline != nil || liveBinChunkSortPipeline != nil
+        else { return false }
         guard position < cache.layers.count, let device = device, let queue = commandQueue else {
             return false
         }
@@ -973,6 +996,117 @@ extension MetalRenderer {
             // path's per-stroke culling. Compositing the cleared target is identity.
             liveTiming.culledStrokes += visStrokeIDs.count
             liveTiming.binMilliseconds += Self.milliseconds(since: prefixStart)
+            return true
+        }
+
+        // ── Splat fast path (small-stamp views): a segment-parallel composite that
+        // replaces the whole scatter/sort/tile-walk tail. Exact by construction — for
+        // radiusFactor ≤ 1 each segment's prune disk is a subset of its binning box, so
+        // iterating the disk covers precisely the walk's contributing set; the per-
+        // (pixel, stroke) atomicMax plus the in-order per-batch replay reproduce the
+        // walk bit-for-bit. See SPLAT-DESIGN.md for the proof and the ordering.
+        let splatBatch = LiveConfig.splatBatchSlots()
+        let splatBoxPixW = boxW * liveTile
+        let splatBoxPixH = boxH * liveTile
+        let splatPixels = splatBoxPixW * splatBoxPixH
+        if LiveConfig.splatEnabled(),
+           radiusFactor <= LiveConfig.splatMaxRadiusFactor(),
+           splatPixels * splatBatch <= LiveConfig.splatSlotBudget(),
+//           !visStrokeIDs.isEmpty, // suggested it can be dropped as it's after if visStrokeIDs.isEmpty
+           let splatPipe = liveSplatPipeline,
+           let splatCompPipe = liveSplatCompositePipeline,
+           let splatWritePipe = liveSplatWritePipeline,
+//           let device = device, // already in guard above
+           let layerTex = gpuRenderTarget,
+           let noiseBind = splatNoiseBinding(),
+           ensureSplatBuffers(device: device, ref: ref, pixels: splatPixels,
+                              slots: splatPixels * splatBatch),
+           let splatMax = ref.splatMax, let splatAcc = ref.splatAcc,
+           let visOrd = ref.visOrd, let visIDs = ref.visStrokeIDsBuf {
+            // Per-frame uploads: per-stroke visible ordinal, and ordinal → stroke id.
+            let ordBytes = ref.strokeCount * MemoryLayout<UInt32>.size
+            var ords = [UInt32](repeating: 0xFFFF_FFFF, count: ref.strokeCount)
+            for (o, id) in visStrokeIDs.enumerated() { ords[id] = UInt32(o) }
+            if ordBytes > 0 {
+                ords.withUnsafeBytes { raw in
+                    if let src = raw.baseAddress { memcpy(visOrd.contents(), src, ordBytes) }
+                }
+            }
+            var ids = visStrokeIDs.map { UInt32($0) }
+            if ids.isEmpty { ids = [0] }
+            ids.withUnsafeBytes { raw in
+                if let src = raw.baseAddress { memcpy(visIDs.contents(), src, raw.count) }
+            }
+            var sp = LiveSplatParams(
+                segCount: UInt32(ref.segCount), slotsPerPixel: UInt32(splatBatch),
+                batchStart: 0, batchCount: 0, tileSize: UInt32(liveTile),
+                boxTilesPerRow: UInt32(boxW), boxTilesPerCol: UInt32(boxH),
+                flags: needsNoise ? 1 : 0,
+                originPxX: Int32(box.minX * liveTile), originPxY: Int32(box.minY * liveTile),
+                boxPixW: Int32(splatBoxPixW), boxPixH: Int32(splatBoxPixH))
+            let visCount = visStrokeIDs.count
+            let splatBatches = (visCount + splatBatch - 1) / splatBatch
+            let splatThreads = MTLSize(width: 16, height: 16, depth: 1)
+            let splatGroups = MTLSize(width: (splatBoxPixW + 15) / 16,
+                                      height: (splatBoxPixH + 15) / 16, depth: 1)
+            let slotBytes = splatPixels * splatBatch * MemoryLayout<UInt32>.size
+            let accBytes = splatPixels * MemoryLayout<SIMD4<Float>>.stride
+            let splatStart = DispatchTime.now().uptimeNanoseconds
+            guard let cbSplat = queue.makeCommandBuffer(),
+                  let splatFill = cbSplat.makeBlitCommandEncoder() else { return false }
+            // One clear for the whole frame: the composite kernel zeroes each slot it
+            // consumes, so every later batch starts clean without another fill.
+            splatFill.fill(buffer: splatMax, range: 0..<slotBytes, value: 0)
+            splatFill.fill(buffer: splatAcc, range: 0..<accBytes, value: 0)
+            splatFill.endEncoding()
+            guard let splatEnc = cbSplat.makeComputeCommandEncoder() else { return false }
+            for b in 0..<splatBatches {
+                sp.batchStart = UInt32(b * splatBatch)
+                sp.batchCount = UInt32(min(splatBatch, visCount - b * splatBatch))
+                splatEnc.setComputePipelineState(splatPipe)
+                splatEnc.setBytes(&sp, length: MemoryLayout<LiveSplatParams>.stride, index: 0)
+                splatEnc.setBuffer(frameSegs, offset: 0, index: 1)
+                splatEnc.setBuffer(ref.segStroke, offset: 0, index: 2)
+                splatEnc.setBuffer(ref.strokeFlags, offset: 0, index: 3)
+                splatEnc.setBuffer(visOrd, offset: 0, index: 4)
+                splatEnc.setBuffer(ranges, offset: 0, index: 5)
+                splatEnc.setBuffer(splatMax, offset: 0, index: 6)
+                splatEnc.dispatchThreadgroups(binGroups(ref.segCount),
+                                              threadsPerThreadgroup: binThreads)
+
+                splatEnc.setComputePipelineState(splatCompPipe)
+                splatEnc.setBytes(&sp, length: MemoryLayout<LiveSplatParams>.stride, index: 0)
+                splatEnc.setBuffer(splatMax, offset: 0, index: 1)
+                splatEnc.setBuffer(visIDs, offset: 0, index: 2)
+                splatEnc.setBuffer(ref.strokeColors, offset: 0, index: 3)
+                splatEnc.setBuffer(ref.strokeFlags, offset: 0, index: 4)
+                splatEnc.setBuffer(splatAcc, offset: 0, index: 5)
+                splatEnc.setTexture(noiseBind, index: 0)
+                if let sampler = linearSampler { splatEnc.setSamplerState(sampler, index: 0) }
+                splatEnc.dispatchThreadgroups(splatGroups, threadsPerThreadgroup: splatThreads)
+            }
+            splatEnc.setComputePipelineState(splatWritePipe)
+            splatEnc.setBytes(&sp, length: MemoryLayout<LiveSplatParams>.stride, index: 0)
+            splatEnc.setBuffer(splatAcc, offset: 0, index: 1)
+            splatEnc.setTexture(layerTex, index: 0)
+            splatEnc.dispatchThreadgroups(splatGroups, threadsPerThreadgroup: splatThreads)
+            splatEnc.endEncoding()
+            cbSplat.commit()
+            cbSplat.waitUntilCompleted()
+            if let err = cbSplat.error { throw err }
+            let tRenderSplat = Self.milliseconds(since: splatStart)
+            liveTiming.gpuMilliseconds += tRenderSplat
+            liveTiming.binMilliseconds += Self.milliseconds(since: prefixStart)
+            if LiveConfig.binStageTimingEnabled() {
+                print(String(format: "livebin layer %d: segs %d tiles %d chunks 0 passes 0 — xform %.2f scatter 0.00 sort 0.00 render+comp %.2f ms [splat %d×%d]",
+                             position, ref.segCount, boxTiles, tXform, tRenderSplat,
+                             splatBatches, splatBatch))
+            }
+            liveTiming.dispatchedTiles += boxTiles
+            liveTiming.strokes += visCount
+            var splatSegTotal = 0
+            for id in visStrokeIDs { splatSegTotal += ref.strokeSegCounts[id] }
+            liveTiming.segments += splatSegTotal
             return true
         }
 
@@ -1530,6 +1664,57 @@ extension MetalRenderer {
             ref.tileIndex = try shared(boxTiles * 8)
             ref.boxCap = boxTiles
         }
+    }
+
+    /// Sizes the splat path's per-layer scratch (geometric reuse; grown, never shrunk).
+    /// `slots` = box pixels × batch; `pixels` = box pixel count. The caller has already
+    /// checked the slot budget, so a failure here is a genuine allocation failure.
+    private func ensureSplatBuffers(device: MTLDevice, ref: LiveBinRefLayer,
+                                    pixels: Int, slots: Int) -> Bool {
+        guard pixels > 0, slots > 0 else { return false }
+        if ref.splatMax == nil || ref.splatMaxCap < slots {
+            let cap = max(slots, ref.splatMaxCap * 2, 1024)
+            guard let buf = device.makeBuffer(length: cap * MemoryLayout<UInt32>.size,
+                                              options: .storageModePrivate) else { return false }
+            ref.splatMax = buf
+            ref.splatMaxCap = cap
+        }
+        if ref.splatAcc == nil || ref.splatAccCap < pixels {
+            let cap = max(pixels, ref.splatAccCap * 2, 256)
+            guard let buf = device.makeBuffer(length: cap * MemoryLayout<SIMD4<Float>>.stride,
+                                              options: .storageModePrivate) else { return false }
+            ref.splatAcc = buf
+            ref.splatAccCap = cap
+        }
+        let ordBytes = max(ref.strokeCount, 1) * MemoryLayout<UInt32>.size
+        if ref.visOrd == nil || ref.visOrd!.length < ordBytes {
+            guard let buf = device.makeBuffer(length: ordBytes,
+                                              options: .storageModeShared) else { return false }
+            ref.visOrd = buf
+        }
+        if ref.visStrokeIDsBuf == nil || ref.visStrokeIDsBuf!.length < ordBytes {
+            guard let buf = device.makeBuffer(length: ordBytes,
+                                              options: .storageModeShared) else { return false }
+            ref.visStrokeIDsBuf = buf
+        }
+        return true
+    }
+
+    /// Valid texture for the splat composite's noise slot: the real noise texture when
+    /// the document has one, otherwise a 1×1 stand-in (never sampled — the kernel's
+    /// noise flag is 0 — but a valid object must be bound).
+    private func splatNoiseBinding() -> MTLTexture? {
+        if let n = noiseTexture { return n }
+        if let d = liveSplatDummyTexture { return d }
+        guard let device = device else { return nil }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm,
+                                                            width: 1, height: 1,
+                                                            mipmapped: false)
+        desc.usage = .shaderRead
+        desc.storageMode = .shared
+        guard let d = device.makeTexture(descriptor: desc) else { return nil }
+        liveSplatDummyTexture = d
+        return d
     }
 
     /// Threads per threadgroup for the live passes: one thread per pixel, but 32×32 of
