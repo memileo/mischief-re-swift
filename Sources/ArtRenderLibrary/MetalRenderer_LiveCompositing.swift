@@ -658,7 +658,7 @@ extension MetalRenderer {
         if liveEmptyStrokeGroups == nil {
             // The entries stand-in is never dereferenced while counts are 0 (the
             // cursor loop short-circuits on the count), so one zeroed slot suffices.
-            guard let gr = device.makeBuffer(length: MemoryLayout<GpuBinStrokeGroup>.stride,
+            guard let gr = device.makeBuffer(length: MemoryLayout<GpuBinStrokeBlock>.stride,
                                              options: .storageModeShared) else {
                 return false
             }
@@ -839,13 +839,8 @@ extension MetalRenderer {
         var visStrokeIDs: [Int] = []
         visStrokeIDs.reserveCapacity(layer.ops.count)
         var layerBox: (minX: Int, minY: Int, maxX: Int, maxY: Int)? = nil
-        // Per visible stroke (parallel, document order): the padded device-space stamp
-        // box for the composite kernels' stroke skip, and the tile range its transformed
-        // AABB covers. The pad covers every stamp cutoff (AA `radius+0.44`, noise
-        // `1.375·max(r,1)`, prune never loosens either), so skipping a stroke whose box
-        // misses the pixel changes no output value — see GpuBinStrokeTable docs.
-        var visBoxes: [SIMD4<Float>] = []
-        var visTileBoxes: [(minX: Int, minY: Int, maxX: Int, maxY: Int)] = []
+        // The prune table's per-stroke boxes are built later from the ref state's block
+        // records; the cull loop only collects visible stroke ids + the layer box.
         var strokeID = -1
         for op in layer.ops {
             guard case .stroke(let s) = op else { continue }
@@ -871,15 +866,6 @@ extension MetalRenderer {
                 return false    // inconsistent with the cull above — stay exact via CPU
             }
             layerBox = GpuBinSpec.unionTileBox(layerBox, with: tb)
-            // Padded half-open device box: the kernel's uniform radius scale is
-            // radiusFactor ((scaleX+scaleY)/2 — identical formula both sides), so pad =
-            // 1.4·maxRadius·radiusFactor + 3.5 covers AA (radius+0.44) and noise
-            // (1.375·max(r,1)) stamp cutoffs with margin; the prune gate never loosens
-            // them. +1 on max makes the box half-open [min, max).
-            let pad = 1.4 * ref.strokeMaxRadius[strokeID] * radiusFactor + 3.5
-            visBoxes.append(SIMD4<Float>(minX - pad, minY - pad,
-                                         maxX + 1 + pad, maxY + 1 + pad))
-            visTileBoxes.append((tb.minX, tb.minY, tb.maxX, tb.maxY))
         }
         if visStrokeIDs.isEmpty {
             liveTiming.culledStrokes += cache.strokeCount(at: position)
@@ -989,22 +975,31 @@ extension MetalRenderer {
             return true
         }
 
-        // ── Stroke-group table (composite box pruning): per dense tile, every stroke in
-        // document order with its padded device box, so the composite kernels can skip
-        // whole strokes whose box misses a pixel instead of pruning segment by segment.
-        // Dense tiles only (sparse tiles keep the direct walk); a dropped table (budget
-        // exceeded) or ART_LIVE_STROKE_PRUNE=0 leaves behaviour identical, just slower.
+        // ── Stroke-block table (composite box pruning): per dense tile, blocks of
+        // `pruneBlockSize` consecutive segments in document order with their padded
+        // device boxes, so the composite kernels can skip whole segment runs whose
+        // box misses a pixel (refines the earlier whole-stroke boxes: mega-strokes
+        // skip per block too). Dense tiles only; a dropped table (budget exceeded)
+        // or ART_LIVE_STROKE_PRUNE=0 leaves behaviour identical, just slower.
         var groupHeaderBuf: MTLBuffer
         var groupEntryBuf: MTLBuffer
         guard ensureEmptyGroupBuffers(device: device, tileCount: boxTiles) else { return false }
         if LiveConfig.strokePruneEnabled() {
-            let table = GpuBinSpec.strokeGroupTable(
-                strokeIDs: visStrokeIDs.map { UInt32($0) },
-                strokeBoxes: visBoxes,
-                strokeTileBoxes: visTileBoxes,
+            let table = GpuBinSpec.strokeBlockTable(
+                visibleStrokes: visStrokeIDs,
+                blockFirst: ref.strokeBlockFirst, blockCount: ref.strokeBlockCount,
+                blockStroke: ref.blockStroke, blockSegStart: ref.blockSegStart,
+                blockRects: ref.blockRects,
+                blockMaxRadius: ref.blockMaxRadius,
+                camera: (a: Float(camera.a), b: Float(camera.b),
+                         c: Float(camera.c), d: Float(camera.d),
+                         tx: Float(camera.tx), ty: Float(camera.ty)),
+                radiusFactor: radiusFactor,
                 tileCounts: countsArr,
-                box: (box.minX, box.minY, box.maxX, box.maxY))
-            if table.totalGroups > 0 {
+                box: (box.minX, box.minY, box.maxX, box.maxY),
+                texW: Int(texW), texH: Int(texH), tilesX: tilesX, tilesY: tilesY,
+                invTile: invTile)
+            if table.totalBlocks > 0 {
                 if ref.groupHeaderCap < boxTiles {
                     let capT = max(boxTiles, ref.groupHeaderCap * 2, 64)
                     guard let buf = device.makeBuffer(
@@ -1016,14 +1011,14 @@ extension MetalRenderer {
                 if ref.groupCap < table.entries.count {
                     let capG = max(table.entries.count, ref.groupCap * 2, 64)
                     guard let buf = device.makeBuffer(
-                        length: capG * MemoryLayout<GpuBinStrokeGroup>.stride,
+                        length: capG * MemoryLayout<GpuBinStrokeBlock>.stride,
                         options: .storageModeShared) else { return false }
                     ref.strokeGroups = buf
                     ref.groupCap = capG
                 }
                 guard let hd = ref.groupHeader, let gr = ref.strokeGroups,
                       hd.length >= boxTiles * 2 * MemoryLayout<UInt32>.size,
-                      gr.length >= table.entries.count * MemoryLayout<GpuBinStrokeGroup>.stride
+                      gr.length >= table.entries.count * MemoryLayout<GpuBinStrokeBlock>.stride
                 else { return false }
                 table.header.withUnsafeBytes { raw in
                     if let src = raw.baseAddress {
@@ -1063,7 +1058,9 @@ extension MetalRenderer {
         // Chunked sort plan (pure integer work on the counts we already have): split
         // every sortable slice into fixed 512-entry chunks, one GPU thread each, plus
         // the merge-pass count (0 when every tile fits one chunk — the common case).
-        let (sortChunks, _, mergePasses) = GpuBinSpec.chunkTable(entries: entries)
+        let sortChunk = LiveConfig.sortChunkSize()
+        let (sortChunks, _, mergePasses) = GpuBinSpec.chunkTable(entries: entries,
+                                                                 chunkSize: sortChunk)
         if ref.chunkCap < sortChunks.count {
             let cap = max(sortChunks.count, max(ref.chunkCap * 2, 1))
             guard let buf = device.makeBuffer(length: cap * MemoryLayout<GpuBinChunk>.stride,
@@ -1086,6 +1083,7 @@ extension MetalRenderer {
         // inconsistent — fall back to CPU rather than mis-sort.
         let (passUnits, passOffsets, totalUnits) =
             GpuBinSpec.mergePlan(entries: entries, mergePasses: mergePasses,
+                                 chunkSize: sortChunk,
                                  unitSize: LiveConfig.mergeUnitSize())
         if mergePasses > 0 {
             guard totalUnits > 0, passUnits.allSatisfy({ !$0.isEmpty }) else { return false }
@@ -1165,7 +1163,7 @@ extension MetalRenderer {
             // One thread per chunk, in place (the kernel is barrier- and pad-free, so
             // any 1D grid shape works — the standard 256-wide bin grid).
             var sp = LiveBinSortParams(unitCount: UInt32(sortChunks.count),
-                                       runSize: UInt32(GpuBinSpec.sortChunkSize))
+                                       runSize: UInt32(sortChunk))
             encoder.setComputePipelineState(chunkPipe)
             encoder.setBytes(&sp, length: MemoryLayout<LiveBinSortParams>.stride, index: 0)
             encoder.setBuffer(sortChunkBuf, offset: 0, index: 1)
@@ -1188,7 +1186,7 @@ extension MetalRenderer {
             let srcBuf: MTLBuffer = (pass % 2 == 1) ? tileScratch : tileList
             let dstBuf: MTLBuffer = (pass % 2 == 1) ? tileList : tileScratch
             var mp = LiveBinSortParams(unitCount: UInt32(uns.count),
-                                       runSize: UInt32(GpuBinSpec.sortChunkSize << pass))
+                                       runSize: UInt32(sortChunk << pass))
             encoder.setComputePipelineState(mergePipe)
             encoder.setBytes(&mp, length: MemoryLayout<LiveBinSortParams>.stride, index: 0)
             encoder.setBuffer(sortUnitBuf,
@@ -1392,6 +1390,14 @@ extension MetalRenderer {
         var noisy: [Bool] = []
         var segCounts: [Int] = []
         var maxRadii: [Float] = []
+        // Prune blocks: per stroke, `pruneBlockSize` consecutive segments share one
+        // doc-space running AABB. Blocks never span strokes.
+        var blockFirst: [Int] = []
+        var blockCount: [Int] = []
+        var bStroke: [Int32] = []
+        var bSegStart: [Int32] = []
+        var bRects: [SIMD4<Float>] = []
+        var bMaxR: [Float] = []
         segments.reserveCapacity(layer.cachedSegmentCount)
         for op in layer.ops {
             guard case .stroke(let s) = op else { continue }
@@ -1411,6 +1417,38 @@ extension MetalRenderer {
             // physics-derived device extent needs.
             maxRadii.append(s.segments.reduce(Float(0)) {
                 max(max($0, $1.radius0), $1.radius1) })
+            // Prune blocks: `pruneBlockSize` consecutive segments of the stroke share
+            // one running doc-space AABB over their control points; the block's own
+            // max-radius pad is added at table-build time (tighter than a stroke-level
+            // pad on tapering strokes). Blocks never span strokes.
+            blockFirst.append(bRects.count)
+            var nBlocks = 0
+            var bi = 0
+            while bi < s.segments.count {
+                let segStart = segments.count - s.segments.count + bi
+                var bx0 = Float.greatestFiniteMagnitude, bx1 = -Float.greatestFiniteMagnitude
+                var by0 = Float.greatestFiniteMagnitude, by1 = -Float.greatestFiniteMagnitude
+                var bR = Float(0)
+                var n = 0
+                while bi < s.segments.count && n < GpuBinSpec.pruneBlockSize {
+                    let seg = s.segments[bi]
+                    let x0 = min(min(seg.p0.x, seg.p1.x), min(seg.p2.x, seg.p3.x))
+                    let x1 = max(max(seg.p0.x, seg.p1.x), max(seg.p2.x, seg.p3.x))
+                    let y0 = min(min(seg.p0.y, seg.p1.y), min(seg.p2.y, seg.p3.y))
+                    let y1 = max(max(seg.p0.y, seg.p1.y), max(seg.p2.y, seg.p3.y))
+                    bx0 = min(bx0, x0); bx1 = max(bx1, x1)
+                    by0 = min(by0, y0); by1 = max(by1, y1)
+                    bR = max(bR, max(seg.radius0, seg.radius1))
+                    bi += 1
+                    n += 1
+                }
+                bStroke.append(Int32(sid))
+                bSegStart.append(Int32(segStart))
+                bRects.append(SIMD4<Float>(bx0, by0, bx1, by1))
+                bMaxR.append(bR)
+                nBlocks += 1
+            }
+            blockCount.append(nBlocks)
         }
         guard !segments.isEmpty else { throw MetalRendererError.bufferCreationFailed }
         func upload<T>(_ array: [T], _ stride: Int) throws -> MTLBuffer {
@@ -1436,7 +1474,10 @@ extension MetalRenderer {
             strokeFlags: try upload(flags, MemoryLayout<UInt32>.stride),
             strokeVisible: visible,
             strokeBounds: bounds, strokeIsMarker: markers, strokeHasNoise: noisy,
-            strokeSegCounts: segCounts, strokeMaxRadius: maxRadii)
+            strokeSegCounts: segCounts, strokeMaxRadius: maxRadii,
+            strokeBlockFirst: blockFirst, strokeBlockCount: blockCount,
+            blockStroke: bStroke, blockSegStart: bSegStart, blockRects: bRects,
+            blockMaxRadius: bMaxR)
         liveBinLayers[layer.layerIndex] = ref
         return ref
     }

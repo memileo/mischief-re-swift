@@ -118,6 +118,14 @@ internal final class LiveBinRefLayer {
     var strokeSegCounts: [Int]       // S, segments per stroke (timing counters)
     var strokeMaxRadius: [Float]     // S, max(radius0, radius1) over segments, doc space —
                                      // pads the composite stroke-group boxes conservatively
+    var strokeBlockFirst: [Int]      // S, per stroke: first block in the flat block arrays
+    var strokeBlockCount: [Int]      // S, per stroke: number of prune blocks
+    var blockStroke: [Int32]         // flat per block: owning stroke id (ascending blocks)
+    var blockSegStart: [Int32]       // flat per block: global index of its first segment
+    var blockRects: [SIMD4<Float>]   // flat per block: doc-space inclusive AABB (per
+                                     // `pruneBlockSize` consecutive segments of one stroke)
+    var blockMaxRadius: [Float]      // flat per block: max(radius0, radius1) over its
+                                     // segments, doc space — pads the block's box
     // Frame buffers (sized geometrically, reused across frames):
     var frameSegments: MTLBuffer?    // N × GPUSplineSegment, device space (.private)
     var ranges: MTLBuffer?           // N × int4 tile ranges (.private)
@@ -136,8 +144,9 @@ internal final class LiveBinRefLayer {
     var sortUnits: MTLBuffer?        // merge units (6×uint32), ALL passes concatenated (.shared)
                                                    // (per-pass offsets — never rewritten during encoding)
     var groupHeader: MTLBuffer?      // boxTiles × uint2 (start, count) stroke groups (.shared)
-    var strokeGroups: MTLBuffer?     // groups × LiveStrokeGroupBox (uint + 4 floats, stride 20,
-                                                   // half-open device box) (.shared)
+    var strokeGroups: MTLBuffer?     // blocks × LiveStrokeGroupBlock (segStart, strokeID,
+                                                   // 4 floats — stride 24, half-open device
+                                                   // box) (.shared)
     var emptyGroupHeader: MTLBuffer? // 1-tile zeroed header for paths with no table —
                                                    // count 0 makes the kernels walk segments
                                                    // exactly as they did before this table
@@ -154,7 +163,10 @@ internal final class LiveBinRefLayer {
          refSegments: MTLBuffer, segStroke: MTLBuffer,
          strokeColors: MTLBuffer, strokeFlags: MTLBuffer, strokeVisible: MTLBuffer,
          strokeBounds: [CGRect], strokeIsMarker: [Bool], strokeHasNoise: [Bool],
-         strokeSegCounts: [Int], strokeMaxRadius: [Float]) {
+         strokeSegCounts: [Int], strokeMaxRadius: [Float],
+         strokeBlockFirst: [Int], strokeBlockCount: [Int],
+         blockStroke: [Int32], blockSegStart: [Int32], blockRects: [SIMD4<Float>],
+         blockMaxRadius: [Float]) {
         self.docID = docID
         self.segCount = segCount
         self.strokeCount = strokeCount
@@ -168,6 +180,12 @@ internal final class LiveBinRefLayer {
         self.strokeHasNoise = strokeHasNoise
         self.strokeSegCounts = strokeSegCounts
         self.strokeMaxRadius = strokeMaxRadius
+        self.strokeBlockFirst = strokeBlockFirst
+        self.strokeBlockCount = strokeBlockCount
+        self.blockStroke = blockStroke
+        self.blockSegStart = blockSegStart
+        self.blockRects = blockRects
+        self.blockMaxRadius = blockMaxRadius
     }
 }
 

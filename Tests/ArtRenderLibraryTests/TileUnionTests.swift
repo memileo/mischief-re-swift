@@ -539,80 +539,224 @@ final class GpuBinSpecTests: XCTestCase {
     /// Swift mirror of `liveBinMergePassV3Kernel`'s per-unit work, kept
     /// structurally identical (co-rank binary search, then a bounded serial merge)
     /// so the end-to-end test guards the algorithm the GPU runs on every unit.
-    func testStrokeGroupTableStrideLock() {
-        // Layout lock: macOS memcpys [GpuBinStrokeGroup] into the uint+4-float table
-        // the composite kernels read (uint + 4 × float, stride 20).
-        XCTAssertEqual(MemoryLayout<GpuBinStrokeGroup>.stride, 20)
-        XCTAssertEqual(MemoryLayout<GpuBinStrokeGroup>.size, 20)
+    func testStrokeBlockTableStrideLock() {
+        // Layout lock: macOS memcpys [GpuBinStrokeBlock] into the segStart/strokeID +
+        // 4-float table the composite kernels read (8 × 4-byte fields, stride 24,
+        // scalar alignment so Metal's float layout matches exactly).
+        XCTAssertEqual(MemoryLayout<GpuBinStrokeBlock>.stride, 24)
+        XCTAssertEqual(MemoryLayout<GpuBinStrokeBlock>.size, 24)
     }
 
-    func testStrokeGroupTableOrderingGatingAndBudget() {
-        // Doc-ascending strokes 3, 7, 9 over a 2×2 layer box; only tile (1,1) is dense.
-        let ids: [UInt32] = [3, 7, 9]
-        let boxes: [SIMD4<Float>] = [
-            SIMD4<Float>(-10, -10, 10, 10),
-            SIMD4<Float>(0, 0, 200, 200),
-            SIMD4<Float>(150, 150, 260, 260),
-        ]
-        let tileBoxes: [(minX: Int, minY: Int, maxX: Int, maxY: Int)] = [
-            (0, 0, 0, 0),   // stroke 3: only the sparse tile (0,0) → never in the table
-            (0, 0, 1, 1),   // stroke 7: covers everything, dense tile included
-            (1, 1, 1, 1),   // stroke 9: dense tile only
-        ]
-        let counts: [UInt32] = [10, 10, 10, 128]   // only local tile 3 = (1,1) is dense
-        let table = GpuBinSpec.strokeGroupTable(
-            strokeIDs: ids, strokeBoxes: boxes, strokeTileBoxes: tileBoxes,
-            tileCounts: counts, box: (0, 0, 1, 1))
-        XCTAssertEqual(table.totalGroups, 2)
-        // Sparse tiles carry no groups; the dense tile carries two in doc order.
-        for t in 0..<3 {
-            XCTAssertEqual(table.header[t * 2 + 1], 0, "tile \(t)")
-        }
-        XCTAssertEqual(table.header[3 * 2], 0)
-        XCTAssertEqual(table.header[3 * 2 + 1], 2)
-        XCTAssertEqual(table.entries.count, 2)
-        XCTAssertEqual(table.entries[0].strokeID, 7)
-        XCTAssertEqual(table.entries[1].strokeID, 9)
-        // The kernel's monotone cursor against this table: known ids hit their box,
-        // absent ids (gap below/between/above) resolve to "no skip".
-        func lookup(id: UInt32) -> SIMD4<Float>? {
-            var cursor = 0
-            let start = Int(table.header[3 * 2]), count = Int(table.header[3 * 2 + 1])
-            var hit: SIMD4<Float>? = nil
-            while cursor < count {
-                let e = table.entries[start + cursor]
-                if e.strokeID < id { cursor += 1; continue }
-                if e.strokeID == id { hit = SIMD4<Float>(e.minX, e.minY, e.maxX, e.maxY) }
-                break
-            }
-            return hit
-        }
-        XCTAssertEqual(lookup(id: 7), boxes[1])
-        XCTAssertEqual(lookup(id: 9), boxes[2])
-        XCTAssertNil(lookup(id: 6))
-        XCTAssertNil(lookup(id: 8))
-        XCTAssertNil(lookup(id: 12))
-        // Density gate: same inputs with the dense tile lowered below the threshold
-        // drop the whole table (no dense tiles → empty header, direct walk).
-        let sparse = GpuBinSpec.strokeGroupTable(
-            strokeIDs: ids, strokeBoxes: boxes, strokeTileBoxes: tileBoxes,
-            tileCounts: [10, 10, 10,
-                         UInt32(GpuBinSpec.strokePruneMinTileEntries - 1)],
-            box: (0, 0, 1, 1))
-        XCTAssertEqual(sparse.totalGroups, 0)
-        XCTAssertEqual(sparse.entries.count, 0)
+    func testStrokeBlockTableBuildBlockRecords() {
+        // One block (rect 100,100–300,150 doc/inclusive) on a 512×512 canvas of 16px
+        // tiles (32×32 tiles): the block covers tiles x 6…18, y 6…9. Only tile (7,7)
+        // is dense ⇒ exactly one entry, carrying the block's segStart + stroke id.
+        let camera = (a: Float(1), b: Float(0), c: Float(0), d: Float(1),
+                      tx: Float(0), ty: Float(0))
+        var counts: [UInt32] = .init(repeating: 1, count: 32 * 32)
+        counts[7 * 32 + 7] = 128
+        let table = GpuBinSpec.strokeBlockTable(
+            visibleStrokes: [0],
+            blockFirst: [0], blockCount: [1],
+            blockStroke: [0], blockSegStart: [7],
+            blockRects: [SIMD4<Float>(100, 100, 300, 150)],
+            blockMaxRadius: [1],
+            camera: camera, radiusFactor: 1,
+            tileCounts: counts,
+            box: (0, 0, 31, 31),
+            texW: 512, texH: 512, tilesX: 32, tilesY: 32,
+            invTile: 1 / 16)
+        XCTAssertEqual(table.totalBlocks, 1)
+        XCTAssertEqual(table.entries.count, 1)
+        XCTAssertEqual(table.entries[0].segStart, 7)
+        XCTAssertEqual(table.entries[0].strokeID, 0)
+        XCTAssertEqual(Int(table.header[(7 * 32 + 7) * 2]), 0)      // start
+        XCTAssertEqual(Int(table.header[(7 * 32 + 7) * 2 + 1]), 1)  // count
+        XCTAssertTrue(table.header.enumerated().allSatisfy { i, v in
+            if i == (7 * 32 + 7) * 2 || i == (7 * 32 + 7) * 2 + 1 { return true }
+            if i % 2 == 1 { return v == 0 }                          // other counts 0
+            return v <= UInt32(table.entries.count)                  // starts sane
+        })
+    }
+
+    func testStrokeBlockTableOrderingGatingAndBudget() {
+        // Doc-stroke 0 with two blocks; stroke 1 with one block. Both touch the dense
+        // tile (1,1) of a 2×2 box; smaller canvas so tile mapping actually divides.
+        // Choose tile size 16 and canvas 64×64 (4×4 tiles of 16px); box = right-bottom
+        // 2×2 tiles (18.. device? box covers canvas tiles (1,1)-(2,2)? Keep box (0,0,3,3)
+        // over a 4×4 tile canvas and pad rects inside it.
+        let camera = (a: Float(1), b: Float(0), c: Float(0), d: Float(1),
+                      tx: Float(0), ty: Float(0))
+        let ts: Float = 16
+        // Block A: rect (0,0)-(16,16) → tile (0,0). Block B: rect (16,0)-(32,16) → tile (1,0).
+        // Block C: rect (16,16)-(32,32) → tile (1,1). Canvas 64×64 ⇒ 4×4 tiles.
+        let counts: [UInt32] = .init(repeating: 2, count: 16)
+        var counts2 = counts
+        counts2[1 * 4 + 1] = 128          // tile (1,1) dense
+        let table = GpuBinSpec.strokeBlockTable(
+            visibleStrokes: [0, 1],
+            blockFirst: [0, 2], blockCount: [2, 1],
+            blockStroke: [0, 0, 1], blockSegStart: [0, 64, 100],
+            blockRects: [
+                SIMD4<Float>(0, 0, 16, 16),      // stroke 0 block 0 → tile (0,0)
+                SIMD4<Float>(16, 16, 32, 32),    // stroke 0 block 1 → tile (1,1)
+                SIMD4<Float>(16, 16, 32, 32),    // stroke 1 block 0 → tile (1,1)
+            ],
+            blockMaxRadius: [0, 0, 0],
+            camera: camera, radiusFactor: 1,
+            tileCounts: counts2,
+            box: (0, 0, 3, 3),
+            texW: 64, texH: 64, tilesX: 4, tilesY: 4, invTile: 1 / ts)
+        XCTAssertEqual(table.totalBlocks, 3)
+        // Only tile (1,1) is dense; every dense-tile entry list ascends in
+        // (stroke, block) walk order — matching the ascending segIdx order the
+        // sorted tile list carries (real docs: stroke ids ascend ⇒ segStart too).
+        // Block A's inclusive rect reaches exactly into tile (1,1), so the dense
+        // tile carries stroke 0 both blocks, then stroke 1's.
+        XCTAssertEqual(table.entries[0].segStart, 0)
+        XCTAssertEqual(table.entries[0].strokeID, 0)
+        XCTAssertEqual(table.entries[1].segStart, 64)
+        XCTAssertEqual(table.entries[1].strokeID, 0)
+        XCTAssertEqual(table.entries[2].segStart, 100)
+        XCTAssertEqual(table.entries[2].strokeID, 1)
+        // Dense tile header: start 0, count 3.
+        XCTAssertEqual(Int(table.header[((1) * 4 + 1) * 2 + 1]), 3)
+        // Density gate with everything below the threshold drops the table.
+        let sparse = GpuBinSpec.strokeBlockTable(
+            visibleStrokes: [0, 1],
+            blockFirst: [0, 2], blockCount: [2, 1],
+            blockStroke: [0, 0, 1], blockSegStart: [0, 64, 100],
+            blockRects: [
+                SIMD4<Float>(0, 0, 16, 16),
+                SIMD4<Float>(16, 16, 32, 32),
+                SIMD4<Float>(16, 16, 32, 32),
+            ],
+            blockMaxRadius: [0, 0, 0],
+            camera: camera, radiusFactor: 1,
+            tileCounts: counts,
+            box: (0, 0, 3, 3),
+            texW: 64, texH: 64, tilesX: 4, tilesY: 4, invTile: 1 / ts)
+        XCTAssertEqual(sparse.totalBlocks, 0)
         XCTAssertTrue(sparse.header.allSatisfy { $0 == 0 })
-        // Budget: exceed it → table dropped, header stays zero (kernels fall back).
-        let countsHuge: [UInt32] = [10, 10, 10, 128]
-        let idsHuge: [UInt32] = [0, 1, 2, 3]
-        let boxesHuge = [SIMD4<Float>](repeating: SIMD4<Float>(0, 0, 1, 1), count: 4)
-        let tilesHuge = [(1, 1, 1, 1), (1, 1, 1, 1), (1, 1, 1, 1), (1, 1, 1, 1)] as
-            [(minX: Int, minY: Int, maxX: Int, maxY: Int)]
-        let dropped = GpuBinSpec.strokeGroupTable(
-            strokeIDs: idsHuge, strokeBoxes: boxesHuge, strokeTileBoxes: tilesHuge,
-            tileCounts: countsHuge, box: (0, 0, 1, 1), budget: 3)
-        XCTAssertEqual(dropped.totalGroups, 0)
+        // Budget drop: same input with budget 1 drops everything.
+        let dropped = GpuBinSpec.strokeBlockTable(
+            visibleStrokes: [0, 1],
+            blockFirst: [0, 2], blockCount: [2, 1],
+            blockStroke: [0, 0, 1], blockSegStart: [0, 64, 100],
+            blockRects: [
+                SIMD4<Float>(0, 0, 16, 16),
+                SIMD4<Float>(16, 16, 32, 32),
+                SIMD4<Float>(16, 16, 32, 32),
+            ],
+            blockMaxRadius: [0, 0, 0],
+            camera: camera, radiusFactor: 1,
+            tileCounts: counts2,
+            box: (0, 0, 3, 3),
+            texW: 64, texH: 64, tilesX: 4, tilesY: 4, invTile: 1 / ts,
+            budget: 1)
+        XCTAssertEqual(dropped.totalBlocks, 0)
         XCTAssertTrue(dropped.header.allSatisfy { $0 == 0 })
+    }
+
+    func testStrokeBlockTableCoversScatterRanges() {
+        // THE invariant the composite kernels depend on: every block that owns any
+        // segment scattered into a tile must be present in that tile's table, or the
+        // kernel's segStart cursor desyncs and applies a WRONG block's box (glitches).
+        // The GPU scatters each segment into tiles reached by its p1/p2 endpoints
+        // expanded by 1.4·max(r0,r1)·radiusFactor + 1 px (`liveBinRangeForSeg`, int
+        // truncation mapping), which can spill past the block's bare rect. This test
+        // mirrors that formula and asserts full coverage — it fails with an unpadded
+        // tile range (the pre-fix bug: radius 13 needs 19.2 px spill, tile 16 px).
+        let r: Float = 13
+        let ts: Float = 16
+        let tilesX = 16
+        // 64 segments ⊂ 2 blocks of 32; capsule-style segments (p0=p1, p3=p2) along
+        // y=32, marching x: p1=(4i, 32), p2=(4i+2, 32). Block 0 rects [0..126],
+        // block 1 [128..254].
+        var rects: [SIMD4<Float>] = []
+        var perSegP1: [SIMD2<Float>] = []
+        var perSegP2: [SIMD2<Float>] = []
+        for i in 0..<64 {
+            let x1 = Float(i) * 4
+            let x2 = x1 + 2
+            perSegP1.append(SIMD2<Float>(x1, 32))
+            perSegP2.append(SIMD2<Float>(x2, 32))
+        }
+        rects.append(SIMD4<Float>(0, 32, 126, 32))       // block 0: segs 0..31
+        rects.append(SIMD4<Float>(128, 32, 254, 32))     // block 1: segs 32..63
+        let counts: [UInt32] = .init(repeating: 200, count: tilesX * tilesX)  // all dense
+        let table = GpuBinSpec.strokeBlockTable(
+            visibleStrokes: [0],
+            blockFirst: [0], blockCount: [2],
+            blockStroke: [0, 0], blockSegStart: [0, 32],
+            blockRects: rects,
+            blockMaxRadius: [r, r],
+            camera: (a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0), radiusFactor: 1,
+            tileCounts: counts,
+            box: (0, 0, tilesX - 1, tilesX - 1),
+            texW: Int(ts) * tilesX, texH: Int(ts) * tilesX,
+            tilesX: tilesX, tilesY: tilesX, invTile: 1 / ts)
+
+        // Per-tile block lists from the table.
+        var perTile: [Int: [GpuBinStrokeBlock]] = [:]
+        for t in 0..<(tilesX * tilesX) {
+            let start = Int(table.header[t * 2]), n = Int(table.header[t * 2 + 1])
+            perTile[t] = (0..<n).map { table.entries[start + $0] }
+        }
+        // Scatter-range mirror of `liveBinRangeForSeg` (rf = 1):
+        let padS = 1.4 * r + 1
+        func scatterTiles(_ p1: SIMD2<Float>, _ p2: SIMD2<Float>)
+            -> (minX: Int, minY: Int, maxX: Int, maxY: Int) {
+            let inv = 1 / ts, limit = tilesX - 1
+            let minX = min(p1.x, p2.x) - padS, maxX = max(p1.x, p2.x) + padS
+            let minY = min(p1.y, p2.y) - padS, maxY = max(p1.y, p2.y) + padS
+            return (max(0, min(limit, Int(minX * inv))),
+                    max(0, min(limit, Int(minY * inv))),
+                    max(0, min(limit, Int(maxX * inv))),
+                    max(0, min(limit, Int(maxY * inv))))
+        }
+        for i in 0..<64 {
+            let owner = i < 32 ? 0 : 1
+            let r0 = scatterTiles(perSegP1[i], perSegP2[i])
+            var ty = r0.minY
+            while ty <= r0.maxY {
+                var tx = r0.minX
+                while tx <= r0.maxX {
+                    let t = ty * tilesX + tx
+                    let blocks = perTile[t] ?? []
+                    let hit = blocks.contains { b in
+                        Int(b.segStart) <= i && i < Int(b.segStart) + 32
+                            && b.strokeID == 0
+                    }
+                    XCTAssertTrue(hit,
+                        "segment \(i) scatters into tile (\(tx),\(ty)) but its block " +
+                        "\(owner) is missing from the table (has \(blocks.count) blocks)")
+                    tx += 1
+                }
+                ty += 1
+            }
+        }
+        // Sanity: the previously-broken case is actually exercised — segment 31 (block
+        // rect maxX = 126, % 16 = 14) reaches tile x = floor(145.2/16) = 9, which the
+        // bare ceil(126/16) = 8 range missed. The table must carry block 0 there.
+        let t9 = 0 * tilesX + 9
+        XCTAssertTrue((perTile[t9] ?? []).contains { Int($0.segStart) == 0 })
+        // And the y spill: rect y = 32 (ceil = 2), scatter y reaches tiles floor(12.8/16)=0
+        // .. floor(51.2/16)=3.
+        let t0 = 0 * tilesX + 0
+        XCTAssertTrue((perTile[t0] ?? []).contains { Int($0.segStart) == 0 })
+    }
+
+    func testSortChunkSizeKnobClamps() {
+        XCTAssertEqual(LiveConfig.sortChunkSize(environment: [:]), GpuBinSpec.sortChunkSize)
+        XCTAssertEqual(LiveConfig.sortChunkSize(environment: ["ART_LIVE_SORT_CHUNK": "256"]), 256)
+        XCTAssertEqual(LiveConfig.sortChunkSize(environment: ["ART_LIVE_SORT_CHUNK": "128"]), 128)
+        XCTAssertEqual(LiveConfig.sortChunkSize(environment: ["ART_LIVE_SORT_CHUNK": "64"]), 64)
+        XCTAssertEqual(LiveConfig.sortChunkSize(environment: ["ART_LIVE_SORT_CHUNK": "1024"]), 1024)
+        // Out-of-range / malformed values clamp or fall back to the default.
+        XCTAssertEqual(LiveConfig.sortChunkSize(environment: ["ART_LIVE_SORT_CHUNK": "32"]), 64)
+        XCTAssertEqual(LiveConfig.sortChunkSize(environment: ["ART_LIVE_SORT_CHUNK": "4096"]), 1024)
+        XCTAssertEqual(LiveConfig.sortChunkSize(environment: ["ART_LIVE_SORT_CHUNK": "abc"]), 512)
     }
 
     private func coRankMergeUnit(src: [UInt32], dst: inout [UInt32], u: GpuBinMergeUnit) {

@@ -310,6 +310,19 @@ public enum LiveConfig {
         return env["ART_LIVE_STROKE_PRUNE"] != "0"
     }
 
+    /// Sort chunk size override (`ART_LIVE_SORT_CHUNK`, clamped 64…1024, default 512).
+    /// Smaller chunks give `liveBinChunkSortV3Kernel` more threads and shallower
+    /// per-thread heaps; merge passes/units grow correspondingly (spec, CPU-only —
+    /// the kernels are chunk-size-agnostic, so no rebuild of the metallib is needed
+    /// to sweep this).
+    public static func sortChunkSize(environment: [String: String]? = nil) -> Int {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        guard let raw = env["ART_LIVE_SORT_CHUNK"], let v = Int(raw) else {
+            return GpuBinSpec.sortChunkSize
+        }
+        return max(64, min(1024, v))
+    }
+
     /// Tile size for the *live* binning/dispatch. Resolution order:
     /// `ART_LIVE_TILE_SIZE` → `ART_TILE_SIZE` → 16 (the measured default).
     /// The static path keeps its own default (32); only the live path uses this.
@@ -377,18 +390,33 @@ public struct GpuBinMergePair {
 /// no matter how dense the tile (the old one-thread-per-pair tail did up to 65K
 /// serial steps in a single thread, stalling zoomed-out frames).
 /// One clickable stroke unit for the per-tile composite's box pruning. Layout-identical
-/// to the Metal `LiveStrokeGroupBox`: the stroke ID plus its conservative half-open
+/// to the Metal `LiveStrokeGroupBlock`: segStart + stroke ID plus the conservative half-open
 /// device-space stamp box `[min, max)` (five 4-byte fields, stride 20). The composite
 /// kernels consult it per stroke-group change; a pixel outside the box provably
 /// stamps nothing for that stroke (the pad covers both the AA and the noise cutoff),
 /// so skipping changes no output value — it only skips provably-zero work.
-public struct GpuBinStrokeGroup {
+/// One sub-stroke block for the per-tile composite's box pruning. The block table
+/// refines the earlier whole-stroke boxes: a "block" is `pruneBlockSize` consecutive
+/// segments of one stroke (never crossing strokes), so a stroke packed with many
+/// small segments can still skip far-away chunks segment-run by segment-run.
+/// Layout-identical to the Metal `LiveStrokeGroupBlock`; four plain floats (no
+/// vectors) so Metal's 4-byte alignment matches Swift byte-for-byte: eight u32/f32
+/// fields, stride 24. The device box is half-open `[min, max)` and the pad (CPU:
+/// 1.4·maxRadius·radiusFactor + 3.5 px over the transformed block AABB) covers every
+/// stamp cutoff (AA cov > 0 needs liveSegDist < r(t)+0.44; noise cov > 0 needs
+/// liveSegDist < 1.375·max(r,1); the stored prune gate only tightens) — a pixel
+/// outside the box provably stamps nothing for the block's segments, so skipping
+/// changes no output value, it only skips provably-zero work.
+public struct GpuBinStrokeBlock {
+    public var segStart: UInt32   // global index of the block's first segment
     public var strokeID: UInt32
     public var minX: Float
     public var minY: Float
     public var maxX: Float
     public var maxY: Float
-    public init(strokeID: UInt32, minX: Float, minY: Float, maxX: Float, maxY: Float) {
+    public init(segStart: UInt32, strokeID: UInt32,
+                minX: Float, minY: Float, maxX: Float, maxY: Float) {
+        self.segStart = segStart
         self.strokeID = strokeID
         self.minX = minX
         self.minY = minY
@@ -595,93 +623,167 @@ public enum GpuBinSpec {
     /// ballooning CPU plan time / upload traffic.
     public static let strokePruneBudget = 2_000_000
 
-    /// Builds the per-tile stroke-group table the composite kernels use to skip whole
-    /// strokes whose padded device box misses a pixel. Inputs (all parallel):
-    /// `strokeIDs` = visible strokes in document order, `strokeBoxes` = their padded
-    /// half-open device-space boxes `[min, max)` (pad ≥ 1.4·maxRadius·radiusFactor+3.5
-    /// covers both the AA and noise stamp cutoffs), `strokeTileRanges` = per stroke the
-    /// canvas-tile range its transformed AABB covers, `tileCounts` = per box-local tile
-    /// entry count (density gate), `box` = the layer box in canvas tile coords.
-    /// Output: `header` (two UInt32 per box-local tile: [start, count) into `entries`,
-    /// entry list flat buffer) and per-tile flat group entries in ascending stroke-ID
-    /// order. A tile below the density gate gets no entries — the kernel walks its
-    /// segments directly, exactly as before. If the total exceeds `budget`, the table
-    /// is dropped (empty header) for this frame. Pure integer/float logic, runs on
-    /// Linux; the Metal kernels mirror the walk order (document order == ascending
-    /// segment index == ascending stroke level within any tile).
-    public static func strokeGroupTable(strokeIDs: [UInt32],
-                                        strokeBoxes: [SIMD4<Float>],
-                                        strokeTileBoxes: [(minX: Int, minY: Int,
-                                                           maxX: Int, maxY: Int)],
+    /// Segments per pruning block: consecutive segments of one stroke become one
+    /// table entry with a conservative box. 32 keeps table size modest (~31 entries
+    /// per 1K entries) while cutting per-block walk cost; finer blocks mostly add
+    /// upload bytes without improving skip rates.
+    public static let pruneBlockSize = 32
+
+    /// Builds the per-tile stroke-BLOCK table the composite kernels use to skip runs
+    /// of segments whose padded device box misses the pixel — a much finer cut than
+    /// the whole-stroke boxes: mega-strokes (tens of thousands of segments) skip
+    /// per-block instead of never. Inputs:
+    /// `visibleStrokes` = visible stroke indices in document order;
+    /// `blockFirst`/`blockCount` = per stroke, its contiguous range within the flat
+    /// block arrays; `blockStroke`/`blockSegStart`/`blockRects` = flat per-block data
+    /// (rect = doc-space inclusive AABB covering the stroke's cached segment bounds);
+    /// `blockMaxRadius` = per block, max(radius0, radius1) doc space (pads the block's
+    /// box; tighter than a stroke-level pad on tapering strokes);
+    /// `camera`/`radiusFactor` = the exact same transform formulas the fused kernel
+    /// uses (device = (a·x + c·y + tx, b·x + d·y + ty), radius scaled by
+    /// radiusFactor); `tileCounts` = per box-local tile entry count (density gate);
+    /// `box` + tex dims = layer tile coordinates. Output: `header` (two UInt32 per
+    /// box-local tile: [start, count) into `entries`) and per-tile flat block
+    /// entries in ascending segStart order (blocks iterate stroke-then-block, both
+    /// ascending, so per-tile appends need no sort; blocks never span strokes, so
+    /// segment runs and stroke-completion boundaries both stay exact). A tile below
+    /// the density gate gets no entries — the kernel walks its segments directly,
+    /// exactly as before. A total above `budget` drops the table for this frame.
+    /// Pure float/int logic, runs on Linux; the Metal kernels mirror the walk.
+    public static func strokeBlockTable(visibleStrokes: [Int],
+                                        blockFirst: [Int], blockCount: [Int],
+                                        blockStroke: [Int32], blockSegStart: [Int32],
+                                        blockRects: [SIMD4<Float>],
+                                        blockMaxRadius: [Float],
+                                        camera: (a: Float, b: Float, c: Float,
+                                                 d: Float, tx: Float, ty: Float),
+                                        radiusFactor: Float,
                                         tileCounts: [UInt32],
                                         box: (minX: Int, minY: Int, maxX: Int, maxY: Int),
+                                        texW: Int, texH: Int, tilesX: Int, tilesY: Int,
+                                        invTile: Float,
                                         minEntries: Int = strokePruneMinTileEntries,
                                         budget: Int = strokePruneBudget)
-        -> (header: [UInt32], entries: [GpuBinStrokeGroup], totalGroups: Int) {
+        -> (header: [UInt32], entries: [GpuBinStrokeBlock], totalBlocks: Int) {
         let boxW = max(box.maxX - box.minX + 1, 0)
         let boxH = max(box.maxY - box.minY + 1, 0)
         let boxTiles = boxW * boxH
         var header = [UInt32](repeating: 0, count: boxTiles * 2)
-        guard boxTiles > 0, tileCounts.count >= boxTiles,
-              strokeIDs.count == strokeBoxes.count,
-              strokeIDs.count == strokeTileBoxes.count else { return (header, [], 0) }
+        guard boxTiles > 0, tileCounts.count >= boxTiles else { return (header, [], 0) }
 
-        // Pass 1: how many groups qualify per box-local tile.
+        // One pass over visible strokes' blocks, caching each block's padded device
+        // box + tile range (pass 1 counts appends, pass 2 fills). Blocks absent from
+        // the output texture keep their cache slot with an empty range so per-stroke
+        // block ranges stay contiguous.
+        var devBoxes: [SIMD4<Float>] = []
+        devBoxes.reserveCapacity(blockRects.count)
+        var devRanges: [(minX: Int, minY: Int, maxX: Int, maxY: Int)] = []
+        devRanges.reserveCapacity(blockRects.count)
         var perTile = [Int](repeating: 0, count: boxTiles)
-        for s in 0..<strokeIDs.count {
-            let tb = strokeTileBoxes[s]
-            let loX = max(tb.minX, box.minX), hiX = min(tb.maxX, box.maxX)
-            let loY = max(tb.minY, box.minY), hiY = min(tb.maxY, box.maxY)
-            guard loX <= hiX, loY <= hiY else { continue }
-            var ly = loY
-            while ly <= hiY {
-                var lx = loX
-                while lx <= hiX {
-                    let t = (ly - box.minY) * boxW + (lx - box.minX)
-                    if Int(tileCounts[t]) >= minEntries { perTile[t] += 1 }
-                    lx += 1
+
+        for sid in visibleStrokes {
+            guard sid >= 0, sid < blockCount.count, sid < blockFirst.count else { continue }
+            var b = blockFirst[sid]
+            let end = b + blockCount[sid]
+            while b < end {
+                defer { b += 1 }
+                guard b < blockRects.count, b < blockStroke.count,
+                      b < blockSegStart.count, b < blockMaxRadius.count else { break }
+                let pad = 1.4 * blockMaxRadius[b] * radiusFactor + 3.5
+                let r = blockRects[b]
+                // Camera-apply the four doc corners (affine, row-major like CGAffineTransform.apply).
+                let x0 = camera.a * r.x + camera.c * r.y + camera.tx
+                let y0 = camera.b * r.x + camera.d * r.y + camera.ty
+                let x1 = camera.a * r.z + camera.c * r.y + camera.tx
+                let y1 = camera.b * r.z + camera.d * r.y + camera.ty
+                let x2 = camera.a * r.x + camera.c * r.w + camera.tx
+                let y2 = camera.b * r.x + camera.d * r.w + camera.ty
+                let x3 = camera.a * r.z + camera.c * r.w + camera.tx
+                let y3 = camera.b * r.z + camera.d * r.w + camera.ty
+                let minX = min(min(x0, x1), min(x2, x3))
+                let maxX = max(max(x0, x1), max(x2, x3))
+                let minY = min(min(y0, y1), min(y2, y3))
+                let maxY = max(max(y0, y1), max(y2, y3))
+                let dv = SIMD4<Float>(minX - pad, minY - pad, maxX + 1 + pad, maxY + 1 + pad)
+                // Tile range MUST be computed from the PADDED box, not the bare corner
+                // AABB: `liveBinRangeForSeg` scatters each segment into tiles reached by
+                // its endpoints expanded by 1.4·r·radiusFactor + 1 px, which can cross a
+                // tile row/column beyond the block's bare rect. A block owning entries in
+                // a tile that its table range misses would be absent from that tile's
+                // table, desyncing the kernel's segStart cursor and applying the WRONG
+                // block's box to segments (glitches). The pad (1.4·rmax·radiusFactor
+                // + 3.5, corner set p0..p3 ⊇ the scatter's p1/p2, ceil ≥ floor) makes the
+                // range a strict superset of every per-segment scatter range of the
+                // block, restoring the invariant above.
+                guard let tb = tileBoxForAABB(minX: minX - pad, minY: minY - pad,
+                                              maxX: maxX + pad, maxY: maxY + pad,
+                                              texW: Float(texW), texH: Float(texH),
+                                              tilesX: tilesX, tilesY: tilesY,
+                                              invTile: invTile) else {
+                    devBoxes.append(dv)
+                    devRanges.append((-1, -1, -2, -2))   // empty: off-texture, never appends
+                    continue
                 }
-                ly += 1
+                devBoxes.append(dv)
+                devRanges.append(tb)
+                let loX = max(tb.minX, box.minX), hiX = min(tb.maxX, box.maxX)
+                let loY = max(tb.minY, box.minY), hiY = min(tb.maxY, box.maxY)
+                var ly = loY
+                while ly <= hiY {
+                    var lx = loX
+                    while lx <= hiX {
+                        let t = (ly - box.minY) * boxW + (lx - box.minX)
+                        if Int(tileCounts[t]) >= minEntries { perTile[t] += 1 }
+                        lx += 1
+                    }
+                    ly += 1
+                }
             }
         }
-        var total = perTile.reduce(0, +)
+        let total = perTile.reduce(0, +)
         if total > budget { return (header, [], 0) }
-        // Pass 2: prefix Start offsets, then fill. Strokes iterate in document
-        // (ascending-ID) order, so each tile's list is ascending with no checks;
-        // within a tile every stroke occurs at most once (its segments are the
-        // contiguous ID range the tile list carries in order).
+
         var start = 0
         for t in 0..<boxTiles {
             header[t * 2] = UInt32(start)
             header[t * 2 + 1] = UInt32(perTile[t])
             start += perTile[t]
         }
-        var cursor = perTile
-        for (t, c) in perTile.enumerated() { cursor[t] = 0 }
-        var entries = [GpuBinStrokeGroup](
-            repeating: GpuBinStrokeGroup(strokeID: 0xFFFF_FFFF,
+        var entries = [GpuBinStrokeBlock](
+            repeating: GpuBinStrokeBlock(segStart: 0xFFFF_FFFF, strokeID: 0xFFFF_FFFF,
                                          minX: 0, minY: 0, maxX: 0, maxY: 0),
             count: total)
-        for s in 0..<strokeIDs.count {
-            let boxf = strokeBoxes[s]
-            let e = GpuBinStrokeGroup(strokeID: strokeIDs[s],
-                                      minX: boxf.x, minY: boxf.y,
-                                      maxX: boxf.z, maxY: boxf.w)
-            let tb = strokeTileBoxes[s]
-            let loX = max(tb.minX, box.minX), hiX = min(tb.maxX, box.maxX)
-            let loY = max(tb.minY, box.minY), hiY = min(tb.maxY, box.maxY)
-            var ly = loY
-            while ly <= hiY {
-                var lx = loX
-                while lx <= hiX {
-                    let t = (ly - box.minY) * boxW + (lx - box.minX)
-                    if Int(tileCounts[t]) >= minEntries {
-                        entries[Int(header[t * 2]) + cursor[t]] = e
-                        cursor[t] += 1
+        var cursor = [Int](repeating: 0, count: boxTiles)
+        var cacheIdx = 0
+        for sid in visibleStrokes {
+            guard sid >= 0, sid < blockCount.count, sid < blockFirst.count else { continue }
+            var b = blockFirst[sid]
+            let end = b + blockCount[sid]
+            while b < end {
+                defer { b += 1 }
+                guard cacheIdx < devBoxes.count, cacheIdx < devRanges.count else { break }
+                defer { cacheIdx += 1 }
+                let tb = devRanges[cacheIdx]
+                if tb.minY >= tb.maxY { continue }   // empty range
+                let e = GpuBinStrokeBlock(
+                    segStart: UInt32(max(0, Int(blockSegStart[b]))), strokeID: UInt32(sid),
+                    minX: devBoxes[cacheIdx].x, minY: devBoxes[cacheIdx].y,
+                    maxX: devBoxes[cacheIdx].z, maxY: devBoxes[cacheIdx].w)
+                let loX = max(tb.minX, box.minX), hiX = min(tb.maxX, box.maxX)
+                let loY = max(tb.minY, box.minY), hiY = min(tb.maxY, box.maxY)
+                var ly = loY
+                while ly <= hiY {
+                    var lx = loX
+                    while lx <= hiX {
+                        let t = (ly - box.minY) * boxW + (lx - box.minX)
+                        if Int(tileCounts[t]) >= minEntries {
+                            entries[Int(header[t * 2]) + cursor[t]] = e
+                            cursor[t] += 1
+                        }
+                        lx += 1
                     }
-                    lx += 1
+                    ly += 1
                 }
-                ly += 1
             }
         }
         return (header, entries, total)
