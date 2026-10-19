@@ -747,6 +747,55 @@ final class GpuBinSpecTests: XCTestCase {
         XCTAssertTrue((perTile[t0] ?? []).contains { Int($0.segStart) == 0 })
     }
 
+    func testBitonicChunkSortMirror() {
+        // CPU mirror of `liveBinChunkSortV4Kernel`: same column/barrier structure
+        // with the pad values confined to the shared copy. Verifies: ascending
+        // order, byte-identical values (no duplicates), and that pads never leak
+        // into the valid prefix — the invariant whose breach (UINT_MAX pads
+        // reaching device memory) killed the earlier on-device bitonic.
+        func bitonicMirror(_ input: [UInt32]) -> [UInt32] {
+            let len = input.count
+            guard len > 1 else { return input }
+            var sh = [UInt32](repeating: 0xFFFF_FFFF, count: 1024)
+            for (i, v) in input.enumerated() { sh[i] = v }
+            var m = 1
+            while m < len { m <<= 1 }
+            var k = 2
+            while k <= m {
+                var j = k >> 1
+                while j > 0 {
+                    var e = 0
+                    while e < m {
+                        let p2 = e ^ j
+                        if p2 > e {
+                            let v = sh[e], pv = sh[p2]
+                            let up = (e & k) == 0
+                            sh[e] = up ? min(v, pv) : max(v, pv)
+                            sh[p2] = up ? max(v, pv) : min(v, pv)
+                        }
+                        e += 1
+                    }
+                    j >>= 1
+                }
+                k <<= 1
+            }
+            return Array(sh[0..<len])
+        }
+        for (len, seed) in [(2, 1), (3, 2), (5, 3), (31, 4), (32, 5), (33, 6), (56, 7),
+                            (512, 8), (513, 9), (700, 10), (1023, 11), (1024, 12)] {
+            // Pseudo-random distinct values in a shuffled order (values are
+            // unique, like segIdx tile-list entries).
+            var values = [UInt32]((0..<UInt32(len)).map { $0 &* 2654435761 % 4096 + 7 })
+            for i in stride(from: len - 1, through: 1, by: -1) {
+                let j = (seed * 7919 + i * i) % (i + 1)
+                values.swapAt(i, j)
+            }
+            let out = bitonicMirror(values)
+            XCTAssertEqual(out, values.sorted(), "bitonic mirror mismatch at len \(len)")
+            XCTAssertFalse(out.contains(0xFFFF_FFFF), "pads leaked at len \(len)")
+        }
+    }
+
     func testSortChunkSizeKnobClamps() {
         XCTAssertEqual(LiveConfig.sortChunkSize(environment: [:]), GpuBinSpec.sortChunkSize)
         XCTAssertEqual(LiveConfig.sortChunkSize(environment: ["ART_LIVE_SORT_CHUNK": "256"]), 256)

@@ -83,9 +83,12 @@ class MetalRenderer {
     // predates them (or ART_LIVE_GPUBIN=0) silently uses the CPU binning instead.
     internal var liveBinTransformCountPipeline: MTLComputePipelineState?
     internal var liveBinScatterPipeline: MTLComputePipelineState?
-    // Chunked sort: one thread sorts one 512-entry chunk in place, then pairwise merge
-    // passes restore full order — bounded work per thread at any zoom (no per-tile sort).
+    // Chunked sort: v3 = one thread heapsorts one chunk in place; v4 (default) =
+    // one threadgroup bitonic-sorts one chunk in threadgroup memory — same chunks
+    // and offsets, output identical (ascending unique segIdx), then pairwise merge
+    // passes restore full order. Bounded per-thread work at any zoom either way.
     internal var liveBinChunkSortPipeline: MTLComputePipelineState?
+    internal var liveBinChunkSortBitonicPipeline: MTLComputePipelineState?
     internal var liveBinMergePassPipeline: MTLComputePipelineState?
     /// Per-layer GPU-binning state, keyed by layer index. Entries are validated against
     /// the owning cache (`ObjectIdentifier`) + segment count and dropped wholesale when

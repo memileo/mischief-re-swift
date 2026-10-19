@@ -61,7 +61,7 @@
          <EnvironmentVariable
             key = "ART_LIVE_SORT_CHUNK"
             value = "64"
-            isEnabled = "YES">
+            isEnabled = "NO">
          </EnvironmentVariable>
          <EnvironmentVariable
             key = "ART_LIVE_GPUBIN"

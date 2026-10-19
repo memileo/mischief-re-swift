@@ -1762,6 +1762,76 @@ kernel void liveBinChunkSortV3Kernel(
     }
 }
 
+// Sort one chunk in place with a threadgroup-cooperative bitonic network over
+// threadgroup memory (v4 — replaces the v3 per-thread heapsort default).
+//
+// Why: the heapsort is ONE thread running ~n·log n DEPENDENT compare-swaps
+// (each sift step's loads depend on the previous), so it is latency-bound —
+// measured 17–24 ms for kaos-regular's ~7.7k small chunks, ~10 ms at zoom-out,
+// and 0.9 s for dots-zoom-in's 512-wide chunks (~30–113 µs per chunk at a
+// handful of cycles per dependent step). A bitonic network performs the same
+// compare-swaps, but spread across the threadgroup's lanes in shared memory:
+// each column is parallel, the serial chain is only O(log² n) columns, and the
+// total measured sort should drop to ~1 ms everywhere. The merge passes, the
+// chunk table, and all parameters are untouched — same chunks, same offsets.
+//
+// The earlier on-device attempt of this idea emitted UINT_MAX pads into the
+// tile list (BINCHECK-attributed). That kernel padded the DEVICE array out to
+// the pow2 width. This version pads ONLY the threadgroup-shared copy — every
+// device read/write stays within [start, start+len) — so that failure mode is
+// structurally impossible: the kernel writes exactly the input values,
+// permuted, and nothing else.
+//
+// Order: strictly ascending segIdx within the chunk (values are unique — each
+// (segment, tile) pair scatters exactly once), so the output is byte-identical
+// to the v3 heapsort's; every later stage (merge passes, per-tile render order)
+// is untouched. All 128 lanes of a threadgroup share one chunk, so the early
+// `len < 2` return is uniform and every barrier is legal.
+kernel void liveBinChunkSortV4Kernel(
+    constant LiveBinSortParams &p [[buffer(0)]],
+    const device uint2 *chunks [[buffer(1)]],
+    device uint *tileList [[buffer(2)]],
+    uint3 tid [[thread_position_in_grid]])
+{
+    // Dispatch shape: MTLSize(chunks,1,1) × MTLSize(128,1,1) — global.x is
+    // chunk*128 + lane, so these two lines split it. Must stay in sync with
+    // `encodeChunkSort`'s dispatch and with the `sh[1024]` capacity below
+    // (chunk size is clamped to ≤1024, so pow2ceil(len) ≤ 1024).
+    uint c = tid.x >> 7u;
+    if (c >= p.unitCount) return;
+    uint len = chunks[c].y;
+    if (len < 2u) return;
+    device uint *list = tileList + chunks[c].x;
+    uint lane = tid.x & 127u;
+    threadgroup uint sh[1024];
+    uint m = 1u;
+    while (m < len) m <<= 1u;
+    for (uint e = lane; e < len; e += 128u) sh[e] = list[e];
+    for (uint e = len + lane; e < m; e += 128u) sh[e] = 0xFFFFFFFFu;
+    // Ascending bitonic network. One barrier per column: it guarantees every
+    // previous column's writes are visible. Within a column the pairs (e, e^j)
+    // are disjoint, and only the LOWER element's owner (p > e) handles a pair,
+    // so no element is ever read or written by two lanes of the same column.
+    for (uint k = 2u; k <= m; k <<= 1u) {
+        for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint e = lane; e < m; e += 128u) {
+                uint p2 = e ^ j;
+                if (p2 > e) {
+                    uint v = sh[e], pv = sh[p2];
+                    bool up = (e & k) == 0u;
+                    sh[e] = up ? min(v, pv) : max(v, pv);
+                    sh[p2] = up ? max(v, pv) : min(v, pv);
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Only the valid prefix goes back — pads (0xFFFFFFFF sorts last) are
+    // dropped here, never written to the tile list.
+    for (uint e = lane; e < len; e += 128u) list[e] = sh[e];
+}
+
 // One thread's share of a pairwise merge: the pair bounds plus the output partition
 // [dst+part, dst+part+partLen) this thread owns. Must match `GpuBinMergeUnit` field
 // for field (six uints, stride 24).

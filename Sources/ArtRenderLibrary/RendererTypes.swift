@@ -323,6 +323,15 @@ public enum LiveConfig {
         return max(64, min(1024, v))
     }
 
+    /// Whether the live chunk sort uses the v4 threadgroup bitonic (default ON).
+    /// `ART_LIVE_SORT_BITONIC=0` reverts to the v3 per-thread heapsort for A/B
+    /// gates and regression comparisons; the merge passes are unchanged either
+    /// way (same chunks, same unit table), so output bytes are identical.
+    public static func sortBitonicEnabled(environment: [String: String]? = nil) -> Bool {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        return env["ART_LIVE_SORT_BITONIC"] != "0"
+    }
+
     /// Tile size for the *live* binning/dispatch. Resolution order:
     /// `ART_LIVE_TILE_SIZE` → `ART_TILE_SIZE` → 16 (the measured default).
     /// The static path keeps its own default (32); only the live path uses this.

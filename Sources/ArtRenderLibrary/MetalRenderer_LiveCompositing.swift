@@ -219,6 +219,7 @@ extension MetalRenderer {
             ("liveBinTransformCountKernel", { self.liveBinTransformCountPipeline = $0 }),
             ("liveBinScatterKernel", { self.liveBinScatterPipeline = $0 }),
             ("liveBinChunkSortV3Kernel", { self.liveBinChunkSortPipeline = $0 }),
+            ("liveBinChunkSortV4Kernel", { self.liveBinChunkSortBitonicPipeline = $0 }),
             ("liveBinMergePassV3Kernel", { self.liveBinMergePassPipeline = $0 }),
         ]
         for (name, assign) in binKernels {
@@ -802,7 +803,7 @@ extension MetalRenderer {
         // predating any of them (or ART_LIVE_GPUBIN=0) falls back to CPU below.
         guard let fusedPipe = liveBinTransformCountPipeline,
               let scatterPipe = liveBinScatterPipeline,
-              let chunkPipe = liveBinChunkSortPipeline,
+//              let chunkPipe = liveBinChunkSortPipeline,
               let mergePipe = liveBinMergePassPipeline else { return false }
         guard position < cache.layers.count, let device = device, let queue = commandQueue else {
             return false
@@ -1160,16 +1161,26 @@ extension MetalRenderer {
         func encodeChunkSort(_ encoder: MTLComputeCommandEncoder) throws {
             guard !sortChunks.isEmpty else { return }
             guard let sortChunkBuf else { throw MetalRendererError.bufferCreationFailed }
-            // One thread per chunk, in place (the kernel is barrier- and pad-free, so
-            // any 1D grid shape works — the standard 256-wide bin grid).
             var sp = LiveBinSortParams(unitCount: UInt32(sortChunks.count),
                                        runSize: UInt32(sortChunk))
-            encoder.setComputePipelineState(chunkPipe)
             encoder.setBytes(&sp, length: MemoryLayout<LiveBinSortParams>.stride, index: 0)
             encoder.setBuffer(sortChunkBuf, offset: 0, index: 1)
             encoder.setBuffer(tileList, offset: 0, index: 2)
-            encoder.dispatchThreadgroups(binGroups(sortChunks.count),
-                                         threadsPerThreadgroup: binThreads)
+            if LiveConfig.sortBitonicEnabled(), let bitonicPipe = liveBinChunkSortBitonicPipeline {
+                // One 128-lane threadgroup per chunk, cooperating over threadgroup
+                // memory (kernel pads ONLY in shared memory; dispatch and the 128-lane
+                // split must match `liveBinChunkSortV4Kernel`'s `tid.x >> 7` decoding).
+                encoder.setComputePipelineState(bitonicPipe)
+                encoder.dispatchThreadgroups(MTLSize(width: sortChunks.count, height: 1, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            } else if let chunkPipe = liveBinChunkSortPipeline {
+                // Per-thread heapsort fallback (also the `ART_LIVE_SORT_BITONIC=0`
+                // A/B path). The kernel is barrier- and pad-free, so any 1D grid
+                // shape works.
+                encoder.setComputePipelineState(chunkPipe)
+                encoder.dispatchThreadgroups(binGroups(sortChunks.count),
+                                             threadsPerThreadgroup: binThreads)
+            }
         }
         func encodeMergePass(_ encoder: MTLComputeCommandEncoder, pass: Int) throws {
             let uns = passUnits[pass]
