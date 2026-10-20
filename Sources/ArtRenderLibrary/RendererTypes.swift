@@ -362,6 +362,18 @@ public enum LiveConfig {
         return max(65_536, n)
     }
 
+    /// Weight of one splat slot read relative to one walk pixel evaluation
+    /// (`ART_LIVE_SPLAT_COST`, default 2, clamped 0…16). 0 disables the cost model and
+    /// leaves the plain radiusFactor/slot-budget gate in charge. See
+    /// `GpuBinSpec.splatCheaperThanWalk`.
+    public static func splatCostRatio(environment: [String: String]? = nil) -> Double {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        guard let v = env["ART_LIVE_SPLAT_COST"], let f = Double(v) else {
+            return GpuBinSpec.splatCostRatioDefault
+        }
+        return max(0, min(16, f))
+    }
+
     /// Whether the live chunk sort uses the v4 threadgroup bitonic (default ON).
     /// `ART_LIVE_SORT_BITONIC=0` reverts to the v3 per-thread heapsort for A/B
     /// gates and regression comparisons; the merge passes are unchanged either
@@ -657,6 +669,49 @@ public enum GpuBinSpec {
             running += UInt64(c)
         }
         return (entries, starts, Int(running))
+    }
+
+    // MARK: Splat vs walk cost model
+
+    /// Default weight of one splat slot operation relative to one walk pixel
+    /// evaluation. Both paths are exact — this only picks the cheaper one per layer.
+    ///
+    /// The walk pays `entries × tileArea` pixel evaluations (that is exactly the `sdf`
+    /// counter BINTIME reports). The splat replays every visible stroke for every box
+    /// pixel, padded up to whole batches: `boxPixels × batches × batchSlots` slot reads.
+    /// A slot read costs ~2× a walk evaluation — it runs the same SDF and then an atomic
+    /// max, and at zoom-out the composite has only `boxPixels` threads, so it is
+    /// latency- rather than throughput-bound. Measured on `complex.art` @ 0.3:
+    /// walk 21.9M evaluations = 3.5 ms against splat 30.6M slots = 16.1 ms, so the walk
+    /// wins by 4.6× — well past this 2× weight.
+    public static let splatCostRatioDefault: Double = 2.0
+
+    /// Work estimate for the per-tile walk, in pixel evaluations.
+    public static func walkPixelOps(entries: Int, tileSize: Int) -> Double {
+        guard entries > 0, tileSize > 0 else { return 0 }
+        return Double(entries) * Double(tileSize * tileSize)
+    }
+
+    /// Work estimate for the splat composite, in slot reads (batches rounded up, exactly
+    /// like the kernel loop).
+    public static func splatSlotOps(boxPixels: Int, visibleStrokes: Int,
+                                    batchSlots: Int) -> Double {
+        guard boxPixels > 0, visibleStrokes > 0, batchSlots > 0 else { return 0 }
+        let batches = (visibleStrokes + batchSlots - 1) / batchSlots
+        return Double(boxPixels) * Double(batches * batchSlots)
+    }
+
+    /// True when the splat is predicted to be cheaper than the walk for this layer.
+    /// `costRatio <= 0` accepts the splat whenever the eligibility gates allow it (the
+    /// pre-model behaviour, `ART_LIVE_SPLAT_COST=0`).
+    public static func splatCheaperThanWalk(entries: Int, tileSize: Int,
+                                            boxPixels: Int, visibleStrokes: Int,
+                                            batchSlots: Int, costRatio: Double) -> Bool {
+        if costRatio <= 0 { return true }
+        let walk = walkPixelOps(entries: entries, tileSize: tileSize)
+        let splat = splatSlotOps(boxPixels: boxPixels, visibleStrokes: visibleStrokes,
+                                 batchSlots: batchSlots)
+        return walk > splat * costRatio
     }
 
     // MARK: Stroke-group table for composite box pruning

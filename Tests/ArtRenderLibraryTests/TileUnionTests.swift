@@ -885,6 +885,56 @@ final class GpuBinSpecTests: XCTestCase {
         }
     }
 
+    /// The splat cost model only *chooses* between two byte-identical paths; it must
+    /// pick the walk at moderate zoom (where the box is still large but the walk is
+    /// already cheap) and the splat at deep zoom-out. The numbers are the measured
+    /// BINTIME figures from `complex.art` @ 0.3 and `kaos.art` @ 0.05.
+    func testSplatCostModelPicksTheCheaperPath() {
+        XCTAssertEqual(GpuBinSpec.splatCostRatioDefault, 2.0)
+        XCTAssertEqual(LiveConfig.splatCostRatio(environment: [:]),
+                       GpuBinSpec.splatCostRatioDefault)
+        XCTAssertEqual(LiveConfig.splatCostRatio(environment: ["ART_LIVE_SPLAT_COST": "0"]), 0)
+        XCTAssertEqual(LiveConfig.splatCostRatio(environment: ["ART_LIVE_SPLAT_COST": "99"]), 16)
+        XCTAssertEqual(LiveConfig.splatCostRatio(environment: ["ART_LIVE_SPLAT_COST": "x"]),
+                       GpuBinSpec.splatCostRatioDefault)
+
+        // complex.art @ 0.3, layer 0: 187 box tiles × 16² px, 640 visible strokes,
+        // 21.9M walk evaluations (3.5 ms) vs 30.6M slot reads (16.1 ms) → walk.
+        let walkOps = GpuBinSpec.walkPixelOps(entries: 85_579, tileSize: 16)
+        XCTAssertEqual(walkOps / 1e6, 21.9, accuracy: 0.1)
+        let slots = GpuBinSpec.splatSlotOps(boxPixels: 187 * 256, visibleStrokes: 640,
+                                            batchSlots: 128)
+        XCTAssertEqual(slots / 1e6, 30.6, accuracy: 0.1)
+        XCTAssertFalse(GpuBinSpec.splatCheaperThanWalk(entries: 85_579, tileSize: 16,
+                                                       boxPixels: 187 * 256,
+                                                       visibleStrokes: 640,
+                                                       batchSlots: 128,
+                                                       costRatio: 2.0))
+
+        // kaos.art @ 0.05: 45 box tiles, ~2,304 visible strokes → 26.5M slot reads
+        // (16.8 ms). Every one of its 321,611 segments enters at least one tile, so the
+        // walk pays ≥ 82M evaluations → splat.
+        XCTAssertTrue(GpuBinSpec.splatCheaperThanWalk(entries: 321_611, tileSize: 16,
+                                                      boxPixels: 45 * 256,
+                                                      visibleStrokes: 2_304,
+                                                      batchSlots: 128,
+                                                      costRatio: 2.0),
+                      "kaos @ 0.05 must keep the splat")
+        XCTAssertTrue(GpuBinSpec.splatCheaperThanWalk(entries: 321_611, tileSize: 16,
+                                                      boxPixels: 45 * 256,
+                                                      visibleStrokes: 2_304,
+                                                      batchSlots: 128,
+                                                      costRatio: 0))
+
+        // Degenerate inputs must never divide by zero or overflow.
+        XCTAssertEqual(GpuBinSpec.walkPixelOps(entries: 0, tileSize: 16), 0)
+        XCTAssertEqual(GpuBinSpec.splatSlotOps(boxPixels: 0, visibleStrokes: 10,
+                                               batchSlots: 128), 0)
+        XCTAssertFalse(GpuBinSpec.splatCheaperThanWalk(entries: 0, tileSize: 16,
+                                                       boxPixels: 1, visibleStrokes: 10,
+                                                       batchSlots: 128, costRatio: 2.0))
+    }
+
     /// A strongly curved spline at full zoom has farOffChord large enough that
     /// `prune > box pad` — the case the splat kernel handles by iterating the tile
     /// range instead of the disk. The predicate must be reachable (and, at zoom-out

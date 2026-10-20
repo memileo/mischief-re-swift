@@ -6,8 +6,8 @@
 #
 # That checked-in file is what SwiftPM copies into the ArtRenderLibrary resource bundle,
 # and what MetalRenderer loads at runtime. Building the **ArtRenderShaders** scheme in
-# Xcode produces a metallib in DerivedData which is *not* embedded anywhere, so it has to
-# be installed here.
+# Xcode is the normal way to produce it: the scheme's run script copies it next to the
+# sources, which is exactly where the runtime reads it.
 #
 # Usage:
 #   Scripts/build-metallib.sh                     compile the .metal sources with xcrun metal
@@ -17,19 +17,31 @@
 #   Scripts/build-metallib.sh --no-verify         skip the symbol check (fast, no metal-nm)
 #   Scripts/build-metallib.sh --force             install even if verification finds gaps
 #
-# Prefer plain `Scripts/build-metallib.sh`: it compiles ArtQuickLook/ArtRenderShaders/*.metal
-# directly into Sources/ArtRenderLibrary/ArtRenderShaders.metallib, so it can never pick up a
-# stale DerivedData product (which is exactly how an out-of-date metallib once got installed
-# unnoticed). Use --from-xcode only if you deliberately built the ArtRenderShaders scheme in
-# Xcode and want that product.
+# This script is an alternative to the Xcode copy step, not a requirement for it: it
+# compiles ArtQuickLook/ArtRenderShaders/*.metal straight into the file above.
 #
 set -euo pipefail
+# Symbol verification matches ~30 kernel names against a few hundred KB of `metal-nm` /
+# `strings` output. Under a UTF-8 locale, bash 3.2 (/bin/bash on macOS) walks that
+# haystack byte by byte and `--verify-only` sits at ~95% CPU for minutes. The C locale
+# makes the match byte-wise; every compared name is ASCII, so nothing else changes.
+export LC_ALL=C
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$ROOT/ArtQuickLook/ArtRenderShaders"
 DEST="$ROOT/Sources/ArtRenderLibrary/ArtRenderShaders.metallib"
 PROJECT="$ROOT/ArtQuickLook/ArtQuickLook.xcodeproj"
 SCHEME="ArtRenderShaders"
+SCRATCH="$ROOT/tmp"          # project-local scratch (gitignored) — never the system tmp
+
+# Scratch dirs for symbol dumps and the compile output, removed on any exit path.
+mkdir -p "$SCRATCH"
+TMPDIR_CHECK="$(mktemp -d "$SCRATCH/metallib-check.XXXXXX")"
+cleanup() {
+    rm -rf "$TMPDIR_CHECK"
+    if [[ -n "${TMP:-}" ]]; then rm -rf "$TMP"; fi
+}
+trap cleanup EXIT
 
 mode="build"
 force=0
@@ -44,7 +56,7 @@ while [[ $# -gt 0 ]]; do
         --force)       force=1 ;;
         --no-verify)   noverify=1 ;;
         --install)     mode="install"; shift; explicit="${1:-}" ;;
-        -h|--help)     sed -n '2,24p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help)     sed -n '2,22p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
     shift
@@ -103,6 +115,10 @@ REQUIRED_KERNELS=(
 # method can silently yield nothing on some setups: missing CLI tools, unexpected
 # container layout — and "every kernel missing" then means the inspection failed,
 # not the metallib).
+#
+# The inspection output goes to a FILE and is searched with `grep -qF`, never through a
+# shell variable plus `[[ $haystack == *$name* ]]`: that pattern match over a multi-MB
+# string is what made --verify-only spin (see the LC_ALL note above).
 inspect_symbols() {
     local file="$1"
     # Both probes are time-bounded: a hung tool must never look like a hung build.
@@ -115,15 +131,15 @@ inspect_symbols() {
 verify() {
     local file="$1" missing=0 missing_live=0
     [[ -f "$file" ]] || { echo "  no such file: $file"; return 1; }
-    local haystack
-    haystack="$(inspect_symbols "$file")"
-    if [[ -z "${haystack//[[:space:]]/}" ]]; then
+    local symbols="$TMPDIR_CHECK/symbols"
+    inspect_symbols "$file" >"$symbols"
+    if ! grep -q '[^[:space:]]' "$symbols" 2>/dev/null; then
         echo "  WARNING: neither metal-nm nor strings could read symbols from $file."
         echo "  (inspection tools failed — this says nothing about the metallib itself;"
         echo "   the runtime's makeFunction check at launch is authoritative.)"
     fi
     for kernel in "${REQUIRED_KERNELS[@]}"; do
-        if [[ "$haystack" != *"$kernel"* ]]; then
+        if ! grep -qF -- "$kernel" "$symbols"; then
             echo "  MISSING: $kernel"
             missing=1
             [[ " ${LIVE_KERNELS[*]} " == *" $kernel "* ]] && missing_live=1
@@ -170,10 +186,15 @@ with_timeout() {
     local secs="$1"; shift
     "$@" &
     local pid=$!
-    (sleep "$secs"; kill -9 "$pid" 2>/dev/null) &
+    # The watcher (and the `sleep` it would leave behind) must NOT inherit the caller's
+    # stdout: inside `$(...)` an open pipe delays the result until the timeout expires.
+    ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 &
     local watcher=$!
-    wait "$pid"
-    local rc=$?
+    local rc=0
+    wait "$pid" || rc=$?
+    # Kill the watcher and the `sleep` it spawned: leaving a stray `sleep 20` behind is
+    # harmless, but it is exactly the kind of thing that looks like a hang in `ps`.
+    if command -v pkill >/dev/null 2>&1; then pkill -P "$watcher" 2>/dev/null || true; fi
     kill "$watcher" 2>/dev/null
     wait "$watcher" 2>/dev/null || true
     return $rc
@@ -269,8 +290,7 @@ case "$mode" in
         ;;
 
     build)
-        TMP="$(mktemp -d)"
-        trap 'rm -rf "$TMP"' EXIT
+        TMP="$(mktemp -d "$SCRATCH/metallib-build.XXXXXX")"   # removed by the EXIT trap
         COUNT="$(ls -1 "$SRC"/*.metal | wc -l | tr -d ' ')"
         echo "Compiling $COUNT Metal source(s) from $SRC"
         xcrun -sdk macosx metal "$SRC"/*.metal -I "$SRC" -o "$TMP/ArtRenderShaders.metallib"

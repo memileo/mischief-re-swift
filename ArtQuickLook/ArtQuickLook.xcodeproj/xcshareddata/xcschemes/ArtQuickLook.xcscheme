@@ -40,7 +40,7 @@
       ignoresPersistentStateOnLaunch = "NO"
       debugDocumentVersioning = "YES"
       debugServiceExtension = "internal"
-      enableGPUValidationMode = "1"
+      enableGPUShaderValidationMode = "2"
       allowLocationSimulation = "YES">
       <BuildableProductRunnable
          runnableDebuggingMode = "0">
@@ -56,6 +56,11 @@
          <EnvironmentVariable
             key = "ART_LIVE_BINTIME"
             value = "1"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "ART_LIVE_TILE_SIZE"
+            value = "8"
             isEnabled = "YES">
          </EnvironmentVariable>
          <EnvironmentVariable

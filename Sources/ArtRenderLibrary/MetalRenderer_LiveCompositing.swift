@@ -1018,9 +1018,30 @@ extension MetalRenderer {
         let splatBoxPixW = boxW * liveTile
         let splatBoxPixH = boxH * liveTile
         let splatPixels = splatBoxPixW * splatBoxPixH
-        if LiveConfig.splatEnabled(),
-           radiusFactor <= LiveConfig.splatMaxRadiusFactor(),
-           splatPixels * splatBatch <= LiveConfig.splatSlotBudget(),
+        // Cost model, not just eligibility: both paths are exact, but they are only
+        // both *fast* in different regimes. The walk costs Σ(segment, tile) × tileArea
+        // (the `sdf` counter); the splat costs boxPixels × visibleStrokes slot reads
+        // (~2× more expensive each). At moderate zoom the box is still large while the
+        // walk is already cheap, so the splat must lose there — measured:
+        // complex.art @ 0.3 went 3.5 ms (walk) → 16.1 ms (splat) before this gate.
+        let splatCost = LiveConfig.splatCostRatio()
+        let splatFits = LiveConfig.splatEnabled()
+            && radiusFactor <= LiveConfig.splatMaxRadiusFactor()
+            && splatPixels * splatBatch <= LiveConfig.splatSlotBudget()
+        let splatWins = splatFits && GpuBinSpec.splatCheaperThanWalk(
+            entries: total, tileSize: liveTile,
+            boxPixels: splatPixels, visibleStrokes: visStrokeIDs.count,
+            batchSlots: splatBatch, costRatio: splatCost)
+        if LiveConfig.binStageTimingEnabled() && splatFits && !splatWins {
+            print(String(format: "livebin layer %d: splat declined — walk %.1fM px-ops vs splat %.1fM slots ×%.1f; using the walk",
+                         position,
+                         GpuBinSpec.walkPixelOps(entries: total, tileSize: liveTile) / 1e6,
+                         GpuBinSpec.splatSlotOps(boxPixels: splatPixels,
+                                                 visibleStrokes: visStrokeIDs.count,
+                                                 batchSlots: splatBatch) / 1e6,
+                         splatCost))
+        }
+        if splatWins,
            let splatPipe = liveSplatPipeline,
            let splatCompPipe = liveSplatCompositePipeline,
            let splatWritePipe = liveSplatWritePipeline,

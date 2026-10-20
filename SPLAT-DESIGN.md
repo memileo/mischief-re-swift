@@ -2,9 +2,13 @@
 
 **Read this first if the context was compacted.**
 
-Status: **implemented, Linux-green (87 tests, 1 skipped, 0 failures); the Metal is
-uncompiled here and needs one Mac round to gate.** The v4 bitonic sort (previous round)
-is also still uncommitted in the working tree alongside this work.
+Status: splat implemented; the layer-composite vanish bug fixed; the zoom-in dot
+de-duplication fixed; the splat cost model added so the splat is only used when it is
+predicted to be *cheaper*, not merely exact. Linux-green (90 tests, 1 skipped, 0
+failures) and the `#if os(macOS)` files were syntax-checked with a forced macOS parse.
+Exactness (kaos gate + splat A/B) still needs the gated Mac run. Committed: the v4
+bitonic sort and the splat kernels/pipelines (`ed0d082`). Uncommitted: the layer-composite
+fix, the dot fix, the cost model, the script fixes, and this note.
 
 ## Why (the diagnosis up to now)
 
@@ -96,8 +100,7 @@ in-encoder dispatch ordering — which the existing scatter→sort→merge chain
 ## Next round — the Mac run (in order)
 
 ```sh
-# 0. rebuild both (new kernels added -> metallib must be rebuilt)
-sh Scripts/build-metallib.sh
+# 0. rebuild the metallib (new kernels) — Xcode scheme copy or Scripts/build-metallib.sh — then:
 swift build -c release
 
 # 1. tripwire once, splat off, walk sanity
@@ -115,8 +118,11 @@ ART_LIVE_BINCHECK=1 .build/release/art2png --live-view --viewport 1920x1080 art/
 ART_LIVE_BINTIME=1 .build/release/art2png --live-view --viewport 1920x1080 <doc>   # report livebin lines
 ```
 
-Expected: zoom-out `render+comp` collapses (kaos 33.6 → order 1–3 ms), the line now ends
-with `[splat Nb×B]`; regular zoom and dots zoom-in keep walking (no `[splat …]` suffix).
+Expected: zoom-out `render+comp` drops and the line ends with `[splat Nb×B]`; regular zoom
+and dots zoom-in keep walking (no `[splat …]` suffix). Measured at zoom 0.21 (24733 segs,
+484 tiles, `splat 4×128`): ≈16 ms vs the walk's ≈34 ms, i.e. ~2× — not the order of
+magnitude guessed here. The composite floor is `pixels × visibleStrokes`, so the win grows
+as the box shrinks but is bounded by the visible-stroke count (see Round 2b).
 The identity step is the real gate: any mismatch means the prune-disk ⇔ walk-contributing
 -set argument is wrong somewhere — report the view and I'll re-derive.
 
@@ -135,7 +141,7 @@ The identity step is the real gate: any mismatch means the prune-disk ⇔ walk-c
 
 ---
 
-# Round 2 — the metallib was stale, and the zoom-in dot blow-up
+# Round 2 — the installed metallib predated the splat kernels, and the zoom-in dot blow-up
 
 ## The measurements above defaulted to the walk
 
@@ -149,14 +155,18 @@ Live view: liveSplatWriteKernel not in metallib — CPU binning for now
 
 So `useSplat` was false on every layer and the whole run was the walk — `render+comp`
 36/34/30/15 ms are *unchanged walk* numbers, and the "splat A/B IDENTICAL" result was
-vacuous (walk vs walk). Proof it was a stale artifact, not a code path: the installed
-`Sources/ArtRenderLibrary/ArtRenderShaders.metallib` contains `liveBinChunkSortV4Kernel`
-but no `liveSplat*`, and the file is unmodified in git — i.e. it is the round‑1 build.
+vacuous (walk vs walk). The installed `Sources/ArtRenderLibrary/ArtRenderShaders.metallib`
+contains `liveBinChunkSortV4Kernel` but no `liveSplat*`: it had been built from an older
+`segmentKernels.metal`, so the new kernels were simply not in the file to load. That was a
+rebuild/source-copy slip — not a code path and not a tooling fault. Nothing was wrong;
+there was just nothing new in the library.
 
-`Scripts/build-metallib.sh` now lists every live kernel (V4 sort + the three splat
-kernels) in `LIVE_KERNELS`, so a metallib missing one is reported as `MISSING:` and
-`install` refuses it. The renderer also prints a loud one-liner when the splat kernels
-are absent. **Rebuild the metallib before any splat measurement.**
+Building the metallib in Xcode is fine: the `ArtRenderShaders` scheme's run script copies
+it next to the sources, which is where the runtime looks. `Scripts/build-metallib.sh` is an
+alternative, not a requirement. What the script now adds is a check: `LIVE_KERNELS` lists
+the V4 sort and the three splat kernels, so a metallib missing any of them is reported as
+`MISSING:` and refused. The renderer also prints a loud one-liner when the splat kernels
+are absent. **Rebuild and verify the metallib before any splat measurement.**
 
 ## The zoomed-in single point (dots.art)
 
@@ -188,11 +198,16 @@ tile is only 16 px, so the walk's expansion waste shrinks as `r_dev` grows.
 
 ## Next round (corrected)
 
+Rebuild the metallib however you normally do — the Xcode scheme's copy step, or
+`sh Scripts/build-metallib.sh`. Then optionally verify it and build:
+
 ```sh
-sh Scripts/build-metallib.sh          # MUST print: OK: all N kernels/functions present
+Scripts/build-metallib.sh --verify-only   # wants: OK: all N kernels/functions present
 swift build -c release
-# expect at launch: "Live view: GPU tile binning ready" and NO "SPLAT kernels missing"
 ```
+At launch expect `Live view: GPU tile binning ready` and **no** `SPLAT kernels missing`
+line. The verification probes are time-bounded, so a hung tool can no longer look like a
+hung build; `--no-verify` skips the check entirely.
 
 Then redo the round‑1 steps 1–4 (tripwire, kaos gate, splat A/B, BINTIME) and report the
 `livebin` lines. Also re-check dots zoom 20: it should now be ~6 segments and fast
@@ -218,3 +233,88 @@ First real splat numbers (zoom 0.21, layer 0 = 24733 segs / 484 tiles): `render+
 `256 × Σ incidences`; the splat composite floor is `pixels × visibleStrokes`).
 
 
+
+---
+
+# Round 3 — the splat cost model, and the two scripts
+
+## What the Mac numbers said
+
+The splat is a large win at deep zoom-out and a clear *loss* at moderate zoom-out:
+
+| view | splat | walk |
+|---|---|---|
+| kaos 0.05 | 16.8 ms (`18×128`) | not run — the box is 45 tiles |
+| logo 0.05 L0 | 5.9 ms (`13×128`) | not run |
+| complex 0.05 | 2.1 ms (`5×128`) | not run |
+| **complex 0.3 L0** | **16.1 ms** (`5×128`) | **3.5 ms** |
+| complex 0.3 L1 | 3.6 ms | 2.9 ms |
+
+The gate only asked *is the splat exact here* (`radiusFactor ≤ 1`) plus a scratch-memory
+budget — never *is it cheaper*. At 0.3 the box is 187 tiles × 256 px = 47.9 K pixels while
+640 strokes are visible, so the composite replays `47.9 K × 640 = 30.6 M` slot reads. A
+slot costs ~2× a walk pixel evaluation (same SDF, then an atomic max; and the composite
+only has `boxPixels` ≈ 48 K threads, so it is latency-bound). The walk needs 21.9 M
+cheaper evaluations instead — hence 3.5 ms vs 16.1 ms.
+
+## The model
+
+Both paths are exact, so this only picks the faster one, per layer, from numbers the
+binning has already produced:
+
+- walk: `entries × tileSize²` pixel evaluations — `entries` is the tile-count sum from
+  the CPU prefix, i.e. exactly the `sdf` counter BINTIME prints.
+- splat: `boxPixels × ceil(visibleStrokes / B) × B` slot reads.
+- use the splat when `walk > splat × ART_LIVE_SPLAT_COST` (default 2.0; `0` disables the
+  model and restores the plain radius-factor gate).
+
+With the default weight: complex.art @ 0.3 → walk (21.9 M vs 30.6 M×2), complex @ 0.05 →
+walk-ish (the box is already tiny), kaos @ 0.05 → splat (≥82 M vs 26.5 M×2). When the
+model overrules the old gate the log says so:
+
+```
+livebin layer 0: splat declined — walk 21.9M px-ops vs splat 30.6M slots ×2.0; using the walk
+```
+
+Tests: `testSplatCostModelPicksTheCheaperPath` (the measured numbers above), and the knob
+clamps (`ART_LIVE_SPLAT_COST`, 0…16).
+
+## The scripts
+
+- `Scripts/stroke-splat-ab.sh` — rewritten. Per view: delete the previous
+  `<doc>.live-view.png`, run walk (`ART_LIVE_SPLAT=0`) and default (`ART_LIVE_SPLAT`
+  unset), move both to `tmp/splat-ab/<doc>@<zoom>-splat-{off,default}.png`, verify each
+  PNG is the requested viewport size, byte-compare, and report the default run's own
+  `[splat N×B]` marker. A view that never splatted is called out as *walk vs walk*, so a
+  vacuous A/B can no longer pass. `--all` runs the standard matrix (kaos 1/0.21/0.05,
+  logo 1/0.05, complex 1/0.3/0.05, dots 1/20); positional `pan` / `rotate` are supported.
+  Output and logs live in `tmp/splat-ab/` (project-local, gitignored).
+- `Scripts/build-metallib.sh --verify-only` — the stall was the verifier, not the tooling:
+  it matched ~31 names with `[[ $haystack == *$name* ]]` against a multi-MB
+  `metal-nm`+`strings` dump held in a shell variable, which bash 3.2 walks byte by byte
+  in a UTF-8 locale. Now the dump goes to a file under `tmp/` and each probe is
+  `grep -qF`, with `LC_ALL=C`. Also fixed: the timeout watcher's orphaned `sleep` kept the
+  caller's stdout open inside `$(...)`, delaying every probe by the full 20 s. Measured
+  here: 0.07 s for the checked-in metallib, 0.16 s for a 2 MB synthetic dump.
+
+## Next levers (ranked by expected win per risk)
+
+1. **`ART_LIVE_TILE_SIZE=8` on the dense views** — no code change, just an env var. The
+   walk's work is `incidences × tileSize²`; halving the tile should cut kaos's 372 M
+   evaluations to ~160 M (incidences grow ~1.8×, area drops 4×). Costs: ~2× the tiles,
+   incidences and tile-table entries, so watch `scatter`/`sort` and the bin CPU time.
+   `ART_LIVE_TILE_SIZE=32` is the other control point. Everything stays byte-identical
+   (the walk is tile-size independent; the splat only reads `tileSize` for its fallback
+   branch), so the usual A/B gates apply.
+2. **The splat composite is the splat's floor**: `boxPixels × visibleStrokes` slot reads.
+   A per-tile compaction (append each stroke's ordinal to the tiles it actually touches,
+   then replay only those per pixel) would make the splat converge to the walk's incidences
+   instead of the whole box — but it is exactly the walk's data structure again, so the
+   ceiling is ~2×. Only worth it if the splat is kept at moderate zoom.
+3. **Bin CPU time** (kaos `bin` 59 ms = 11 ms CPU + 9.4 `xform` + 36.7 `render+comp`) is
+   dominated by per-frame CPU prep: the stroke-block table build, `visBytes`/ordinal
+   uploads and the 7800-tile prefix. Cheap checks: time `strokeBlockTable` separately, and
+   see whether the table is worth it at the current density.
+4. **Excluded layers** (`cut` ops, markers, `needsRebuild` paste/merge layers) still take
+   the per-stroke CPU path. That is a bigger job: cut metas would have to be remapped and
+   interleaved in document order inside the GPU plan.
