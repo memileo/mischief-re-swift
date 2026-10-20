@@ -14,7 +14,14 @@
 #   Scripts/build-metallib.sh --from-xcode        find the metallib Xcode just built and install it
 #   Scripts/build-metallib.sh --install <path>    install a metallib from an explicit path
 #   Scripts/build-metallib.sh --verify-only       only report which functions are present
+#   Scripts/build-metallib.sh --no-verify         skip the symbol check (fast, no metal-nm)
 #   Scripts/build-metallib.sh --force             install even if verification finds gaps
+#
+# Prefer plain `Scripts/build-metallib.sh`: it compiles ArtQuickLook/ArtRenderShaders/*.metal
+# directly into Sources/ArtRenderLibrary/ArtRenderShaders.metallib, so it can never pick up a
+# stale DerivedData product (which is exactly how an out-of-date metallib once got installed
+# unnoticed). Use --from-xcode only if you deliberately built the ArtRenderShaders scheme in
+# Xcode and want that product.
 #
 set -euo pipefail
 
@@ -26,6 +33,7 @@ SCHEME="ArtRenderShaders"
 
 mode="build"
 force=0
+noverify=0
 explicit=""
 
 while [[ $# -gt 0 ]]; do
@@ -34,8 +42,9 @@ while [[ $# -gt 0 ]]; do
         --verify-only) mode="verify" ;;
         --build)       mode="build" ;;
         --force)       force=1 ;;
+        --no-verify)   noverify=1 ;;
         --install)     mode="install"; shift; explicit="${1:-}" ;;
-        -h|--help)     sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help)     sed -n '2,24p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
     shift
@@ -62,7 +71,11 @@ LIVE_KERNELS=(
     liveBinTransformCountKernel
     liveBinScatterKernel
     liveBinChunkSortV3Kernel
+    liveBinChunkSortV4Kernel
     liveBinMergePassV3Kernel
+    liveSplatKernel
+    liveSplatCompositeKernel
+    liveSplatWriteKernel
 )
 REQUIRED_KERNELS=(
     clearKernel
@@ -92,10 +105,11 @@ REQUIRED_KERNELS=(
 # not the metallib).
 inspect_symbols() {
     local file="$1"
+    # Both probes are time-bounded: a hung tool must never look like a hung build.
     if command -v xcrun >/dev/null 2>&1; then
-        xcrun -sdk macosx metal-nm "$file" 2>/dev/null || true
+        with_timeout 20 xcrun -sdk macosx metal-nm "$file" 2>/dev/null || true
     fi
-    strings -a "$file" 2>/dev/null || true
+    with_timeout 20 strings -a "$file" 2>/dev/null || true
 }
 
 verify() {
@@ -127,6 +141,11 @@ verify() {
 
 install() {
     local file="$1"
+    if [[ $noverify -eq 1 ]]; then
+        cp "$file" "$DEST"
+        echo "Installed $DEST (verification skipped)"
+        return 0
+    fi
     echo "Verifying $file"
     if verify "$file"; then
         cp "$file" "$DEST"

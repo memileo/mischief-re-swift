@@ -444,8 +444,19 @@ internal func flattenAndBuild(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRS
     if h_chord > 500.0 { needsSubdivide = true }
     if isMarker && h_chord > 10.0 { needsSubdivide = true }
     if !isSafeAngle(v0, v1) || !isSafeAngle(v1, v2) { needsSubdivide = true }
-    
-    if !needsSubdivide || depth > 8 {
+
+    // A pen "dot" arrives as a fully degenerate span: all four control points coincide.
+    // `isSafeAngle` on the resulting zero-length tangents is false, so the guard above
+    // would recurse to the depth cap and append 2^9 byte-identical copies (dots.art: 512
+    // per dot). There is nothing to refine — every child spans the same point — and a
+    // stroke's coverage is unioned (the kernels take a per-stroke coverage max), so the
+    // copies are redundant. Emit the single stamp the `h_chord < 1` rule below already
+    // selects. Pixel-identical; dots.art drops from 2050 to 6 segments.
+    let spanIsPoint = p0.x == p1.x && p0.y == p1.y
+                   && p1.x == p2.x && p1.y == p2.y
+                   && p2.x == p3.x && p2.y == p3.y
+
+    if !needsSubdivide || depth > 8 || spanIsPoint {
         let r_max = max(r1, r2)
         
         // Changed from 1.5 to 1.0 for more overlap.

@@ -59,6 +59,11 @@
             isEnabled = "YES">
          </EnvironmentVariable>
          <EnvironmentVariable
+            key = "ART_LIVE_SPLAT"
+            value = "0"
+            isEnabled = "NO">
+         </EnvironmentVariable>
+         <EnvironmentVariable
             key = "ART_LIVE_SORT_CHUNK"
             value = "64"
             isEnabled = "NO">

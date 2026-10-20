@@ -249,13 +249,22 @@ extension MetalRenderer {
                 do {
                     assign(try device.makeComputePipelineState(function: fn))
                 } catch {
-                    print("Live view: \(name) pipeline failed (\(error)) — CPU binning for now")
+                    print("Live view: \(name) pipeline failed (\(error)) — feature disabled")
                     assign(nil)
                 }
             } else {
-                print("Live view: \(name) not in metallib — CPU binning for now")
+                print("Live view: \(name) not in metallib — feature disabled")
                 assign(nil)
             }
+        }
+        // A stale metallib is the one failure that used to be silent: the kernels simply
+        // never ran and every measurement looked like the walk. Say so unambiguously.
+        if liveSplatPipeline == nil || liveSplatCompositePipeline == nil || liveSplatWritePipeline == nil {
+            print("Live view: SPLAT kernels missing from the installed metallib — the splat path is OFF."
+                  + " Rebuild it: Scripts/build-metallib.sh")
+        }
+        if liveBinChunkSortBitonicPipeline == nil {
+            print("Live view: liveBinChunkSortV4Kernel missing — chunk sort falls back to the V3 heapsort.")
         }
         if liveBinTransformCountPipeline != nil,
            liveBinScatterPipeline != nil,
@@ -1012,12 +1021,11 @@ extension MetalRenderer {
         if LiveConfig.splatEnabled(),
            radiusFactor <= LiveConfig.splatMaxRadiusFactor(),
            splatPixels * splatBatch <= LiveConfig.splatSlotBudget(),
-//           !visStrokeIDs.isEmpty, // suggested it can be dropped as it's after if visStrokeIDs.isEmpty
            let splatPipe = liveSplatPipeline,
            let splatCompPipe = liveSplatCompositePipeline,
            let splatWritePipe = liveSplatWritePipeline,
-//           let device = device, // already in guard above
            let layerTex = gpuRenderTarget,
+           let canvas = liveCanvasTexture,
            let noiseBind = splatNoiseBinding(),
            ensureSplatBuffers(device: device, ref: ref, pixels: splatPixels,
                               slots: splatPixels * splatBatch),
@@ -1090,6 +1098,17 @@ extension MetalRenderer {
             splatEnc.setBuffer(splatAcc, offset: 0, index: 1)
             splatEnc.setTexture(layerTex, index: 0)
             splatEnc.dispatchThreadgroups(splatGroups, threadsPerThreadgroup: splatThreads)
+            // Stack the finished layer onto the canvas with the layer opacity — the same
+            // `liveCompositeLayerKernel` dispatch `encodeTail` ends with. The splat only
+            // fills the layer texture; without this the layer never reaches the canvas and
+            // every splat-rendered layer vanishes from the frame.
+            splatEnc.setComputePipelineState(compositePipeline)
+            splatEnc.setTexture(layerTex, index: 0)
+            splatEnc.setTexture(canvas, index: 1)
+            var splatOpacity = opacity
+            splatEnc.setBytes(&splatOpacity, length: MemoryLayout<Float>.stride, index: 0)
+            splatEnc.dispatchThreadgroups(Self.liveGroups(width: width, height: height),
+                                          threadsPerThreadgroup: Self.liveThreads)
             splatEnc.endEncoding()
             cbSplat.commit()
             cbSplat.waitUntilCompleted()

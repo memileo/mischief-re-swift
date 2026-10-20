@@ -1502,6 +1502,215 @@ kernel void livePerTileNoiseCompositeKernel(
     if (acc.a > 0.0001f) target.write(acc, pixel);
 }
 
+// MARK: - Splat composite (segment-parallel small-stamp regime)
+//
+// The per-tile walk is pixel-parallel: its cost is
+// `Σ_segments (pixels in the segment's tile-EXPANDED box)`, which at zoom-out is ~85×
+// the ink area (a 2 px stamp still pays for every pixel of the 16 px tile it binned
+// into) and runs on only a handful of thousand pixel-threads. The splat path is
+// segment-parallel instead: each segment writes the pixels of its prune disk, and the
+// per-(pixel, stroke) max is an atomicMax. Cost = the ink area; threads = segments ×
+// disk. For an exactness proof (why the prune disk equals the walk's contributing set)
+// see SPLAT-DESIGN.md.
+//
+// `liveSplatStamped` is a VERBATIM copy of the walk kernels' inner stamp maths (AA and
+// noisy branches). The identity gates compare splat vs walk byte-for-byte, so any edit
+// here must be mirrored there.
+//
+// `LiveSplatParams` — must match the Swift struct field for field, in order.
+struct LiveSplatParams {
+    uint segCount;
+    uint slotsPerPixel;     // batch size B
+    uint batchStart;        // first visible-stroke ordinal in this batch
+    uint batchCount;
+    uint tileSize;
+    uint boxTilesPerRow;
+    uint boxTilesPerCol;
+    uint flags;             // bit0 = noise enabled (sample the noise texture)
+    int  originPxX;         // boxMinTileX * tileSize (left edge of the splat box)
+    int  originPxY;
+    int  boxPixW;           // boxTilesPerRow * tileSize
+    int  boxPixH;
+};
+
+inline float liveSplatStamped(GPUSplineSegment seg, float2 pos, bool noisy) {
+    float signedDist = 1e6f;
+    float t = 0.0f;
+    if (seg.segmentType == 0) {
+        SDFResult res = sdUnevenCapsule(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
+        signedDist = res.dist; t = res.t;
+    } else if (seg.segmentType == 1) {
+        SDFResult res = sdSplineSegment(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+        signedDist = res.dist; t = res.t;
+    } else if (seg.segmentType == 2) {
+        SDFResult res = sdSoftEnvelopeSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+        signedDist = res.dist; t = res.t;
+    }
+    if (noisy) {
+        float radius = mix(seg.radius0, seg.radius1, t);
+        float opacity = mix(seg.opacity0, seg.opacity1, t);
+        float dist = signedDist + radius;
+        float nd = dist / (max(radius, 1.0f) * 1.1f);
+        float covPencil = 1.0f;
+        if (nd > 0.08f) {
+            float tSoft = clamp((nd - 0.1f) / 0.9f, 0.0f, 1.0f);
+            float scurve = tSoft * tSoft * (3.0f - 2.0f * tSoft);
+            covPencil = 1.0f - pow(scurve, 0.9f);
+        }
+        float tAir = clamp(nd * 0.8f, 0.0f, 1.0f);
+        float covAirbrush = (1.0f - tAir);
+        covAirbrush = covAirbrush * covAirbrush;
+        float softness = saturate((radius - 4.0f) / 800.0f);
+        float cov = mix(covPencil, covAirbrush, softness);
+        return cov * opacity;
+    }
+    float opacity = mix(seg.opacity0, seg.opacity1, t);
+    float cov = 1.0f - smootherstep(-0.94f, 0.94f, signedDist + 0.5f);
+    return cov * opacity;
+}
+
+// One thread per reference segment. Segments outside this batch's visible-ordinal range
+// return immediately, so one dispatch per batch re-reads the whole segment buffer; that
+// is far cheaper than building per-batch segment lists.
+kernel void liveSplatKernel(
+    constant LiveSplatParams &p [[buffer(0)]],
+    const device GPUSplineSegment *frames [[buffer(1)]],   // device space, this frame
+    const device uint *segStroke [[buffer(2)]],
+    const device uint *strokeFlags [[buffer(3)]],
+    const device uint *visOrd [[buffer(4)]],               // strokeId -> visible ordinal | 0xFFFFFFFF
+    const device int4 *ranges [[buffer(5)]],               // per-segment tile range (box-clamped use)
+    device atomic_uint *splatMax [[buffer(6)]],            // pixels × slotsPerPixel, cleared per batch
+    uint3 tpg [[thread_position_in_grid]])
+{
+    uint gid = tpg.x;
+    if (gid >= p.segCount) return;
+    uint sid = segStroke[gid];
+    uint ord = visOrd[sid];
+    if (ord == 0xFFFFFFFFu) return;
+    if (ord < p.batchStart || ord >= p.batchStart + p.batchCount) return;
+
+    GPUSplineSegment s = frames[gid];
+    float prune = as_type<float>(s.padding1);
+    if (!(prune > 0.0f)) prune = 3.4e38f;   // walk's "unset" sentinel (never expected)
+    float2 a = s.p1, b = s.p2;
+    float rMax = max(s.radius0, s.radius1);
+    float pad = 1.4f * rMax + 1.0f;
+    uint slot = ord - p.batchStart;
+    bool noisy = (strokeFlags[sid] & 0x2u) != 0u;
+
+    int x0, y0, x1, y1;
+    if (prune <= pad) {
+        // Exact path (the normal case at radiusFactor ≤ 1): the prune disk is inside
+        // the binning box, so iterating the disk pixel-by-pixel is exactly the walk's
+        // contributing set — no tile size dependence at all.
+        x0 = max(p.originPxX, int(floor(min(a.x, b.x) - prune)));
+        x1 = min(p.originPxX + p.boxPixW - 1, int(ceil(max(a.x, b.x) + prune)));
+        y0 = max(p.originPxY, int(floor(min(a.y, b.y) - prune)));
+        y1 = min(p.originPxY + p.boxPixH - 1, int(ceil(max(a.y, b.y) + prune)));
+    } else {
+        // Rare: a strongly curved spline whose prune radius exceeds the box pad, so the
+        // disk can reach outside the box. Fall back to the full tile range ∩ box (the
+        // walk's evaluated set) and let the disk test trim inside it.
+        int4 r = ranges[gid];
+        if (r.x > r.z || r.y > r.w) return;
+        int bx = p.originPxX / int(p.tileSize);
+        int by = p.originPxY / int(p.tileSize);
+        int minTX = max(r.x, bx), maxTX = min(r.z, bx + int(p.boxTilesPerRow) - 1);
+        int minTY = max(r.y, by), maxTY = min(r.w, by + int(p.boxTilesPerCol) - 1);
+        if (minTX > maxTX || minTY > maxTY) return;
+        x0 = max(p.originPxX, minTX * int(p.tileSize));
+        x1 = min(p.originPxX + p.boxPixW - 1, (maxTX + 1) * int(p.tileSize) - 1);
+        y0 = max(p.originPxY, minTY * int(p.tileSize));
+        y1 = min(p.originPxY + p.boxPixH - 1, (maxTY + 1) * int(p.tileSize) - 1);
+    }
+    if (x0 > x1 || y0 > y1) return;
+
+    uint pixelCount = uint(p.boxPixW) * uint(p.boxPixH);
+    for (int py = y0; py <= y1; ++py) {
+        for (int px = x0; px <= x1; ++px) {
+            float2 pos = float2(float(px), float(py)) + float2(0.5f, 0.5f);
+            if (liveSegDist(pos, a, b) > prune) continue;
+            float stamped = liveSplatStamped(s, pos, noisy);
+            if (!(stamped > 0.0f)) continue;    // 0 adds nothing to the max
+            uint idx = uint(py - p.originPxY) * uint(p.boxPixW) + uint(px - p.originPxX);
+            // Slot-major (slot * pixelCount + idx): a segment's inner loop walks
+            // consecutive idx (contiguous writes), and the composite's per-pixel loop
+            // reads consecutive idx across threads (coalesced). Non-negative float bit
+            // patterns order like the floats, so the integer max is the float max — and
+            // max is commutative, so segment order is irrelevant.
+            atomic_fetch_max_explicit(&splatMax[slot * pixelCount + idx],
+                                      as_type<uint>(stamped), memory_order_relaxed);
+        }
+    }
+}
+
+// One thread per box pixel. Replays this batch's `slotsPerPixel` slots in visible-
+// stroke order into the persistent per-pixel accumulator, then zeroes each slot so the
+// next batch's splat writes start clean (one clear total, not one per batch).
+kernel void liveSplatCompositeKernel(
+    constant LiveSplatParams &p [[buffer(0)]],
+    device uint *splatMax [[buffer(1)]],                   // non-atomic read + clear
+    const device uint *visStrokeIDs [[buffer(2)]],         // ordinal -> stroke id
+    const device float4 *strokeColor [[buffer(3)]],
+    const device uint *strokeFlags [[buffer(4)]],
+    device float4 *splatAcc [[buffer(5)]],                 // persistent per-pixel accumulator
+    texture2d<float, access::sample> noiseTex [[texture(0)]],
+    sampler noiseSampler [[sampler(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= uint(p.boxPixW) || gid.y >= uint(p.boxPixH)) return;
+    uint idx = gid.y * uint(p.boxPixW) + gid.x;
+    int px = p.originPxX + int(gid.x);
+    int py = p.originPxY + int(gid.y);
+
+    float noiseVal = 1.0f;
+    if ((p.flags & 0x1u) != 0u && noiseTex.get_width() > 0) {
+        float2 noiseUV = fract(float2(float(px), float(py)) / (float(noiseTex.get_width()) * 0.4f));
+        noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
+    }
+
+    float4 acc = splatAcc[idx];
+    uint pixelCount = uint(p.boxPixW) * uint(p.boxPixH);
+    device uint *slots = splatMax + idx;              // slot-major: slot * pixelCount + idx
+    for (uint k = 0; k < p.slotsPerPixel; ++k) {
+        uint bits = slots[k * pixelCount];
+        slots[k * pixelCount] = 0u;                   // consumed: next batch starts clean
+        if (bits == 0u) continue;
+        float v = as_type<float>(bits);
+        if (v < 0.001f) continue;             // walk's per-stroke threshold
+        uint stroke = visStrokeIDs[p.batchStart + k];
+        float4 col = strokeColor[stroke];
+        uint fl = strokeFlags[stroke];
+        if ((fl & 0x2u) != 0u) {
+            float inverted = 1.0f - v;
+            float noiseAdd = (v * 0.94f) + noiseVal;
+            float a = (1.0f - saturate(inverted / noiseAdd)) * col.a;
+            if (a > 0.0001f) perTileCompositeStroke(acc, col, fl, a);
+        } else {
+            perTileCompositeStroke(acc, col, fl, v * col.a);
+        }
+    }
+    splatAcc[idx] = acc;
+}
+
+// One thread per box pixel: writes the finished accumulator into the layer target,
+// exactly like the walk kernels' single `target.write` (cleared texture = untouched
+// pixels stay transparent).
+kernel void liveSplatWriteKernel(
+    constant LiveSplatParams &p [[buffer(0)]],
+    const device float4 *splatAcc [[buffer(1)]],
+    texture2d<float, access::read_write> target [[texture(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= uint(p.boxPixW) || gid.y >= uint(p.boxPixH)) return;
+    uint idx = gid.y * uint(p.boxPixW) + gid.x;
+    float4 acc = splatAcc[idx];
+    if (acc.a <= 0.0001f) return;
+    uint2 pixel = uint2(uint(p.originPxX) + gid.x, uint(p.originPxY) + gid.y);
+    if (pixel.x >= target.get_width() || pixel.y >= target.get_height()) return;
+    target.write(acc, pixel);
+}
+
 // MARK: - GPU tile binning (live view `bin` stage)
 //
 // Moves the per-frame bulk CPU work — camera re-mapping, per-segment tile ranges, tile

@@ -132,3 +132,89 @@ The identity step is the real gate: any mismatch means the prune-disk ⇔ walk-c
    progressively toward regular zoom, gating each step.
 5. `ART_LIVE_SPLAT_BATCH` (default 128) trades dispatches for composite-loop width; the
    total composite work (pixels × visible strokes) is independent of it.
+
+---
+
+# Round 2 — the metallib was stale, and the zoom-in dot blow-up
+
+## The measurements above defaulted to the walk
+
+The round-1 Mac run reported:
+
+```
+Live view: liveSplatKernel not in metallib — CPU binning for now
+Live view: liveSplatCompositeKernel not in metallib — CPU binning for now
+Live view: liveSplatWriteKernel not in metallib — CPU binning for now
+```
+
+So `useSplat` was false on every layer and the whole run was the walk — `render+comp`
+36/34/30/15 ms are *unchanged walk* numbers, and the "splat A/B IDENTICAL" result was
+vacuous (walk vs walk). Proof it was a stale artifact, not a code path: the installed
+`Sources/ArtRenderLibrary/ArtRenderShaders.metallib` contains `liveBinChunkSortV4Kernel`
+but no `liveSplat*`, and the file is unmodified in git — i.e. it is the round‑1 build.
+
+`Scripts/build-metallib.sh` now lists every live kernel (V4 sort + the three splat
+kernels) in `LIVE_KERNELS`, so a metallib missing one is reported as `MISSING:` and
+`install` refuses it. The renderer also prints a loud one-liner when the splat kernels
+are absent. **Rebuild the metallib before any splat measurement.**
+
+## The zoomed-in single point (dots.art)
+
+A pen "dot" is a *fully degenerate span* — all four control points equal. `isSafeAngle`
+calls a zero-length tangent unsafe, so `flattenAndBuild` recursed to the depth cap and
+appended **2^9 = 512 byte-identical** type‑2 segments per dot. dots.art has four dots:
+`2 + 4·512 = 2050` segments, all four dots duplicated 512× (measured: `unique 1` per
+dot). At zoom 20 the walk is `tiles × 256 px × entries`, so one dot costs
+`8160 · 256 · 512` ≈ 1.07 G iterations → the >100 ms frame. The 3‑point stroke is a real
+2‑segment spline → 6 ms.
+
+Fix: `flattenAndBuild` detects `p0 == p1 == p2 == p3` and emits the single stamp the
+existing `h_chord < 1` rule already selects. A stroke's coverage is unioned (live path:
+per-stroke `curMax`; static path: `maxCoverage` across the stroke's stamps and the
+two-pass mask), so the 512 copies were redundant → **pixel-identical**, and dots.art
+drops from 2050 to 6 segments. This is a *geometry* fix, so it also un-bloats any other
+dots in any document (it is not splat-specific, and it does not depend on the
+`radiusFactor` gate).
+
+## Correctness invariant, stated precisely
+
+The disk path needs `prune_dev ≤ pad_dev`, i.e. `margin_doc·rf ≤ 0.4·r_doc·rf + 1`
+(`pad = 1.4·rMax_dev + 1`). For `r_doc ≥ 2` (`margin_doc = 0.375·r_doc`) that holds for
+**any** `rf`; for `r_doc < 2` it degrades at large `rf`. So the kernel's per-segment
+`prune <= pad` test is the real correctness switch, and `ART_LIVE_SPLAT_MAX_RF = 1.0` is
+a *performance* gate (below it the disk is cheap; above it the disk can exceed the tile
+band, so the walk is not worse). Do not raise `MAX_RF` expecting a win at zoom-in — the
+tile is only 16 px, so the walk's expansion waste shrinks as `r_dev` grows.
+
+## Next round (corrected)
+
+```sh
+sh Scripts/build-metallib.sh          # MUST print: OK: all N kernels/functions present
+swift build -c release
+# expect at launch: "Live view: GPU tile binning ready" and NO "SPLAT kernels missing"
+```
+
+Then redo the round‑1 steps 1–4 (tripwire, kaos gate, splat A/B, BINTIME) and report the
+`livebin` lines. Also re-check dots zoom 20: it should now be ~6 segments and fast
+*before* any splat involvement.
+
+## Round 2b — the vanish bug: the splat never composited the layer
+
+With the kernels actually loaded, every layer using the splat **disappeared** as it
+crossed the slot budget while zooming out (`[splat N×128]` in the log was the tell).
+Cause: the walk path ends with `encodeTail`, which does *two* dispatches — the per-tile
+render into `gpuRenderTarget`, **and** `liveCompositeLayerKernel` stacking that layer
+onto `liveCanvasTexture` with the layer opacity. The splat branch wrote the layer texture
+and returned `true`, so the caller `continue`d and the canvas never received the layer.
+
+Fix: after the splat write kernel, encode the same layer composite
+(`compositePipeline` ← `liveCompositeLayerPipeline`, `layerTex` at texture 0, `canvas` at
+texture 1, opacity at buffer 0, `Self.liveGroups(width:height:)`). **Any future
+early-return path must end with this composite** — writing `gpuRenderTarget` alone is not
+enough to make a layer appear.
+
+First real splat numbers (zoom 0.21, layer 0 = 24733 segs / 484 tiles): `render+comp`
+≈ 16 ms vs the walk's ≈ 34 ms, i.e. ~2×. The win grows as the box shrinks (the walk is
+`256 × Σ incidences`; the splat composite floor is `pixels × visibleStrokes`).
+
+

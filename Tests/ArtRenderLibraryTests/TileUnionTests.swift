@@ -138,6 +138,36 @@ final class SegmentPruneTests: XCTestCase {
             XCTAssertEqual(Double(Float(bitPattern: s.padding1)), 21.875, accuracy: 1e-4)
         }
     }
+
+    /// Regression: a pen "dot" is a fully degenerate span (all four control points equal).
+    /// `isSafeAngle` calls zero-length tangents unsafe, so the flattener used to recurse to
+    /// the depth cap and emit 2^9 byte-identical type-2 segments per dot — dots.art has
+    /// four such dots = 2048 duplicate segments, which is what made a zoomed-in dot frame
+    /// cost >100 ms in the per-tile walk (8160 tiles × 256 px × 512 entries). The renderer
+    /// unions a stroke's coverage (per-stroke max, and both static paths take maxCoverage
+    /// across a stroke's stamps), so one stamp is pixel-identical.
+    func testDegenerateDotSpanEmitsExactlyOneStamp() {
+        let p = CGPoint(x: 939.984375, y: 522)
+        var segs: [GPUSplineSegment] = []
+        flattenAndBuild(span: CRPointSpan(p0: p, p1: p, p2: p, p3: p),
+                        rSpan: CRScalarSpan(s0: 64, s1: 64, s2: 64, s3: 64),
+                        oSpan: CRScalarSpan(s0: 1, s1: 1, s2: 1, s3: 1),
+                        seed: 0, into: &segs, isPolyline: false, isMarker: false)
+        XCTAssertEqual(segs.count, 1)
+        XCTAssertEqual(segs.first?.segmentType, 2)   // the `h_chord < 1` soft-envelope stamp
+    }
+
+    /// The degenerate fix must not change a genuinely curved span — those still subdivide
+    /// into many distinct segments.
+    func testCurvedSpanStillSubdivides() {
+        var segs: [GPUSplineSegment] = []
+        flattenAndBuild(span: CRPointSpan(p0: CGPoint(x: 0, y: 0), p1: CGPoint(x: 0, y: 0),
+                                          p2: CGPoint(x: 100, y: 0), p3: CGPoint(x: 100, y: 60)),
+                        rSpan: CRScalarSpan(s0: 5, s1: 5, s2: 5, s3: 5),
+                        oSpan: CRScalarSpan(s0: 1, s1: 1, s2: 1, s3: 1),
+                        seed: 0, into: &segs, isPolyline: false, isMarker: false)
+        XCTAssertGreaterThan(segs.count, 1)
+    }
 }
 
 /// Regression: the per-pixel prune radius (`padding1`, a distance) must be rescaled with the
