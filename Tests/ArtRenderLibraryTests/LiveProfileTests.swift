@@ -100,6 +100,252 @@ final class LiveProfileTests: XCTestCase {
                      strokes, segments, maxSegmentsPerStroke))
     }
 
+    /// Per-frame CPU planning cost (`bin`) for one document, measured without Metal.
+    ///
+    /// `BINTIME` puts kaos at `bin 39` against `gpu 39` once allocation is reported
+    /// separately, so the CPU half of a live frame now costs as much as the GPU half and
+    /// almost all of it sits in the prefix that builds the tile plan. The tile *counts*
+    /// come from the GPU on macOS; this test replicates them with the exact kernel formula
+    /// (`liveBinRangeForSeg` + layer-box clamp) and times the stages the CPU owns, so the
+    /// split can be found on Linux instead of by guessing from one aggregate number.
+    ///
+    ///     ART_LIVE_PROFILE_BIN=art/kaos.art swift test --filter testProfileBinPlan
+    func testProfileBinPlan() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let spec = environment["ART_LIVE_PROFILE_BIN"] else {
+            throw XCTSkip("set ART_LIVE_PROFILE_BIN=art/kaos.art to measure the bin plan")
+        }
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // ArtRenderLibraryTests
+            .deletingLastPathComponent()   // Tests
+            .deletingLastPathComponent()   // repo root
+        let url = spec.hasPrefix("/") ? URL(fileURLWithPath: spec)
+                                      : URL(fileURLWithPath: spec, relativeTo: repoRoot)
+        let data = try Data(contentsOf: url)
+        guard let art = ArtParser(data: [UInt8](data)) else {
+            XCTFail("parse failed: \(url.path)")
+            return
+        }
+        // `art2png` always renders the live view on a 1920×1080 canvas at scale 1, so at
+        // zoom 1 the camera is the identity and `radiusFactor` is exactly 1 — the same
+        // numbers the CLI run reports.
+        let renderer = Renderer(canvasSize: CGSize(width: 1920, height: 1080), scale: 1.0)
+        guard let cache = renderer.buildLiveRenderCacheGeometry(art: art),
+              let position = cache.layers.firstIndex(where: { !$0.needsRebuild }) else {
+            XCTFail("no cached layer in \(url.lastPathComponent)")
+            return
+        }
+        let layer = cache.layers[position]
+        let viewport = CGSize(width: 1920, height: 1080)
+        let viewportRect = CGRect(origin: .zero, size: viewport)
+        let camera = LiveViewTransform()
+            .matrix(canvasPixelSize: viewport, viewportSize: viewport).affineTransform
+        let ca = Float(camera.a), cb = Float(camera.b)
+        let cc = Float(camera.c), cd = Float(camera.d)
+        let ctx = Float(camera.tx), cty = Float(camera.ty)
+        let radiusFactor = (sqrt(ca * ca + cc * cc) + sqrt(cb * cb + cd * cd)) / 2
+        let tileSize = 16
+        let (tilesX, tilesY) = GpuBinSpec.tileGrid(viewportWidth: 1920, viewportHeight: 1080,
+                                                   tileSize: tileSize)
+        let texW = Float(viewport.width), texH = Float(viewport.height)
+        let invTile = Float(1.0 / Double(tileSize))
+
+        // Reference data, built exactly like `ensureBinRefState`: blocks never span
+        // strokes and carry their doc-space corner AABB + max radius.
+        var strokes: [LiveCachedStroke] = []
+        var blockFirst: [Int] = [], blockCount: [Int] = []
+        var blockStroke: [Int32] = [], blockSegStart: [Int32] = []
+        var blockRects: [SIMD4<Float>] = [], blockMaxRadius: [Float] = []
+        var segTotal = 0
+        for op in layer.ops {
+            guard case .stroke(let s) = op else { continue }
+            let sid = Int32(strokes.count)
+            strokes.append(s)
+            blockFirst.append(blockRects.count)
+            var nBlocks = 0
+            var bi = 0
+            while bi < s.segments.count {
+                var bx0 = Float.greatestFiniteMagnitude, bx1 = -Float.greatestFiniteMagnitude
+                var by0 = Float.greatestFiniteMagnitude, by1 = -Float.greatestFiniteMagnitude
+                var bR = Float(0)
+                var n = 0
+                while bi < s.segments.count && n < GpuBinSpec.pruneBlockSize {
+                    let seg = s.segments[bi]
+                    bx0 = min(bx0, min(min(seg.p0.x, seg.p1.x), min(seg.p2.x, seg.p3.x)))
+                    bx1 = max(bx1, max(max(seg.p0.x, seg.p1.x), max(seg.p2.x, seg.p3.x)))
+                    by0 = min(by0, min(min(seg.p0.y, seg.p1.y), min(seg.p2.y, seg.p3.y)))
+                    by1 = max(by1, max(max(seg.p0.y, seg.p1.y), max(seg.p2.y, seg.p3.y)))
+                    bR = max(bR, max(seg.radius0, seg.radius1))
+                    bi += 1
+                    n += 1
+                }
+                blockStroke.append(sid)
+                blockSegStart.append(Int32(segTotal + bi - n))
+                blockRects.append(SIMD4<Float>(bx0, by0, bx1, by1))
+                blockMaxRadius.append(bR)
+                nBlocks += 1
+            }
+            blockCount.append(nBlocks)
+            segTotal += s.segments.count
+        }
+
+        // ── The cull: what `renderCachedLayerGPUThrowing` does before the GPU is touched.
+        var vis: [Int] = []
+        var box: (minX: Int, minY: Int, maxX: Int, maxY: Int)? = nil
+        let cullMs = Self.measure {
+            vis.removeAll(keepingCapacity: true)
+            box = nil
+            var sid = -1
+            for s in strokes {
+                sid += 1
+                guard LiveRenderCache.intersects(s.bounds, camera: camera,
+                                                 viewport: viewportRect) else { continue }
+                vis.append(sid)
+                let p0 = CGPoint(x: s.bounds.minX, y: s.bounds.minY).applying(camera)
+                let p1 = CGPoint(x: s.bounds.maxX, y: s.bounds.minY).applying(camera)
+                let p2 = CGPoint(x: s.bounds.maxX, y: s.bounds.maxY).applying(camera)
+                let p3 = CGPoint(x: s.bounds.minX, y: s.bounds.maxY).applying(camera)
+                let minX = Float(min(min(p0.x, p1.x), min(p2.x, p3.x)))
+                let maxX = Float(max(max(p0.x, p1.x), max(p2.x, p3.x)))
+                let minY = Float(min(min(p0.y, p1.y), min(p2.y, p3.y)))
+                let maxY = Float(max(max(p0.y, p1.y), max(p2.y, p3.y)))
+                guard let tb = GpuBinSpec.tileBoxForAABB(minX: minX, minY: minY,
+                                                         maxX: maxX, maxY: maxY,
+                                                         texW: texW, texH: texH,
+                                                         tilesX: tilesX, tilesY: tilesY,
+                                                         invTile: invTile) else { continue }
+                box = GpuBinSpec.unionTileBox(box, with: tb)
+            }
+        }
+        guard let b = box else {
+            XCTFail("nothing visible")
+            return
+        }
+        let boxW = b.maxX - b.minX + 1, boxH = b.maxY - b.minY + 1
+        let boxTiles = boxW * boxH
+        let visibleSet = Set(vis)
+
+        // ── Tile counts. The GPU's fused transform+count dispatch does this on macOS; the
+        // formula is copied from `liveBinRangeForSeg` + the layer-box clamp so the table
+        // stages below see the real incidence totals.
+        var counts = [UInt32](repeating: 0, count: boxTiles)
+        for (sid, s) in strokes.enumerated() {
+            let visible = visibleSet.contains(sid)
+            for seg in s.segments {
+                guard visible else { continue }
+                let r0 = seg.radius0 * radiusFactor, r1 = seg.radius1 * radiusFactor
+                let pad = 1.4 * max(r0, r1) + 1
+                let x1 = ca * seg.p1.x + cc * seg.p1.y + ctx
+                let y1 = cb * seg.p1.x + cd * seg.p1.y + cty
+                let x2 = ca * seg.p2.x + cc * seg.p2.y + ctx
+                let y2 = cb * seg.p2.x + cd * seg.p2.y + cty
+                let minX = min(x1, x2) - pad, maxX = max(x1, x2) + pad
+                let minY = min(y1, y2) - pad, maxY = max(y1, y2) + pad
+                if maxX < 0 || minX > texW || maxY < 0 || minY > texH { continue }
+                let loX = max(0, min(tilesX - 1, Int(minX * invTile)))
+                let hiX = max(0, min(tilesX - 1, Int(maxX * invTile)))
+                let loY = max(0, min(tilesY - 1, Int(minY * invTile)))
+                let hiY = max(0, min(tilesY - 1, Int(maxY * invTile)))
+                let cx0 = max(loX, b.minX), cx1 = min(hiX, b.maxX)
+                let cy0 = max(loY, b.minY), cy1 = min(hiY, b.maxY)
+                if cx0 > cx1 || cy0 > cy1 { continue }
+                var ty = cy0
+                while ty <= cy1 {
+                    var t = (ty - b.minY) * boxW + (cx0 - b.minX)
+                    for _ in cx0...cx1 { counts[t] += 1; t += 1 }
+                    ty += 1
+                }
+            }
+        }
+        let total = counts.reduce(0) { $0 + Int($1) }
+
+        // ── The stages `bin` actually owns.
+        let combineMs = Self.measure { _ = GpuBinSpec.combine(counts: counts) }
+        let (entries, starts, combinedTotal) = GpuBinSpec.combine(counts: counts)
+
+        let tableMs = Self.measure {
+            _ = GpuBinSpec.strokeBlockTable(
+                visibleStrokes: vis,
+                blockFirst: blockFirst, blockCount: blockCount,
+                blockStroke: blockStroke, blockSegStart: blockSegStart,
+                blockRects: blockRects, blockMaxRadius: blockMaxRadius,
+                camera: (a: ca, b: cb, c: cc, d: cd, tx: ctx, ty: cty),
+                radiusFactor: radiusFactor, tileCounts: counts,
+                box: b, texW: Int(texW), texH: Int(texH),
+                tilesX: tilesX, tilesY: tilesY, invTile: invTile)
+        }
+        let table = GpuBinSpec.strokeBlockTable(
+            visibleStrokes: vis,
+            blockFirst: blockFirst, blockCount: blockCount,
+            blockStroke: blockStroke, blockSegStart: blockSegStart,
+            blockRects: blockRects, blockMaxRadius: blockMaxRadius,
+            camera: (a: ca, b: cb, c: cc, d: cd, tx: ctx, ty: cty),
+            radiusFactor: radiusFactor, tileCounts: counts,
+            box: b, texW: Int(texW), texH: Int(texH),
+            tilesX: tilesX, tilesY: tilesY, invTile: invTile)
+
+        let sortChunk = LiveConfig.sortChunkSize()
+        let chunkMs = Self.measure {
+            _ = GpuBinSpec.chunkTable(entries: entries, chunkSize: sortChunk)
+        }
+        let (sortChunks, _, mergePasses) = GpuBinSpec.chunkTable(entries: entries,
+                                                                chunkSize: sortChunk)
+        let mergeMs = Self.measure {
+            _ = GpuBinSpec.mergePlan(entries: entries, mergePasses: mergePasses,
+                                     chunkSize: sortChunk,
+                                     unitSize: LiveConfig.mergeUnitSize())
+        }
+
+        // The four `memcpy`s into the shared buffers: entries (tile list) + starts +
+        // sort chunks + the block table's header/entries.
+        let dst = UnsafeMutableRawPointer.allocate(byteCount: 1 << 24, alignment: 64)
+        defer { dst.deallocate() }
+        let copyMs = Self.measure {
+            entries.withUnsafeBytes { raw in
+                if let src = raw.baseAddress { memcpy(dst, src, min(raw.count, 1 << 24)) }
+            }
+            starts.withUnsafeBytes { raw in
+                if let src = raw.baseAddress { memcpy(dst, src, raw.count) }
+            }
+            sortChunks.withUnsafeBytes { raw in
+                if let src = raw.baseAddress { memcpy(dst, src, min(raw.count, 1 << 24)) }
+            }
+            table.header.withUnsafeBytes { raw in
+                if let src = raw.baseAddress { memcpy(dst, src, min(raw.count, 1 << 24)) }
+            }
+            table.entries.withUnsafeBytes { raw in
+                if let src = raw.baseAddress { memcpy(dst, src, min(raw.count, 1 << 24)) }
+            }
+        }
+
+        print("\n=== bin plan: \(url.lastPathComponent) (1920×1080, zoom 1) ===")
+        print(String(format: "  strokes %d visible %d | segments %d | box %d×%d = %d tiles",
+                     strokes.count, vis.count, segTotal, boxW, boxH, boxTiles))
+        print(String(format: "  incidences %d (%d/tile max-ish) | chunks %d passes %d | blocks %d entries %d",
+                     total, boxTiles > 0 ? total / boxTiles : 0,
+                     sortChunks.count, mergePasses, table.totalBlocks, table.entries.count))
+        print(String(format: "  cull        %7.2f ms", cullMs))
+        print(String(format: "  combine     %7.2f ms", combineMs))
+        print(String(format: "  blockTable  %7.2f ms", tableMs))
+        print(String(format: "  chunkTable  %7.2f ms", chunkMs))
+        print(String(format: "  mergePlan   %7.2f ms", mergeMs))
+        print(String(format: "  memcpys     %7.2f ms", copyMs))
+        print(String(format: "  SUM         %7.2f ms  (combined total %d)",
+                     cullMs + combineMs + tableMs + chunkMs + mergeMs + copyMs, combinedTotal))
+    }
+
+    /// Minimum of three runs: Swift on Linux pays lazy-page and allocator costs on the
+    /// first pass, and the interactive frame sees the steady state.
+    private static func measure(_ body: () -> Void) -> Double {
+        var best = Double.greatestFiniteMagnitude
+        for _ in 0..<3 {
+            let start = DispatchTime.now().uptimeNanoseconds
+            body()
+            best = min(best, ms(since: start))
+        }
+        return best
+    }
+
     private static func ms(since start: UInt64) -> Double {
         Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000.0
     }

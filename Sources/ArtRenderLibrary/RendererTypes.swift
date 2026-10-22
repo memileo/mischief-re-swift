@@ -303,11 +303,21 @@ public enum LiveConfig {
 
     /// Stroke-box pruning in the per-tile composite kernels (default on; set
     /// `ART_LIVE_STROKE_PRUNE=0` to A/B against the direct segment walk). Only dense
-    /// tiles participate (see `GpuBinSpec.strokePruneMinTileEntries`) and a dropped
-    /// table (budget exceeded) keeps the exact behaviour, just slower.
+    /// tiles participate (see `GpuBinSpec.strokePruneMinTileEntries`), the table is
+    /// dropped when it cannot pay for itself (see `strokeBlockTable`'s usability gate)
+    /// and a dropped table keeps the exact behaviour, just with the plain segment walk.
     public static func strokePruneEnabled(environment: [String: String]? = nil) -> Bool {
         let env = environment ?? ProcessInfo.processInfo.environment
         return env["ART_LIVE_STROKE_PRUNE"] != "0"
+    }
+
+    /// Build the stroke-block table even when the usability gate says its block boxes are
+    /// too coarse to skip anything (`ART_LIVE_STROKE_PRUNE=2`). Measurement knob only: the
+    /// pixels are identical either way, so this A/Bs the table's GPU value against its CPU
+    /// build cost (kaos zoom 1: ~39 ms of `bin` and a 36 MB upload for ~1.5M entries).
+    public static func strokePruneForced(environment: [String: String]? = nil) -> Bool {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        return env["ART_LIVE_STROKE_PRUNE"] == "2"
     }
 
     /// Sort chunk size override (`ART_LIVE_SORT_CHUNK`, clamped 64…1024, default 512).
@@ -777,7 +787,10 @@ public enum GpuBinSpec {
     /// ascending, so per-tile appends need no sort; blocks never span strokes, so
     /// segment runs and stroke-completion boundaries both stay exact). A tile below
     /// the density gate gets no entries — the kernel walks its segments directly,
-    /// exactly as before. A total above `budget` drops the table for this frame.
+    /// exactly as before. A total above `budget`, or a table estimated to touch at least
+    /// half as many (tile, block) pairs as the tile list has incidences, drops the table
+    /// for this frame: at that density a box test per block cannot skip enough segments to
+    /// pay for itself (kaos zoom 1: 1.50M entries vs 1.45M incidences).
     /// Pure float/int logic, runs on Linux; the Metal kernels mirror the walk.
     public static func strokeBlockTable(visibleStrokes: [Int],
                                         blockFirst: [Int], blockCount: [Int],
@@ -792,13 +805,15 @@ public enum GpuBinSpec {
                                         texW: Int, texH: Int, tilesX: Int, tilesY: Int,
                                         invTile: Float,
                                         minEntries: Int = strokePruneMinTileEntries,
-                                        budget: Int = strokePruneBudget)
-        -> (header: [UInt32], entries: [GpuBinStrokeBlock], totalBlocks: Int) {
+                                        budget: Int = strokePruneBudget,
+                                        force: Bool = false)
+        -> (header: [UInt32], entries: [GpuBinStrokeBlock], totalBlocks: Int,
+            blockTileEstimate: Int) {
         let boxW = max(box.maxX - box.minX + 1, 0)
         let boxH = max(box.maxY - box.minY + 1, 0)
         let boxTiles = boxW * boxH
         var header = [UInt32](repeating: 0, count: boxTiles * 2)
-        guard boxTiles > 0, tileCounts.count >= boxTiles else { return (header, [], 0) }
+        guard boxTiles > 0, tileCounts.count >= boxTiles else { return (header, [], 0, 0) }
 
         // One pass over visible strokes' blocks, caching each block's padded device
         // box + tile range (pass 1 counts appends, pass 2 fills). Blocks absent from
@@ -809,6 +824,10 @@ public enum GpuBinSpec {
         var devRanges: [(minX: Int, minY: Int, maxX: Int, maxY: Int)] = []
         devRanges.reserveCapacity(blockRects.count)
         var perTile = [Int](repeating: 0, count: boxTiles)
+        // Upper bound on the finished table's size, accumulated in this same pass (the
+        // clamped area of every block's tile box). The usability gate below needs it
+        // BEFORE the O(entries) work, which is the expensive part.
+        var blockTileEstimate = 0
 
         for sid in visibleStrokes {
             guard sid >= 0, sid < blockCount.count, sid < blockFirst.count else { continue }
@@ -857,20 +876,52 @@ public enum GpuBinSpec {
                 devRanges.append(tb)
                 let loX = max(tb.minX, box.minX), hiX = min(tb.maxX, box.maxX)
                 let loY = max(tb.minY, box.minY), hiY = min(tb.maxY, box.maxY)
-                var ly = loY
-                while ly <= hiY {
-                    var lx = loX
-                    while lx <= hiX {
-                        let t = (ly - box.minY) * boxW + (lx - box.minX)
-                        if Int(tileCounts[t]) >= minEntries { perTile[t] += 1 }
-                        lx += 1
-                    }
-                    ly += 1
+                if loX <= hiX && loY <= hiY {
+                    blockTileEstimate += (hiX - loX + 1) * (hiY - loY + 1)
                 }
             }
         }
+
+        // Usability gate. A block entry only pays for itself if a pixel rejects the block
+        // and skips its segments; when the block boxes touch as many tiles as the tile list
+        // has incidences, every pixel pays one box test per block AND still walks the same
+        // segments — pure loss. Measured on kaos zoom 1 (long scribble strokes, so a
+        // 32-segment AABB spans ~150 tiles): 1.50M block-tile entries against 1.45M
+        // incidences, ~39 ms of CPU per frame to build, a 36 MB upload, and ~380M extra box
+        // tests on the GPU. Requiring the table to at least halve the per-tile candidate
+        // count still keeps it wherever it can prune (short strokes, large tiles), and a
+        // dropped table changes no pixel — the kernels walk the tile list directly.
+        //
+        // `bound` is an upper bound on the entries (so declining early is always safe): no
+        // block can own more entries than its box area, and none can own more than one per
+        // dense tile. The second bound is what keeps sparse views from being rejected on a
+        // box area that is mostly below the density gate.
+        let incidences = tileCounts.reduce(0) { $0 + Int($1) }
+        let denseTiles = tileCounts.reduce(0) { $0 + (Int($1) >= minEntries ? 1 : 0) }
+        let bound = min(blockTileEstimate, devRanges.count * denseTiles)
+        if !force && bound * 2 > incidences {
+            return (header, [], 0, bound)
+        }
+
+        // Pass 2: per-tile participation counts (only dense tiles take part).
+        for tb in devRanges where tb.minY < tb.maxY {
+            let loX = max(tb.minX, box.minX), hiX = min(tb.maxX, box.maxX)
+            let loY = max(tb.minY, box.minY), hiY = min(tb.maxY, box.maxY)
+            if loX > hiX || loY > hiY { continue }
+            var ly = loY
+            while ly <= hiY {
+                var t = (ly - box.minY) * boxW + (loX - box.minX)
+                var lx = loX
+                while lx <= hiX {
+                    if Int(tileCounts[t]) >= minEntries { perTile[t] += 1 }
+                    t += 1
+                    lx += 1
+                }
+                ly += 1
+            }
+        }
         let total = perTile.reduce(0, +)
-        if total > budget { return (header, [], 0) }
+        if total > budget { return (header, [], 0, bound) }
 
         var start = 0
         for t in 0..<boxTiles {
@@ -915,7 +966,7 @@ public enum GpuBinSpec {
                 }
             }
         }
-        return (header, entries, total)
+        return (header, entries, total, bound)
     }
 }
 

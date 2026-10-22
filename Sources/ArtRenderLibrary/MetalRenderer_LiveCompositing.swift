@@ -1202,7 +1202,8 @@ extension MetalRenderer {
                 tileCounts: countsArr,
                 box: (box.minX, box.minY, box.maxX, box.maxY),
                 texW: Int(texW), texH: Int(texH), tilesX: tilesX, tilesY: tilesY,
-                invTile: invTile)
+                invTile: invTile,
+                force: LiveConfig.strokePruneForced())
             if table.totalBlocks > 0 {
                 if ref.groupHeaderCap < boxTiles {
                     let aHdr = DispatchTime.now().uptimeNanoseconds
@@ -1241,8 +1242,15 @@ extension MetalRenderer {
                 groupHeaderBuf = hd
                 groupEntryBuf = gr
             } else {
-                // No dense tiles at this view: an empty header makes the kernels walk
-                // segments directly (identical to before this table existed).
+                // No dense tiles, or a table that could not pay for itself (see the
+                // usability gate in `strokeBlockTable`): an empty header makes the kernels
+                // walk segments directly (identical output, no per-block box tests).
+                if LiveConfig.binStageTimingEnabled() {
+                    let incidences = countsArr.reduce(0) { $0 + Int($1) }
+                    print("livebin layer \(position): prune table skipped — "
+                          + "\(table.blockTileEstimate) block-tile pairs vs \(incidences) "
+                          + "incidences; walking the tile list")
+                }
                 groupHeaderBuf = liveEmptyGroupHeader!
                 groupEntryBuf = liveEmptyStrokeGroups!
             }

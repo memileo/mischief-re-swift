@@ -262,6 +262,16 @@ final class LiveConfigTests: XCTestCase {
         XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_LIVE_TILE_SIZE": "16!"]), 16)
     }
 
+    func testStrokePruneForcedOnlyForTwo() {
+        // `2` is the A/B escape hatch around the block table's usability gate; `0` still
+        // disables the table entirely, and everything else is the gated default.
+        XCTAssertFalse(LiveConfig.strokePruneForced(environment: [:]))
+        XCTAssertFalse(LiveConfig.strokePruneForced(environment: ["ART_LIVE_STROKE_PRUNE": "1"]))
+        XCTAssertTrue(LiveConfig.strokePruneForced(environment: ["ART_LIVE_STROKE_PRUNE": "2"]))
+        XCTAssertTrue(LiveConfig.strokePruneEnabled(environment: ["ART_LIVE_STROKE_PRUNE": "2"]))
+        XCTAssertFalse(LiveConfig.strokePruneEnabled(environment: ["ART_LIVE_STROKE_PRUNE": "0"]))
+    }
+
     func testAblateMaskDefaultsOffAndClamps() {
         // Time-attribution knob only: off unless set, and never a value the kernel's
         // five bits cannot represent (a stray env var must not change pixels).
@@ -707,6 +717,42 @@ final class GpuBinSpecTests: XCTestCase {
             budget: 1)
         XCTAssertEqual(dropped.totalBlocks, 0)
         XCTAssertTrue(dropped.header.allSatisfy { $0 == 0 })
+    }
+
+    func testStrokeBlockTableUsabilityGate() {
+        // The table only pays off if its block boxes let a pixel reject many segments at
+        // once. 64 blocks whose padded boxes each cover the whole 8×8 tile canvas, over 64
+        // dense tiles (4096 incidences) ⇒ 4096 block-tile pairs: every pixel would pay one
+        // box test per block and still walk the same segments (kaos zoom 1 in miniature).
+        let camera = (a: Float(1), b: Float(0), c: Float(0), d: Float(1),
+                      tx: Float(0), ty: Float(0))
+        let counts: [UInt32] = .init(repeating: 64, count: 64)
+        func table(_ rects: [SIMD4<Float>], force: Bool = false) -> [UInt32] {
+            GpuBinSpec.strokeBlockTable(
+                visibleStrokes: [0], blockFirst: [0], blockCount: [rects.count],
+                blockStroke: .init(repeating: 0, count: rects.count),
+                blockSegStart: (0..<rects.count).map { Int32($0 * 32) },
+                blockRects: rects, blockMaxRadius: .init(repeating: 0, count: rects.count),
+                camera: camera, radiusFactor: 1, tileCounts: counts,
+                box: (0, 0, 7, 7), texW: 128, texH: 128,
+                tilesX: 8, tilesY: 8, invTile: 1 / 16, force: force).header
+        }
+        let wide = (0..<64).map { _ in SIMD4<Float>(0, 0, 127, 127) }
+        func entries(_ header: [UInt32]) -> Int {
+            stride(from: 1, to: header.count, by: 2).reduce(0) { $0 + Int(header[$1]) }
+        }
+        XCTAssertEqual(entries(table(wide)), 0)
+        // Tight blocks (one tile each, so ~12 tiles with the padding superset) stay: their
+        // pair count is far below the incidence count.
+        let tight = (0..<64).map { i -> SIMD4<Float> in
+            let x = Float((i % 8) * 16), y = Float((i / 8) * 16)
+            return SIMD4<Float>(x, y, x + 15, y + 15)
+        }
+        let tightEntries = entries(table(tight))
+        XCTAssertGreaterThan(tightEntries, 0)
+        XCTAssertLessThan(tightEntries, 4096 / 2)
+        // `ART_LIVE_STROKE_PRUNE=2` forces the declined table back, for A/B measurement.
+        XCTAssertEqual(entries(table(wide, force: true)), 4096)
     }
 
     func testStrokeBlockTableCoversScatterRanges() {

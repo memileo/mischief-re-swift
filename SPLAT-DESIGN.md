@@ -448,4 +448,72 @@ legend. Then pick the branch below.
    7800 counters) become the next target: a threadgroup-local histogram with one global
    atomic per distinct tile.
 
+## Round 5 — the ablation verdict, and `bin` was the block table
+
+### What the ablation said (kaos zoom 1, `--warmup 1`)
+
+| bit | `render+comp` | delta vs 0 | stage |
+|-----|---------------|------------|-------|
+| 0 (shipping) | 33.69 ms | — | — |
+| 1 | 26.39 | **7.30** | SDF + coverage |
+| 2 | 21.02 | **12.67** | loop + `tileList` + segment load + block table |
+| 4 | 31.97 | 1.72 | per-stroke blend/quantise |
+| 8 | 31.73 | 1.96 | pixel write |
+| 16 | 22.64 | **11.05** | the 64-byte `segments[segIdx]` fetch |
+
+Reading: the segments are fetched with a *dependent, per-iteration* address while the SDF
+only costs 7.3 ms, and the loop/table floor (12.67) is almost entirely that same fetch
+(11.05) — the fixed loop overhead is ~1.6 ms. Blend and write are noise. The isolated
+deltas sum to 22.0 of 33.7, i.e. ~11.7 ms is latency exposure that no single stage owns,
+which is the signature of a dependency chain: `tileList[i]` → `segIdx` → 64-byte struct →
+SDF, with nothing to overlap it.
+
+Xform also fell from 8.77 to 4.34 ms with a warm frame, so the earlier atomics number was
+half cold-cache.
+
+### `bin 39` was not CPU planning — it was one table
+
+The honest timing split exposed `bin 39` against `gpu 39`, which could not be culling: the
+cull is 2214 strokes. `ART_LIVE_PROFILE_BIN=art/kaos.art swift test --filter
+testProfileBinPlan` (new, Linux, no Metal) replicated the real kaos tile counts and timed
+the stages `bin` owns:
+
+```
+cull 2.61 | combine 0.92 | blockTable 187.41 | chunkTable 1.00 | mergePlan 0.49 | memcpys 2.14
+```
+
+96 % of it in `GpuBinSpec.strokeBlockTable`, and the reason is visible in its output:
+**1,501,372 block-tile entries against 1,454,923 incidences**. kaos strokes are long
+scribbles, so a 32-segment AABB spans ~150 tiles; the table then adds a block to every tile
+its box touches. Every pixel pays one box test per listed block (~192 per tile) *and still
+walks the same ~186 segments*, so the pruning value is nil while the table costs ~39 ms of
+CPU per frame, a 36 MB upload, and ~380M extra box tests on the GPU. That single table was
+the biggest cost in the frame.
+
+**Fixed with a usability gate** in `strokeBlockTable`, decided *before* the O(entries)
+work: no block can own more entries than its clamped box area, and none can own more than
+one per dense tile, so `bound = min(areaSum, blocks × denseTiles)` is a safe upper bound.
+If `bound × 2 > incidences` the table is dropped — it cannot even halve the per-tile
+candidate count. Dropping it changes no pixel (the kernels walk the tile list directly, the
+pre-table behaviour). `ART_LIVE_STROKE_PRUNE=2` forces the table back for A/B.
+
+After the gate, the same profile prints `blockTable 7.59 | memcpys 0.01` and `blocks 0`
+(debug), i.e. release `bin` should drop from ~39 ms to a few ms.
+
+### Next
+
+1. Confirm on the Mac: `bin` should fall to single digits with `render+comp` unchanged or
+   lower, since the kernel also loses the per-pixel block-table walk. A/B the table's GPU
+   value directly with `ART_LIVE_STROKE_PRUNE=2` (identical pixels, so the only difference
+   is time) — `Scripts/stroke-prune-ab.sh --modes 0,1,2 art/kaos.art` renders all three
+   modes from separate copies and hashes the PNGs, so the identity is checked in the same
+   run. `Scripts/stroke-splat-ab.sh --all` must stay 10× IDENTICAL. No metallib rebuild
+   this round: the kernels are untouched, only the table that feeds them.
+2. Re-run `Scripts/composite-ablate.sh` afterwards: with the block table gone, the bit-2
+   floor should shrink, and the remaining attribution decides between **pix2** (bit 16
+   still large, as it is now) and the branchless SDF (bit 1 large).
+3. pix2 is the expected next structural step: one dependent fetch per *two* pixels, and two
+   interleaved SDF chains to fill the ~11.7 ms of exposed latency.
+
+
 
