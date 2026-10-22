@@ -401,6 +401,23 @@ public enum LiveConfig {
         }
         return 16
     }
+
+    /// Composite-kernel ablation mask (`ART_LIVE_ABLATE`, 0 = off, clamped 0…31).
+    /// Debug only — the pixels it produces are wrong by construction. It exists to
+    /// attribute the per-tile composite's frame time on GPUs with no per-line profiling
+    /// (AMD): run the same view once per bit and compare `render+comp`. Implemented in
+    /// `livePerTileAACompositeKernel`; noisy layers take the noise twin, which ignores
+    /// the mask. Each bit is a dispatch-uniform branch, so 0 is the shipping kernel:
+    ///   1  no SDF — isolates SDF + coverage
+    ///   2  prune rejects everything — loop + tile-list/segment loads + block table only
+    ///   4  no per-stroke blend/quantise
+    ///   8  no pixel write
+    ///   16 constant-address segment load (hoists the 64-byte fetch of the tile's segment)
+    public static func ablate(environment: [String: String]? = nil) -> Int {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        guard let v = env["ART_LIVE_ABLATE"], let n = Int(v) else { return 0 }
+        return min(max(n, 0), 31)
+    }
 }
 
 // MARK: - GPU tile binning spec (platform-independent; unit-tested on Linux)
@@ -472,8 +489,8 @@ public struct GpuBinMergePair {
 /// vectors) so Metal's 4-byte alignment matches Swift byte-for-byte: eight u32/f32
 /// fields, stride 24. The device box is half-open `[min, max)` and the pad (CPU:
 /// 1.4·maxRadius·radiusFactor + 3.5 px over the transformed block AABB) covers every
-/// stamp cutoff (AA cov > 0 needs liveSegDist < r(t)+0.44; noise cov > 0 needs
-/// liveSegDist < 1.375·max(r,1); the stored prune gate only tightens) — a pixel
+/// stamp cutoff (AA cov > 0 needs chord distance < r(t)+0.44; noise cov > 0 needs
+/// chord distance < 1.375·max(r,1); the stored prune gate only tightens) — a pixel
 /// outside the box provably stamps nothing for the block's segments, so skipping
 /// changes no output value, it only skips provably-zero work.
 public struct GpuBinStrokeBlock {

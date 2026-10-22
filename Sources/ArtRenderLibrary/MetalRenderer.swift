@@ -349,6 +349,12 @@ internal final class LiveBinRefLayer {
             print("Live view: tile size \(n) ignored — the live composite needs a multiple of 16 "
                   + "in 16…64; using \(self.liveTileSize)")
         }
+        let ablation = LiveConfig.ablate()
+        if ablation != 0 {
+            print("Live view: ART_LIVE_ABLATE=\(ablation) — composite stages are skipped for "
+                  + "time attribution; the pixels are wrong by construction "
+                  + "(per-tile AA layers only; 1 SDF, 2 prune, 4 blend, 8 write, 16 segment load)")
+        }
         
         self.commandQueue = device.makeCommandQueue()
         

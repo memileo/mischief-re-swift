@@ -341,3 +341,111 @@ splat (kaos at 0.25) is labelled `walk (splat declined)` instead of pretending t
 it. `--all` renders the standard matrix (kaos 1/0.25/0.05, logo 1/0.05, complex 1/0.3/0.05,
 dots 1/20).
 
+## Round 4 — attributing the composite, and honest CLI timings
+
+### What the Mac said
+
+* Tile 8 vs tile 16 on kaos: `xform 8.62 / 8.77`, `render+comp 36.59 / 36.63` — within
+  noise on both, and logo likewise. Tile size is **not** a lever (the work is
+  incidences × tile area, and incidences grow as the tile shrinks). 16 stays.
+* GPU frame capture: `livePerTileAACompositeKernel` ≈ **28–29 ms** on kaos zoom 1, of
+  which ≈ **12 ms** disappears when the SDFs are stubbed. The remaining ~16 ms has no
+  per-line attribution available: AMD + Metal has no shader line counters.
+* The SDF count itself is intrinsic: 7800 tiles × 256 px × ~186 incidences/px = 372 M
+  pixel-segment pairs, i.e. the drawing, not redundancy. At 12 ms that is ~31 G evals/s,
+  about 20–25 % of the card's FP32 peak — so the walk is **stall-bound, not FLOP-bound**.
+
+That last number is the whole story: 372 M iterations in 28 ms is ~320 lane-cycles per
+iteration against maybe 90 cycles of useful arithmetic. The missing time is latency and
+divergence (dependent `tileList → segments` loads, the 64-byte struct per iteration, the
+3-way branch inside the capsule SDF, the per-pixel prune branch). Guessing which one is a
+coin flip, so this round ships the instrumentation to measure it, plus the fixes that are
+certain.
+
+### `ART_LIVE_ABLATE` — attribute the kernel with uniform branches
+
+`LiveConfig.ablate` (`ART_LIVE_ABLATE`, clamped 0…31) lands in `PerTileParams.ablate` and
+is read once per thread in `livePerTileAACompositeKernel`. Every bit is a *uniform* branch
+(same for the whole dispatch), so with 0 the kernel is unchanged and with a bit set the
+timing delta is the stage's cost. The pixels are wrong by construction — it is a
+measurement tool, never a shipping path. The renderer prints a note when it is set.
+
+| bit | stage removed | what the delta means |
+|-----|---------------|----------------------|
+| 1 | SDF | SDF + coverage (`signedDist → smootherstep`) |
+| 2 | prune rejects everything | loop + `tileList` load + segment load + block table only |
+| 4 | per-stroke blend | `perTileCompositeStroke` (quantise + source-over) |
+| 8 | pixel write | the one `target.write` per pixel |
+| 16 | constant-address segment load | the 64-byte `segments[segIdx]` fetch per iteration |
+
+Read it as: `(0 − 1)` = SDF, `(0 − 4)` = blend, `(0 − 8)` = write, `(0 − 16)` = segment
+load, `2` = the fixed loop/loads/table floor. If `16` is large, the walk is memory-latency
+bound → the fix is two pixels per thread (below). If `1` is large, the SDF's divergence is
+the target → make `sdUnevenCapsule` branchless with `select` (bit-exact). If `2` is close
+to `0`, the loop body is the problem, not any one stage.
+
+Only the AA per-tile kernel honours the bits (noisy layers take the noise twin, whose
+structure differs enough that copying the branches would only add risk).
+
+### Honest BINTIME
+
+`bin` was never steady-state CPU on a one-shot CLI run: it sat inside a window that
+included every cold Metal allocation (the 20 MB segment arena, the tile list + scratch,
+the group/table buffers, and for splat views the 64 MB slot buffer) — and on the **splat**
+return it also added the whole GPU tail (`since(prefixStart)` across
+`waitUntilCompleted`), so an 18 ms splat render was reported as `bin`. kaos printing
+`bin 60` while the entire GPU was 47 ms is the tell.
+
+Now:
+* `LiveFrameTiming.allocMilliseconds` — cold buffer growth, measured around each
+  `makeBuffer` site and around `ensureBinFrameBuffers` / `ensureEmptyGroupBuffers` /
+  `ensureSplatBuffers`. Printed as `alloc` in the summary line.
+* `bin` excludes it (`bin = window − alloc`), and the splat path subtracts its GPU tail
+  (`− tRenderSplat`), which was already counted in `gpu`.
+* `art2png --live-view --warmup N` renders N throwaway frames first, so the reported
+  numbers are the steady state. Expect the first frame to show `alloc` in the tens of ms
+  and later frames to show `alloc 0`.
+
+The A/B script does not need warmup (pixels are identical), but anything used to *compare
+timings* should pass `--warmup 1`.
+
+### The prune gate: no sqrt, no division
+
+`liveSegPruned(p, a, b, r²)` replaces `liveSegDist(p, a, b) > r` at all five call sites
+(four walk kernels + the splat's disk trim). The three point-to-segment cases compare
+squared distances directly and the perpendicular case multiplies through by `|ba|²`, so
+the gate costs ~8 ops with no `sqrt` and no divide instead of a divide plus a `length`.
+`SegmentPrune.radius` stores `reach + max(0.75, 0.375·r)`, i.e. at least 0.75 px more than
+the last pixel with non-zero coverage, so the rounding difference between the two forms
+cannot flip a contributing pixel; the kaos pixel gate and `stroke-splat-ab.sh --all` are
+the check.
+
+### Next step, decided by the numbers
+
+Run this first (one command, six steady-state frames, ~5 s on kaos):
+
+```
+sh Scripts/composite-ablate.sh                     # art/kaos.art at zoom 1, 1920x1080
+sh Scripts/composite-ablate.sh art/complex.art --zoom 0.3
+```
+
+It prints the `livebin layer 0:` line and the `Live view:` summary per bit, plus the delta
+legend. Then pick the branch below.
+
+1. `ART_LIVE_ABLATE=16` ≈ `0` → not the segment load. Go to 2.
+   `16` materially lower → **two pixels per thread**: one 64-byte load and one loop
+   iteration serve two pixels, and the two SDF chains interleave (ILP into the stalls).
+   The block cursor and `nextFirst` are pixel-independent, so only `acc`, `curMax`,
+   `curStroke`, `haveCur` and `strokeActive` need a second copy; a 16×16 threadgroup then
+   covers 16×32 px (two tiles stacked) and the existing box guard already tolerates the
+   overshoot.
+2. `ART_LIVE_ABLATE=1` ≈ 12 ms and the rest is spread → the SDF's 3-way branch is the
+   cost; make `sdUnevenCapsule` a `select` over the three case distances (bit-identical
+   results, no divergence).
+3. `ART_LIVE_ABLATE=2` ≈ `0` → the loop/loads/table floor dominates; the fix is fewer
+   iterations (pix2) rather than a cheaper body.
+4. Only if the composite drops under ~10 ms does `xform` (8.8 ms, 1.45 M atomics into
+   7800 counters) become the next target: a threadgroup-local histogram with one global
+   atomic per distinct tile.
+
+

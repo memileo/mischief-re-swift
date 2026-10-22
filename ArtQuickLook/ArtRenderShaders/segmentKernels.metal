@@ -942,13 +942,22 @@ struct LiveStrokeParams {
     uint  flags;
 };
 
-// Distance from p to segment a-b (0 when inside the a/b clamp). The per-pixel prune gate
-// below uses this against the chord p1→p2 — one sqrt, versus the multi-sample spline SDF.
-static inline float liveSegDist(float2 p, float2 a, float2 b) {
+// Per-pixel prune gate: is `p` farther than `r` from the chord a→b? Exactly the predicate
+// `liveSegDist(p, a, b) > r`, but with no sqrt and no division: the three point-to-segment
+// cases compare squared distances directly (the perpendicular case multiplies through by
+// |ba|²). SegmentPrune.radius() stores `reach + max(0.75, 0.375·r)` as the prune radius, so
+// a pixel that passes the gate is still ≥0.75 px inside the SDF's coverage cutoff — the
+// rounding difference between the two forms cannot flip a contributing pixel. The kaos
+// pixel gate and the per-view A/B runs check that, since this is otherwise a pure gate.
+static inline bool liveSegPruned(float2 p, float2 a, float2 b, float r2) {
     float2 pa = p - a;
     float2 ba = b - a;
-    float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-7f), 0.0f, 1.0f);
-    return length(pa - ba * h);
+    float bb = dot(ba, ba);
+    float pb = dot(pa, ba);
+    if (pb <= 0.0f) return dot(pa, pa) > r2;                       // nearest point is a
+    if (pb >= bb) { float2 q = pa - ba; return dot(q, q) > r2; }   // nearest point is b
+    float cr = ba.x * pa.y - ba.y * pa.x;                          // perpendicular offset
+    return cr * cr > r2 * bb;
 }
 
 // Live twin of `segmentAACompositeKernel`.
@@ -998,7 +1007,7 @@ kernel void liveSegmentAACompositeKernel(
         // chord p1→p2 cannot be covered by this segment, so skip the expensive SDF. 0 = not
         // set → never prune. Output-identical.
         float pruneRadius = (seg.padding1 != 0u) ? as_type<float>(seg.padding1) : 3.4e38f;
-        if (liveSegDist(pos, seg.p1, seg.p2) > pruneRadius) continue;
+        if (liveSegPruned(pos, seg.p1, seg.p2, pruneRadius * pruneRadius)) continue;
 
         float signedDist = 1e6f;
         float t = 0.0f;
@@ -1090,7 +1099,7 @@ kernel void liveSegmentNoiseCompositeKernel(
         // Per-pixel prune (see SegmentPrune): skip segments that provably contribute no
         // coverage to this pixel. 0 = not set → never prune. Output-identical.
         float pruneRadius = (seg.padding1 != 0u) ? as_type<float>(seg.padding1) : 3.4e38f;
-        if (liveSegDist(pos, seg.p1, seg.p2) > pruneRadius) continue;
+        if (liveSegPruned(pos, seg.p1, seg.p2, pruneRadius * pruneRadius)) continue;
 
         float signedDist = 1e6f;
         float t = 0.0f;
@@ -1188,6 +1197,7 @@ struct PerTileParams {
     uint boxTilesPerRow;
     uint boxTilesPerCol;
     uint tileSize;
+    uint ablate;            // ART_LIVE_ABLATE — counting/time attribution only (0 = normal)
 };
 
 // MARK: - Per-tile AA composite (one dispatch per layer, AA only), stroke-box pruning
@@ -1197,8 +1207,8 @@ struct PerTileParams {
 // stamp box [min, max). Must match `GpuBinStrokeBlock` field for field (uint, uint,
 // four plain floats — scalar alignment, stride 24). The pad (CPU: 1.4·maxRadius·
 // radiusFactor + 3.5 px over the block's transformed AABB) covers every stamp cutoff
-// (AA cov > 0 needs signedDist < 0.44 ⇒ liveSegDist < r(t)+0.44; noise cov > 0 needs
-// liveSegDist < 1.375·max(r,1); the stored prune gate only tightens). A pixel outside
+// (AA cov > 0 needs signedDist < 0.44 ⇒ chord distance < r(t)+0.44; noise cov > 0 needs
+// chord distance < 1.375·max(r,1); the stored prune gate only tightens). A pixel outside
 // the box therefore provably stamps nothing for the block's segments — skipping it
 // changes no output value, it only skips provably-zero work.
 struct LiveStrokeGroupBlock {
@@ -1240,6 +1250,16 @@ kernel void livePerTileAACompositeKernel(
     TileIndex tc = tileStartCount[localTile];
     float2 pos = float2(pixel.x, pixel.y) + float2(0.5f, 0.5f);
 
+    // ART_LIVE_ABLATE (debug, `LiveConfig.ablate`): 0 in normal use, wrong pixels else.
+    // Every bit removes one stage so the frame time can be attributed on GPUs without
+    // per-line profiling (AMD). Measured deltas from bit 0:
+    //   1  no SDF                 → SDF + coverage time
+    //   2  prune rejects all      → loop + tile-list/segment loads + block table only
+    //   4  no per-stroke blend    → blend/quantise time
+    //   8  no pixel write         → target write time
+    //   16 constant segment load  → the 64-byte per-iteration segment load
+    const uint ablate = params.ablate;
+
     // Block skip table: per box-local tile, blocks ascending by segStart, each with a
     // conservative half-open device box. The cursor advances exactly when the walk's
     // segment index crosses a block start (nextFirst is register-cached), so skipped
@@ -1266,7 +1286,7 @@ kernel void livePerTileAACompositeKernel(
                     LiveStrokeGroupBlock g = strokeGroups[gBase + blockCursor];
                     ++blockCursor;
                     if (haveCur && curStroke != g.strokeID) {   // stroke boundary: composite the last
-                        if (curMax >= 0.001f) {
+                        if (curMax >= 0.001f && (ablate & 4u) == 0u) {
                             float4 col = strokeColor[curStroke];
                             perTileCompositeStroke(acc, col, strokeFlags[curStroke], curMax * col.a);
                         }
@@ -1283,7 +1303,7 @@ kernel void livePerTileAACompositeKernel(
         } else {
             uint sId = strokeOfSegment[segIdx];
             if (sId != curStroke) {                       // crossed into a new stroke: composite the last
-                if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f) {
+                if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f && (ablate & 4u) == 0u) {
                     float4 col = strokeColor[curStroke];
                     perTileCompositeStroke(acc, col, strokeFlags[curStroke], curMax * col.a);
                 }
@@ -1294,21 +1314,27 @@ kernel void livePerTileAACompositeKernel(
         }
         if (!strokeActive) continue;    // box-missed block: every segment stamps nothing
 
-        GPUSplineSegment seg = segments[segIdx];
+        uint segLoad = ((ablate & 16u) != 0u) ? 0u : segIdx;   // bit 16: hoistable load address
+        GPUSplineSegment seg = segments[segLoad];
         float pruneRadius = (seg.padding1 != 0u) ? as_type<float>(seg.padding1) : 3.4e38f;
-        if (liveSegDist(pos, seg.p1, seg.p2) > pruneRadius) continue;
+        bool pruned = ((ablate & 2u) != 0u)
+            ? true
+            : liveSegPruned(pos, seg.p1, seg.p2, pruneRadius * pruneRadius);
+        if (pruned) continue;
 
         float signedDist = 1e6f;
         float t = 0.0f;
-        if (seg.segmentType == 0) {
-            SDFResult res = sdUnevenCapsule(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
-            signedDist = res.dist; t = res.t;
-        } else if (seg.segmentType == 1) {
-            SDFResult res = sdSplineSegment(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
-            signedDist = res.dist; t = res.t;
-        } else if (seg.segmentType == 2) {
-            SDFResult res = sdSoftEnvelopeSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
-            signedDist = res.dist; t = res.t;
+        if ((ablate & 1u) == 0u) {
+            if (seg.segmentType == 0) {
+                SDFResult res = sdUnevenCapsule(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
+                signedDist = res.dist; t = res.t;
+            } else if (seg.segmentType == 1) {
+                SDFResult res = sdSplineSegment(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+                signedDist = res.dist; t = res.t;
+            } else if (seg.segmentType == 2) {
+                SDFResult res = sdSoftEnvelopeSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+                signedDist = res.dist; t = res.t;
+            }
         }
         float opacity = mix(seg.opacity0, seg.opacity1, t);
         float edgeWidth = 0.94f;
@@ -1318,12 +1344,12 @@ kernel void livePerTileAACompositeKernel(
         if (stamped > curMax) curMax = stamped;
     }
     // Composite the final stroke group.
-    if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f) {
+    if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f && (ablate & 4u) == 0u) {
         float4 col = strokeColor[curStroke];
         perTileCompositeStroke(acc, col, strokeFlags[curStroke], curMax * col.a);
     }
 
-    if (acc.a > 0.0001f) target.write(acc, pixel);
+    if (acc.a > 0.0001f && (ablate & 8u) == 0u) target.write(acc, pixel);
 }
 
 // MARK: - Per-tile noise-capable composite (one dispatch per layer, AA + noise)
@@ -1458,7 +1484,7 @@ kernel void livePerTileNoiseCompositeKernel(
 
         GPUSplineSegment seg = segments[segIdx];
         float pruneRadius = (seg.padding1 != 0u) ? as_type<float>(seg.padding1) : 3.4e38f;
-        if (liveSegDist(pos, seg.p1, seg.p2) > pruneRadius) continue;
+        if (liveSegPruned(pos, seg.p1, seg.p2, pruneRadius * pruneRadius)) continue;
 
         float stamped = 0.0f;
         if (curNoisy) {
@@ -1653,7 +1679,7 @@ kernel void liveSplatKernel(
     for (int py = y0; py <= y1; ++py) {
         for (int px = x0; px <= x1; ++px) {
             float2 pos = float2(float(px), float(py)) + float2(0.5f, 0.5f);
-            if (liveSegDist(pos, a, b) > prune) continue;
+            if (liveSegPruned(pos, a, b, prune * prune)) continue;
             float stamped = liveSplatStamped(s, pos, noisy);
             if (!(stamped > 0.0f)) continue;    // 0 adds nothing to the max
             uint idx = uint(py - p.originPxY) * uint(p.boxPixW) + uint(px - p.originPxX);

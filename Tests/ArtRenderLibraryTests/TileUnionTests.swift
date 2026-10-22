@@ -262,6 +262,18 @@ final class LiveConfigTests: XCTestCase {
         XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_LIVE_TILE_SIZE": "16!"]), 16)
     }
 
+    func testAblateMaskDefaultsOffAndClamps() {
+        // Time-attribution knob only: off unless set, and never a value the kernel's
+        // five bits cannot represent (a stray env var must not change pixels).
+        XCTAssertEqual(LiveConfig.ablate(environment: [:]), 0)
+        XCTAssertEqual(LiveConfig.ablate(environment: ["ART_LIVE_ABLATE": "0"]), 0)
+        XCTAssertEqual(LiveConfig.ablate(environment: ["ART_LIVE_ABLATE": "31"]), 31)
+        XCTAssertEqual(LiveConfig.ablate(environment: ["ART_LIVE_ABLATE": "17"]), 17)
+        XCTAssertEqual(LiveConfig.ablate(environment: ["ART_LIVE_ABLATE": "32"]), 31)
+        XCTAssertEqual(LiveConfig.ablate(environment: ["ART_LIVE_ABLATE": "-4"]), 0)
+        XCTAssertEqual(LiveConfig.ablate(environment: ["ART_LIVE_ABLATE": "sdf"]), 0)
+    }
+
     func testMergeUnitSizeDefaultsAndClamps() {
         XCTAssertEqual(LiveConfig.mergeUnitSize(environment: [:]),
                        GpuBinSpec.mergeUnitSize)

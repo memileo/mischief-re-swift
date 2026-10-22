@@ -190,7 +190,12 @@ public struct LiveFrameTiming {
     /// Distance-field lookups the kernels will perform this frame (segment incidences × tile px).
     public var sdfEvaluations = 0
 
+    /// Per-frame CPU planning (cull + tile table + sort plan + uploads). Excludes buffer
+    /// allocation, which is a cold-start cost and used to hide inside this number.
     public var binMilliseconds = 0.0
+    /// Metal buffer allocation / growth. Only the first frames pay it; reported separately
+    /// so a one-shot `art2png --live-view` run cannot be mistaken for steady state.
+    public var allocMilliseconds = 0.0
     public var encodeMilliseconds = 0.0
     /// Time spent inside `waitUntilCompleted`, i.e. GPU execution (plus any stall).
     public var gpuMilliseconds = 0.0
@@ -200,12 +205,12 @@ public struct LiveFrameTiming {
     public var totalMilliseconds = 0.0
 
     public var summary: String {
-        String(format: "%.0f ms total (bin %.0f, encode %.0f, gpu %.0f, paper %.0f) — "
+        String(format: "%.0f ms total (bin %.0f, alloc %.0f, encode %.0f, gpu %.0f, paper %.0f) — "
                        + "%d strokes / %d segments, %d layers cached, %d rebuilt, %d culled "
                        + "| %d box tiles, %d ink tiles, %lld sdf",
-               totalMilliseconds, binMilliseconds, encodeMilliseconds, gpuMilliseconds,
-               paperMilliseconds, strokes, segments, cachedLayers, rebuiltLayers, culledStrokes,
-               dispatchedTiles, inkedTiles, sdfEvaluations)
+               totalMilliseconds, binMilliseconds, allocMilliseconds, encodeMilliseconds,
+               gpuMilliseconds, paperMilliseconds, strokes, segments, cachedLayers,
+               rebuiltLayers, culledStrokes, dispatchedTiles, inkedTiles, sdfEvaluations)
     }
 }
 

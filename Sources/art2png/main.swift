@@ -34,6 +34,8 @@ func main() {
         print("  --zoom F               Zoom factor for --live-view (1 = as the file shows)")
         print("  --pan X,Y              Pan in view pixels for --live-view")
         print("  --rotate R             Rotation in radians for --live-view")
+        print("  --warmup N             macOS only: Render N extra live-view frames first so the")
+        print("                          reported timings are steady state (default 0)")
     }
     
     guard args.count > 1 else {
@@ -58,6 +60,7 @@ func main() {
     var liveZoom: CGFloat = 1
     var livePan = CGPoint.zero
     var liveRotation: CGFloat = 0
+    var liveWarmup = 0
     
     var i = 1
     while i < args.count {
@@ -125,6 +128,13 @@ func main() {
                 print("Error: --zoom requires a positive number"); exit(1)
             }
             liveZoom = CGFloat(v)
+            i += 1
+        } else if args[i] == "--warmup" {
+            i += 1
+            guard i < args.count, let v = Int(args[i]), v >= 0, v <= 100 else {
+                print("Error: --warmup requires a whole frame count 0…100"); exit(1)
+            }
+            liveWarmup = v
             i += 1
         } else if args[i] == "--rotate" {
             i += 1
@@ -253,19 +263,28 @@ func main() {
             if livePan != .zero { _ = transform.pan(by: livePan) }
             if liveRotation != 0 { _ = transform.rotate(by: liveRotation, anchor: CGPoint(x: viewportSize.width / 2, y: viewportSize.height / 2), viewportSize: viewportSize) }
             
-            guard let live = renderer.renderLive(cache: cache, art: art, camera: transform,
-                                                 viewport: viewportSize, clearPaper: true) else {
+            // Warmup frames: the first live frame pays the Metal buffer sizing (`alloc`)
+            // and the geometry-cache upload, so a one-shot CLI run reads much slower than
+            // steady state. `--warmup 1` (or more) reports the frame after those.
+            var live: LiveRenderedCanvas?
+            for frame in 0...liveWarmup {
+                if frame > 0 { print("Warmup \(frame)/\(liveWarmup)") }
+                live = renderer.renderLive(cache: cache, art: art, camera: transform,
+                                           viewport: viewportSize, clearPaper: true)
+                if live == nil { break }
+            }
+            guard let liveFrame = live else {
                 print("Error: interactive live render failed")
                 exit(1)
             }
-            guard let image = renderer.livePreviewImage(live, transform: live.presentTransform,
-                                                        size: live.pixelSize) else {
+            guard let image = renderer.livePreviewImage(liveFrame, transform: liveFrame.presentTransform,
+                                                        size: liveFrame.pixelSize) else {
                 print("Error: failed to read back the interactive live render")
                 exit(1)
             }
             let viewPath = inputURL.deletingPathExtension().appendingPathExtension("live-view.png").path
             saveCGImageAsPNG(image, to: viewPath)
-            print("Live view (\(Int(live.pixelSize.width))×\(Int(live.pixelSize.height)), "
+            print("Live view (\(Int(liveFrame.pixelSize.width))×\(Int(liveFrame.pixelSize.height)), "
                   + "zoom \(String(format: "%.2f", transform.zoom))x, "
                   + "rotate \(String(format: "%.3f", transform.rotation)) rad): \(viewPath)")
         }

@@ -156,7 +156,7 @@ render() {
     log="$dir/run.log"
     if [ "$mode" = off ]; then
         echo "+ ART_LIVE_SPLAT=0 ART_LIVE_BINTIME=1 $BIN --live-view --viewport $VP${1:+ $*} $(basename "$copy")" >"$log"
-        ART_LIVE_SPLAT=0 "$BIN" --live-view --viewport "$VP" "$@" "$copy" >>"$log" 2>&1
+        ART_LIVE_SPLAT=0 ART_LIVE_BINTIME=1 "$BIN" --live-view --viewport "$VP" "$@" "$copy" >>"$log" 2>&1
     else
         echo "+ ART_LIVE_SPLAT=<unset>  ART_LIVE_BINTIME=1 $BIN --live-view --viewport $VP${1:+ $*} $(basename "$copy")" >"$log"
         env -u ART_LIVE_SPLAT  ART_LIVE_BINTIME=1 "$BIN" --live-view --viewport "$VP" "$@" "$copy" >>"$log" 2>&1

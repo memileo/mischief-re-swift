@@ -71,6 +71,8 @@ struct PerTileParams {
     var boxTilesPerRow: UInt32
     var boxTilesPerCol: UInt32
     var tileSize: UInt32
+    /// `ART_LIVE_ABLATE` mask — 0 in normal use (see `LiveConfig.ablate`).
+    var ablate: UInt32
 }
 
 // Must match `LiveBinTransformParams` in segmentKernels.metal field for field, in order.
@@ -749,7 +751,8 @@ extension MetalRenderer {
                                    tileOriginY: UInt32(boxMinY),
                                    boxTilesPerRow: UInt32(boxWidth),
                                    boxTilesPerCol: UInt32(boxHeight),
-                                   tileSize: UInt32(liveTile))
+                                   tileSize: UInt32(liveTile),
+                                   ablate: UInt32(LiveConfig.ablate()))
         if containsNoise {
             guard let pipeline = livePerTileNoiseCompositePipeline else {
                 throw MetalRendererError.pipelineMissing("livePerTileNoiseCompositeKernel")
@@ -871,7 +874,7 @@ extension MetalRenderer {
         // — otherwise CLI one-shot runs report a too-slow steady-state bin cost).
         let ref = try ensureBinRefState(device: device, docID: ObjectIdentifier(cache),
                                         layer: layer)
-        let cpuStart = DispatchTime.now().uptimeNanoseconds
+        var cpuStart = DispatchTime.now().uptimeNanoseconds
         var visStrokeIDs: [Int] = []
         visStrokeIDs.reserveCapacity(layer.ops.count)
         var layerBox: (minX: Int, minY: Int, maxX: Int, maxY: Int)? = nil
@@ -912,6 +915,7 @@ extension MetalRenderer {
         let boxW = box.maxX - box.minX + 1, boxH = box.maxY - box.minY + 1
         let boxTiles = boxW * boxH
         guard boxTiles > 0 else { return false }
+        liveTiming.binMilliseconds += Self.milliseconds(since: cpuStart)
 
         // Reference state is ensured above the timing window; here only per-frame data
         // prep follows.
@@ -920,7 +924,12 @@ extension MetalRenderer {
         if needsNoise && noiseTexture == nil { return false }
         if needsNoise && livePerTileNoiseCompositePipeline == nil { return false }
         if !needsNoise && livePerTileAACompositePipeline == nil { return false }
+        // Frame buffers are sized once (the segment arena alone is ~20 MB on a big
+        // document): cold-start allocation, kept out of `bin` and reported as `alloc`.
+        let aFrame = DispatchTime.now().uptimeNanoseconds
         try ensureBinFrameBuffers(device: device, ref: ref, boxTiles: boxTiles)
+        liveTiming.allocMilliseconds += Self.milliseconds(since: aFrame)
+        cpuStart = DispatchTime.now().uptimeNanoseconds
         guard let frameSegs = ref.frameSegments, let ranges = ref.ranges,
               let counts = ref.counts, let staging = ref.countsStaging,
               let heads = ref.heads, let startsBuf = ref.starts,
@@ -995,6 +1004,12 @@ extension MetalRenderer {
 
         // ── CPU prefix over the tile counts (one tile grid, trivial) → tile table.
         let prefixStart = DispatchTime.now().uptimeNanoseconds
+        // Cold-start Metal buffer growth is not per-frame CPU planning: accumulate it in
+        // `alloc` and subtract it from `bin`, so a one-shot CLI run cannot report the
+        // first frame's allocations as steady-state bin cost (warm frames allocate
+        // nothing). The splat tail is GPU time and is subtracted from `bin` the same way
+        // (it is already inside `gpu`).
+        var allocWindow = 0.0
         var countsArr = [UInt32](repeating: 0, count: boxTiles)
         countsArr.withUnsafeMutableBytes { raw in
             if let dst = raw.baseAddress {
@@ -1044,15 +1059,21 @@ extension MetalRenderer {
                                                  batchSlots: splatBatch) / 1e6,
                          splatCost))
         }
-        if splatWins,
+        var splatBuffered = false
+        if splatWins, liveSplatPipeline != nil, liveSplatCompositePipeline != nil,
+           liveSplatWritePipeline != nil, gpuRenderTarget != nil, liveCanvasTexture != nil {
+            let aSplat = DispatchTime.now().uptimeNanoseconds
+            splatBuffered = ensureSplatBuffers(device: device, ref: ref, pixels: splatPixels,
+                                               slots: splatPixels * splatBatch)
+            allocWindow += Self.milliseconds(since: aSplat)
+        }
+        if splatWins, splatBuffered,
            let splatPipe = liveSplatPipeline,
            let splatCompPipe = liveSplatCompositePipeline,
            let splatWritePipe = liveSplatWritePipeline,
            let layerTex = gpuRenderTarget,
            let canvas = liveCanvasTexture,
            let noiseBind = splatNoiseBinding(),
-           ensureSplatBuffers(device: device, ref: ref, pixels: splatPixels,
-                              slots: splatPixels * splatBatch),
            let splatMax = ref.splatMax, let splatAcc = ref.splatAcc,
            let visOrd = ref.visOrd, let visIDs = ref.visStrokeIDsBuf {
             // Per-frame uploads: per-stroke visible ordinal, and ordinal → stroke id.
@@ -1139,7 +1160,9 @@ extension MetalRenderer {
             if let err = cbSplat.error { throw err }
             let tRenderSplat = Self.milliseconds(since: splatStart)
             liveTiming.gpuMilliseconds += tRenderSplat
-            liveTiming.binMilliseconds += Self.milliseconds(since: prefixStart)
+            liveTiming.allocMilliseconds += allocWindow
+            liveTiming.binMilliseconds += max(0, Self.milliseconds(since: prefixStart)
+                                                 - tRenderSplat - allocWindow)
             if LiveConfig.binStageTimingEnabled() {
                 print(String(format: "livebin layer %d: segs %d tiles %d chunks 0 passes 0 — xform %.2f scatter 0.00 sort 0.00 render+comp %.2f ms [splat %d×%d]",
                              position, ref.segCount, boxTiles, tXform, tRenderSplat,
@@ -1161,7 +1184,10 @@ extension MetalRenderer {
         // or ART_LIVE_STROKE_PRUNE=0 leaves behaviour identical, just slower.
         var groupHeaderBuf: MTLBuffer
         var groupEntryBuf: MTLBuffer
-        guard ensureEmptyGroupBuffers(device: device, tileCount: boxTiles) else { return false }
+        let aGroups = DispatchTime.now().uptimeNanoseconds
+        let groupsReady = ensureEmptyGroupBuffers(device: device, tileCount: boxTiles)
+        allocWindow += Self.milliseconds(since: aGroups)
+        guard groupsReady else { return false }
         if LiveConfig.strokePruneEnabled() {
             let table = GpuBinSpec.strokeBlockTable(
                 visibleStrokes: visStrokeIDs,
@@ -1179,20 +1205,24 @@ extension MetalRenderer {
                 invTile: invTile)
             if table.totalBlocks > 0 {
                 if ref.groupHeaderCap < boxTiles {
+                    let aHdr = DispatchTime.now().uptimeNanoseconds
                     let capT = max(boxTiles, ref.groupHeaderCap * 2, 64)
                     guard let buf = device.makeBuffer(
                         length: capT * 2 * MemoryLayout<UInt32>.size,
                         options: .storageModeShared) else { return false }
                     ref.groupHeader = buf
                     ref.groupHeaderCap = capT
+                    allocWindow += Self.milliseconds(since: aHdr)
                 }
                 if ref.groupCap < table.entries.count {
+                    let aEnt = DispatchTime.now().uptimeNanoseconds
                     let capG = max(table.entries.count, ref.groupCap * 2, 64)
                     guard let buf = device.makeBuffer(
                         length: capG * MemoryLayout<GpuBinStrokeBlock>.stride,
                         options: .storageModeShared) else { return false }
                     ref.strokeGroups = buf
                     ref.groupCap = capG
+                    allocWindow += Self.milliseconds(since: aEnt)
                 }
                 guard let hd = ref.groupHeader, let gr = ref.strokeGroups,
                       hd.length >= boxTiles * 2 * MemoryLayout<UInt32>.size,
@@ -1221,6 +1251,7 @@ extension MetalRenderer {
             groupEntryBuf = liveEmptyStrokeGroups!
         }
         if ref.tileListCap < total {
+            let aTile = DispatchTime.now().uptimeNanoseconds
             let cap = max(total, ref.tileListCap * 2)
             guard let buf = device.makeBuffer(length: cap * MemoryLayout<UInt32>.size,
                                               options: .storageModePrivate),
@@ -1231,6 +1262,7 @@ extension MetalRenderer {
             ref.tileList = buf
             ref.tileScratch = scratch
             ref.tileListCap = cap
+            allocWindow += Self.milliseconds(since: aTile)
         }
         guard let tileList = ref.tileList, let tileScratch = ref.tileScratch else { return false }
         // Chunked sort plan (pure integer work on the counts we already have): split
@@ -1240,6 +1272,7 @@ extension MetalRenderer {
         let (sortChunks, _, mergePasses) = GpuBinSpec.chunkTable(entries: entries,
                                                                  chunkSize: sortChunk)
         if ref.chunkCap < sortChunks.count {
+            let aChunk = DispatchTime.now().uptimeNanoseconds
             let cap = max(sortChunks.count, max(ref.chunkCap * 2, 1))
             guard let buf = device.makeBuffer(length: cap * MemoryLayout<GpuBinChunk>.stride,
                                               options: .storageModeShared) else {
@@ -1247,6 +1280,7 @@ extension MetalRenderer {
             }
             ref.sortChunks = buf
             ref.chunkCap = cap
+            allocWindow += Self.milliseconds(since: aChunk)
         }
         sortChunks.withUnsafeBytes { raw in
             if let src = raw.baseAddress, let dst = ref.sortChunks?.contents() {
@@ -1266,6 +1300,7 @@ extension MetalRenderer {
         if mergePasses > 0 {
             guard totalUnits > 0, passUnits.allSatisfy({ !$0.isEmpty }) else { return false }
             if ref.unitCap < totalUnits {
+                let aUnit = DispatchTime.now().uptimeNanoseconds
                 let cap = max(totalUnits, ref.unitCap * 2)
                 guard let buf = device.makeBuffer(length: cap * MemoryLayout<GpuBinMergeUnit>.stride,
                                                   options: .storageModeShared) else {
@@ -1273,6 +1308,7 @@ extension MetalRenderer {
                 }
                 ref.sortUnits = buf
                 ref.unitCap = cap
+                allocWindow += Self.milliseconds(since: aUnit)
             }
             guard let unitBuf = ref.sortUnits else { return false }
             let unitBase = unitBuf.contents()
@@ -1304,7 +1340,8 @@ extension MetalRenderer {
         // slot `starts[t] + bump(heads[t])`, so seeding heads with starts would add
         // the base twice and store past the tile list (GPU validation fault + hangs).
         // Heads are .private — zeroed by blit fill in CB2 below, not by CPU memset.
-        liveTiming.binMilliseconds += Self.milliseconds(since: prefixStart)
+        liveTiming.allocMilliseconds += allocWindow
+        liveTiming.binMilliseconds += max(0, Self.milliseconds(since: prefixStart) - allocWindow)
 
         // ── CB2: scatter + chunked sort + merge passes, then per-tile render +
         // layer composite. ART_LIVE_BINTIME=1 splits stages into one command buffer
