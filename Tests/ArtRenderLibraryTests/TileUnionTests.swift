@@ -250,7 +250,16 @@ final class LiveConfigTests: XCTestCase {
         XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_TILE_SIZE": "32"]), 32)
         XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_LIVE_TILE_SIZE": "32"]), 32)
         XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_TILE_SIZE": "32",
-                                                              "ART_LIVE_TILE_SIZE": "8"]), 8)
+                                                              "ART_LIVE_TILE_SIZE": "48"]), 48)
+        // The live composite dispatches whole 16×16 threadgroups per tile, so a tile that
+        // is not a multiple of 16 would read past the per-tile tables (validation: "Invalid
+        // device load" in livePerTileAACompositeKernel). Such values are ignored.
+        XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_LIVE_TILE_SIZE": "8"]), 16)
+        XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_TILE_SIZE": "32",
+                                                              "ART_LIVE_TILE_SIZE": "8"]), 32)
+        XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_LIVE_TILE_SIZE": "24"]), 16)
+        XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_LIVE_TILE_SIZE": "80"]), 16)
+        XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_LIVE_TILE_SIZE": "16!"]), 16)
     }
 
     func testMergeUnitSizeDefaultsAndClamps() {

@@ -281,14 +281,10 @@ clamps (`ART_LIVE_SPLAT_COST`, 0…16).
 
 ## The scripts
 
-- `Scripts/stroke-splat-ab.sh` — rewritten. Per view: delete the previous
-  `<doc>.live-view.png`, run walk (`ART_LIVE_SPLAT=0`) and default (`ART_LIVE_SPLAT`
-  unset), move both to `tmp/splat-ab/<doc>@<zoom>-splat-{off,default}.png`, verify each
-  PNG is the requested viewport size, byte-compare, and report the default run's own
-  `[splat N×B]` marker. A view that never splatted is called out as *walk vs walk*, so a
-  vacuous A/B can no longer pass. `--all` runs the standard matrix (kaos 1/0.21/0.05,
-  logo 1/0.05, complex 1/0.3/0.05, dots 1/20); positional `pan` / `rotate` are supported.
-  Output and logs live in `tmp/splat-ab/` (project-local, gitignored).
+- `Scripts/stroke-splat-ab.sh` — see round 3b. Copy-per-mode, render in place, SHA-256
+  compare; `--all` runs the standard matrix (kaos 1/0.25/0.05, logo 1/0.05,
+  complex 1/0.3/0.05, dots 1/20). Output and logs live in `tmp/splat-ab/` (project-local,
+  gitignored).
 - `Scripts/build-metallib.sh --verify-only` — the stall was the verifier, not the tooling:
   it matched ~31 names with `[[ $haystack == *$name* ]]` against a multi-MB
   `metal-nm`+`strings` dump held in a shell variable, which bash 3.2 walks byte by byte
@@ -299,13 +295,18 @@ clamps (`ART_LIVE_SPLAT_COST`, 0…16).
 
 ## Next levers (ranked by expected win per risk)
 
-1. **`ART_LIVE_TILE_SIZE=8` on the dense views** — no code change, just an env var. The
-   walk's work is `incidences × tileSize²`; halving the tile should cut kaos's 372 M
-   evaluations to ~160 M (incidences grow ~1.8×, area drops 4×). Costs: ~2× the tiles,
-   incidences and tile-table entries, so watch `scatter`/`sort` and the bin CPU time.
-   `ART_LIVE_TILE_SIZE=32` is the other control point. Everything stays byte-identical
-   (the walk is tile-size independent; the splat only reads `tileSize` for its fallback
-   branch), so the usual A/B gates apply.
+1. **Tile size: measured — no win, and it exposed a real bug.** `ART_LIVE_TILE_SIZE=8`
+   on kaos: `render+comp` 36.05 ms vs 36.63 at 16 (xform 9.06 vs 7.65), and Metal
+   validation reported `Invalid device load executing kernel function
+   "livePerTileAACompositeKernel"`. That was not noise. The composite dispatches
+   `ceil(tileSize / 16)` *whole* 16×16 threadgroups per tile, so a tile smaller than the
+   group makes every group also cover the next tile: `localTile` runs past
+   `tileStartCount` and the trailing threads composite a neighbouring tile's strokes into
+   the layer. Fixed with a box-bounds guard in all four live composite kernels
+   (`boxTilesPerCol` added to `PerTileParams` and `LiveStrokeParams`), and
+   `LiveConfig.liveTileSize` now accepts only multiples of 16 in 16…64 and prints a note
+   when a requested value is ignored. Conclusion: 16 stays; the SDF count does not fall
+   the way `incidences × tileSize²` predicts (incidences grow much faster than 1.8× at 8).
 2. **The splat composite is the splat's floor**: `boxPixels × visibleStrokes` slot reads.
    A per-tile compaction (append each stroke's ordinal to the tiles it actually touches,
    then replay only those per pixel) would make the splat converge to the walk's incidences
@@ -318,3 +319,25 @@ clamps (`ART_LIVE_SPLAT_COST`, 0…16).
 4. **Excluded layers** (`cut` ops, markers, `needsRebuild` paste/merge layers) still take
    the per-stroke CPU path. That is a bigger job: cut metas would have to be remapped and
    interleaved in document order inside the GPU plan.
+
+## Round 3b — the A/B script, the 1×1 PNG, and why the tile knob was unsound
+
+`art2png --viewport` used to accept anything: `--viewport 0.25` split on `x` into
+`["0.25"]` and parsed both ends as the same number, i.e. a 0.25×0.25 canvas, which rounds
+to **1×1** — written without a warning. The A/B script's old positional form was
+`<doc> <viewport> [zoom]`, so `stroke-splat-ab.sh art/kaos.art 0.25` passed the zoom as the
+viewport and produced exactly those 161-byte PNGs. Both sides are fixed: `--viewport` now
+requires integer `WxH` (1…16384) and exits non-zero otherwise; the script takes
+`<doc> [zoom]` / flags and refuses a non-`WxH` `--viewport` itself.
+
+`stroke-splat-ab.sh` is rewritten around one idea: **copy the document, render in place,
+compare hashes.** Each view gets `tmp/splat-ab/<doc>@<zoom>/off|default/<doc>.art`, so the
+output PNG is always `<copy>.live-view.png` next to a known input — no guessing where a
+run wrote, no fixed filenames overwritten by the next view, no shell field plumbing. The
+two PNGs are compared by SHA-256, each is checked to be the requested viewport size, the
+command line is echoed into each `run.log`, and a failure prints the log tail. The default
+run's own `[splat N×B]` marker is reported, so a view where the cost model declined the
+splat (kaos at 0.25) is labelled `walk (splat declined)` instead of pretending to exercise
+it. `--all` renders the standard matrix (kaos 1/0.25/0.05, logo 1/0.05, complex 1/0.3/0.05,
+dots 1/20).
+

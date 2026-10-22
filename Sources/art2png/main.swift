@@ -121,15 +121,15 @@ func main() {
             i += 1
         } else if args[i] == "--zoom" {
             i += 1
-            guard i < args.count, let v = Double(args[i]) else {
-                print("Error: --zoom requires a numeric value"); exit(1)
+            guard i < args.count, let v = Double(args[i]), v.isFinite, v > 0 else {
+                print("Error: --zoom requires a positive number"); exit(1)
             }
             liveZoom = CGFloat(v)
             i += 1
         } else if args[i] == "--rotate" {
             i += 1
-            guard i < args.count, let v = Double(args[i]) else {
-                print("Error: --rotate requires a numeric value"); exit(1)
+            guard i < args.count, let v = Double(args[i]), v.isFinite else {
+                print("Error: --rotate requires a number"); exit(1)
             }
             liveRotation = CGFloat(v)
             i += 1
@@ -137,17 +137,25 @@ func main() {
             i += 1
             guard i < args.count else { print("Error: --pan requires X,Y"); exit(1) }
             let parts = args[i].split(separator: ",").compactMap { Double($0) }
-            guard parts.count == 2 else { print("Error: --pan requires X,Y"); exit(1) }
+            guard parts.count == 2, parts.allSatisfy({ $0.isFinite }) else {
+                print("Error: --pan requires X,Y"); exit(1)
+            }
             livePan = CGPoint(x: CGFloat(parts[0]), y: CGFloat(parts[1]))
             i += 1
         } else if args[i] == "--viewport" {
             i += 1
-            guard i < args.count,
-                  let w = Double(args[i].split(separator: "x").first ?? ""),
-                  let h = Double(args[i].split(separator: "x").last ?? "") else {
-                print("Error: --viewport requires WxH"); exit(1)
+            // Strict WxH. "0.25" (a zoom accidentally passed as the viewport) used to
+            // parse as 0.25×0.25 and render a 1×1 PNG without a word — refuse instead.
+            guard i < args.count else { print("Error: --viewport requires WxH"); exit(1) }
+            let parts = args[i].split(separator: "x", omittingEmptySubsequences: false)
+            guard parts.count == 2,
+                  let w = Int(parts[0]), let h = Int(parts[1]),
+                  w >= 1, h >= 1, w <= 16384, h <= 16384 else {
+                print("Error: --viewport needs WxH with whole pixels (e.g. 1920x1080), "
+                      + "got '\(args[i])'")
+                exit(1)
             }
-            viewportSize = CGSize(width: CGFloat(w), height: CGFloat(h))
+            viewportSize = CGSize(width: w, height: h)
             i += 1
         } else if args[i] == "--help" || args[i] == "-h" {
             info()

@@ -929,6 +929,7 @@ struct LiveStrokeParams {
     uint  tileOriginX;
     uint  tileOriginY;
     uint  boxTilesPerRow;
+    uint  boxTilesPerCol;
     uint  tileSize;
     uint  textureWidth;
     uint  textureHeight;
@@ -971,6 +972,12 @@ kernel void liveSegmentAACompositeKernel(
     if (pixel.x >= w || pixel.y >= h) return;
 
     uint2 tileID = pixel / params.tileSize;
+    // The dispatch covers whole 16×16 threadgroups per tile, so when the layer box's last
+    // column/row is not a multiple of the group, the trailing threads cover pixels of a
+    // tile outside the box. They must return here: `tileIndex` below would run past the
+    // tile table (and composite a neighbouring tile's strokes into this layer).
+    if (tileID.x - params.tileOriginX >= params.boxTilesPerRow ||
+        tileID.y - params.tileOriginY >= params.boxTilesPerCol) return;
     uint tileIndex = (tileID.y - params.tileOriginY) * params.boxTilesPerRow
                    + (tileID.x - params.tileOriginX);
     TileIndex tIdx = tileIndices[tileIndex];
@@ -1059,6 +1066,12 @@ kernel void liveSegmentNoiseCompositeKernel(
     if (pixel.x >= w || pixel.y >= h) return;
 
     uint2 tileID = pixel / params.tileSize;
+    // The dispatch covers whole 16×16 threadgroups per tile, so when the layer box's last
+    // column/row is not a multiple of the group, the trailing threads cover pixels of a
+    // tile outside the box. They must return here: `tileIndex` below would run past the
+    // tile table (and composite a neighbouring tile's strokes into this layer).
+    if (tileID.x - params.tileOriginX >= params.boxTilesPerRow ||
+        tileID.y - params.tileOriginY >= params.boxTilesPerCol) return;
     uint tileIndex = (tileID.y - params.tileOriginY) * params.boxTilesPerRow
                    + (tileID.x - params.tileOriginX);
     TileIndex tIdx = tileIndices[tileIndex];
@@ -1173,6 +1186,7 @@ struct PerTileParams {
     uint tileOriginX;
     uint tileOriginY;
     uint boxTilesPerRow;
+    uint boxTilesPerCol;
     uint tileSize;
 };
 
@@ -1216,6 +1230,11 @@ kernel void livePerTileAACompositeKernel(
     if (pixel.x >= w || pixel.y >= h) return;
 
     uint2 tileID = pixel / params.tileSize;
+    // Same trailing-thread guard as the per-stroke kernels: the dispatch covers whole
+    // 16×16 groups per tile, so anything outside the layer's tile box must not index the
+    // per-tile tables (Metal validation: "Invalid device load" without this).
+    if (tileID.x - params.tileOriginX >= params.boxTilesPerRow ||
+        tileID.y - params.tileOriginY >= params.boxTilesPerCol) return;
     uint localTile = (tileID.y - params.tileOriginY) * params.boxTilesPerRow
                    + (tileID.x - params.tileOriginX);
     TileIndex tc = tileStartCount[localTile];
@@ -1340,6 +1359,11 @@ kernel void livePerTileNoiseCompositeKernel(
     if (pixel.x >= w || pixel.y >= h) return;
 
     uint2 tileID = pixel / params.tileSize;
+    // Same trailing-thread guard as the per-stroke kernels: the dispatch covers whole
+    // 16×16 groups per tile, so anything outside the layer's tile box must not index the
+    // per-tile tables (Metal validation: "Invalid device load" without this).
+    if (tileID.x - params.tileOriginX >= params.boxTilesPerRow ||
+        tileID.y - params.tileOriginY >= params.boxTilesPerCol) return;
     uint localTile = (tileID.y - params.tileOriginY) * params.boxTilesPerRow
                    + (tileID.x - params.tileOriginX);
     TileIndex tc = tileStartCount[localTile];

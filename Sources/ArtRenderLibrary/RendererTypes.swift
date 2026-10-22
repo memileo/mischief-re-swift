@@ -386,10 +386,19 @@ public enum LiveConfig {
     /// Tile size for the *live* binning/dispatch. Resolution order:
     /// `ART_LIVE_TILE_SIZE` → `ART_TILE_SIZE` → 16 (the measured default).
     /// The static path keeps its own default (32); only the live path uses this.
+    ///
+    /// Must be a multiple of the 16×16 live threadgroup (16…64). The live composite
+    /// dispatches `ceil(tileSize / 16)` whole threadgroups per tile, but every threadgroup
+    /// is 16×16 pixels: with a tile smaller than the group (8) each group also covers the
+    /// *next* tile, i.e. pixels outside the layer's tile box, and `localTile` then indexes
+    /// past the per-tile tables (`Invalid device load executing kernel function
+    /// "livePerTileAACompositeKernel"`, plus duplicated content next to the box). Values
+    /// that are not a multiple of 16 are ignored (the renderer says so once at launch).
     public static func liveTileSize(environment: [String: String]? = nil) -> Int {
         let env = environment ?? ProcessInfo.processInfo.environment
-        if let v = env["ART_LIVE_TILE_SIZE"], let n = Int(v), n >= 8 { return n }
-        if let v = env["ART_TILE_SIZE"], let n = Int(v), n >= 8 { return n }
+        for key in ["ART_LIVE_TILE_SIZE", "ART_TILE_SIZE"] {
+            if let v = env[key], let n = Int(v), n >= 16, n <= 64, n % 16 == 0 { return n }
+        }
         return 16
     }
 }

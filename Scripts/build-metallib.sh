@@ -147,6 +147,15 @@ verify() {
     done
     if [[ $missing -eq 0 ]]; then
         echo "  OK: all ${#REQUIRED_KERNELS[@]} kernels/functions present"
+        # Presence is not freshness: a kernel whose *parameters* changed keeps its name, so
+        # a stale metallib verifies "OK" and then reads the wrong struct fields at runtime
+        # (e.g. the boxTilesPerCol added to PerTileParams/LiveStrokeParams).
+        local newest
+        newest=$(ls -t "$SRC"/*.metal 2>/dev/null | head -1)
+        if [[ -n "$newest" && "$newest" -nt "$file" ]]; then
+            echo "  WARNING: $(basename "$newest") is newer than this metallib — rebuild it"
+            echo "           (kernel parameters may have changed even though the names did not)"
+        fi
         return 0
     fi
     if [[ $missing_live -eq 1 ]]; then

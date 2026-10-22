@@ -1,194 +1,279 @@
 #!/bin/sh
-# A/B pixel-identity check for the splat live-view path.
+# Pixel-identity A/B for the live-view splat path.
 #
-# Runs art2png --live-view twice per view:
-#   * ART_LIVE_SPLAT=0     -> the per-tile walk (the baseline)
-#   * ART_LIVE_SPLAT unset -> tool default (the splat, when the layer's cost model
-#                             predicts it is cheaper)
-# and byte-compares the two PNGs. They must be IDENTICAL.
+# Every view is rendered twice, each time from its own private copy of the document, so a
+# run can never compare against (or accidentally reuse) a PNG from an earlier view:
 #
-# The default run's own `[splat NxB]` marker is reported per case, so a view that quietly
-# fell back to the walk is called out as "walk vs walk" instead of counting as a pass
-# (that is how a round of A/B came back green while the splat kernels were not even in
-# the metallib). A splat-off run that still logs `[splat ...]` is flagged too: the env
-# override did not take.
+#   tmp/splat-ab/<doc>@<zoom>/off/kaos.art      ART_LIVE_SPLAT=0      (the walk)
+#   tmp/splat-ab/<doc>@<zoom>/default/kaos.art  ART_LIVE_SPLAT unset  (tool default)
+#
+# art2png writes <input>.live-view.png next to its input, i.e. next to each copy. The two
+# PNGs are compared by SHA-256: IDENTICAL is the pass condition.
 #
 # Usage:
-#   sh Scripts/stroke-splat-ab.sh <doc.art> [viewport] [zoom] [panX,panY] [rotate]
-#     e.g. sh Scripts/stroke-splat-ab.sh art/kaos.art 1920x1080 0.05
-#          sh Scripts/stroke-splat-ab.sh art/kaos.art 1920x1080 "" 40,-20 0.3
-#   sh Scripts/stroke-splat-ab.sh --all        # the standard view matrix
+#   Scripts/stroke-splat-ab.sh [--viewport WxH] [--zoom Z] [--pan X,Y] [--rotate R] <doc.art>
+#   Scripts/stroke-splat-ab.sh <doc.art> <zoom>      -- shorthand for --zoom
+#   Scripts/stroke-splat-ab.sh --all                 -- the standard view matrix
 #
-# A run writes <doc-dir>/<name>.live-view.png; this script deletes that path before every
-# run (so a stale PNG can never be compared) and keeps each result here:
-#   tmp/splat-ab/<doc>@<zoom>-splat-{off,default}.png   plus one .log per run
+# Defaults: --viewport 1920x1080, --zoom 1. Exit status: 0 all identical, 1 any DIFFER or
+# failed run, 2 bad usage.
 #
-# Env: ART2PNG overrides the binary (default .build/release/art2png), ART_SPLAT_AB_OUT
-# the output directory.
+# A view where the cost model declines the splat (e.g. kaos at 0.25: the walk is cheaper)
+# is a legitimate walk-vs-walk pass and is reported as such. To force the splat there for
+# an identity check, turn the model off for the default side: ART_LIVE_SPLAT_COST=0.
+#
+# Env: ART2PNG (binary, default .build/release/art2png),
+#      ART_SPLAT_AB_OUT (output dir, default tmp/splat-ab — project-local and gitignored).
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=${ART2PNG:-$ROOT/.build/release/art2png}
 OUT=${ART_SPLAT_AB_OUT:-$ROOT/tmp/splat-ab}
+
+VP=1920x1080
+ZOOM=""
+PAN=""
+ROT=""
+ALL=0
+DOC=""
 fail=0
+splat_views=0
+total_views=0
+
+die() {
+    echo "stroke-splat-ab: $*" >&2
+    exit 2
+}
+
+usage() {
+    sed -n '13,26p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --all)     ALL=1; shift ;;
+        --viewport) [ $# -ge 2 ] || die "--viewport needs WxH"; VP=$2; shift 2 ;;
+        --zoom)     [ $# -ge 2 ] || die "--zoom needs a number"; ZOOM=$2; shift 2 ;;
+        --pan)      [ $# -ge 2 ] || die "--pan needs X,Y"; PAN=$2; shift 2 ;;
+        --rotate)   [ $# -ge 2 ] || die "--rotate needs a number"; ROT=$2; shift 2 ;;
+        --)         shift
+                    while [ $# -gt 0 ]; do DOC=$1; shift; done ;;
+        -*)
+            die "unknown option '$1' — see --help"
+            ;;
+        *)
+            # First bare word is the document; a second one is the zoom (the old
+            # two-positional form: `stroke-splat-ab.sh art/kaos.art 0.25`).
+            if [ -z "$DOC" ]; then
+                DOC=$1
+            elif [ -z "$ZOOM" ]; then
+                ZOOM=$1
+            else
+                die "unexpected argument '$1' — see --help"
+            fi
+            shift
+            ;;
+    esac
+done
+
+case "$VP" in
+    *x*) ;;
+    *) die "--viewport needs WxH (e.g. 1920x1080), got '$VP'" ;;
+esac
+case "${VP%x*}" in
+    ''|*[!0-9]*) die "--viewport needs whole pixels (e.g. 1920x1080), got '$VP'" ;;
+esac
+case "${VP#*x}" in
+    ''|*[!0-9]*) die "--viewport needs whole pixels (e.g. 1920x1080), got '$VP'" ;;
+esac
 
 if [ ! -x "$BIN" ]; then
     echo "No executable at $BIN" >&2
     echo "Build it first:  swift build -c release" >&2
     exit 2
 fi
-mkdir -p "$OUT"
+mkdir -p "$OUT" || exit 2
 cd "$ROOT" || exit 2
 
-# Print "<w> <h>" for a PNG, or nothing when no dimension tool is available.
-png_size() {
-    if command -v sips >/dev/null 2>&1; then
-        w=$(sips -g pixelWidth "$1" 2>/dev/null | awk '/pixelWidth/ {print $2}')
-        h=$(sips -g pixelHeight "$1" 2>/dev/null | awk '/pixelHeight/ {print $2}')
-        if [ -n "${w:-}" ] && [ -n "${h:-}" ]; then
-            echo "$w $h"
-        fi
+sha_of() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        cksum "$1" | awk '{print "cksum:" $1 "-" $2}'
     fi
 }
 
-# check_size <png> <label> <viewport WxH> — the live view is always rasterised at the
-# viewport size; anything else means the view is not what was asked for (a 1x1 PNG is
-# the classic symptom of a viewport that never reached the tool).
-check_size() {
-    png=$1; label=$2; vp=$3
-    size=$(png_size "$png")
-    [ -n "$size" ] || return 0
-    want="${vp%x*} ${vp#*x}"
-    if [ "$size" != "$want" ]; then
-        echo "  !! $label: PNG is ${size% *}x${size#* }, expected $vp"
-        fail=1
+bytes_of() {
+    wc -c <"$1" | tr -d ' '
+}
+
+# "width height" from the PNG's IHDR (big-endian at offset 16), or non-zero when the file
+# is not a readable PNG. One `od` per byte keeps this free of word splitting, so the same
+# code works under /bin/sh (bash 3.2 on macOS), bash and zsh — zsh does not split unquoted
+# expansions, which is exactly the kind of difference that made the old script lie.
+png_size() {
+    w=0
+    h=0
+    i=0
+    for off in 16 17 18 19 20 21 22 23; do
+        b=$(od -An -tu1 -j"$off" -N1 "$1" 2>/dev/null | tr -d ' \n')
+        [ -n "$b" ] || return 1
+        i=$((i + 1))
+        if [ $i -le 4 ]; then
+            w=$(((w << 8) | b))
+        else
+            h=$(((h << 8) | b))
+        fi
+    done
+    echo "$w $h"
+}
+
+# Tag for the output dir: name@zoom, plus +pan / +rot when those are used.
+view_tag() {
+    d=$1; shift
+    name=$(basename "$d"); name=${name%.art}
+    z=1
+    extra=""
+    prev=""
+    for a in "$@"; do
+        case "$prev" in
+            --zoom)   z=$a ;;
+            --pan)    extra="$extra+pan" ;;
+            --rotate) extra="$extra+rot" ;;
+        esac
+        prev=$a
+    done
+    echo "$name@$z$extra"
+}
+
+# render <mode off|default> <dir> <doc-copy> [view args...]
+# The command line is echoed into the log first, so a failure is always attributable.
+render() {
+    mode=$1; dir=$2; copy=$3; shift 3
+    log="$dir/run.log"
+    if [ "$mode" = off ]; then
+        echo "+ ART_LIVE_SPLAT=0 ART_LIVE_BINTIME=1 $BIN --live-view --viewport $VP${1:+ $*} $(basename "$copy")" >"$log"
+        ART_LIVE_SPLAT=0 "$BIN" --live-view --viewport "$VP" "$@" "$copy" >>"$log" 2>&1
+    else
+        echo "+ ART_LIVE_SPLAT=<unset>  ART_LIVE_BINTIME=1 $BIN --live-view --viewport $VP${1:+ $*} $(basename "$copy")" >"$log"
+        env -u ART_LIVE_SPLAT  ART_LIVE_BINTIME=1 "$BIN" --live-view --viewport "$VP" "$@" "$copy" >>"$log" 2>&1
+    fi
+}
+
+# check_png <file> <label>: exists, non-empty, and the requested viewport size.
+check_png() {
+    f=$1; label=$2
+    if [ ! -s "$f" ]; then
+        echo "FAIL       $label — no PNG written"
         return 1
     fi
+    size=$(png_size "$f") || {
+        echo "FAIL       $label — $(basename "$f") is not a readable PNG"
+        return 1
+    }
+    if [ "$size" != "${VP%x*} ${VP#*x}" ]; then
+        echo "FAIL       $label — PNG is ${size% *}x${size#* }, expected $VP"
+        return 1
+    fi
+    return 0
 }
 
-# ab_case <tag> <doc> <viewport> <extra art2png args...>
-ab_case() {
-    tag=$1; doc=$2; vp=$3; shift 3
-    base="${doc%.*}.live-view.png"
-    off="$OUT/$tag-splat-off.png"
-    def="$OUT/$tag-splat-default.png"
-    logoff="$OUT/$tag-splat-off.log"
-    logdef="$OUT/$tag-splat-default.log"
-
+# check_view <doc> [view args...]
+check_view() {
+    doc=$1; shift
     if [ ! -f "$doc" ]; then
-        echo "SKIP       $tag — no such document: $doc"
+        echo "SKIP       $doc — no such document"
         return 0
     fi
-    rm -f "$base" "$off" "$def" "$logoff" "$logdef"
+    tag=$(view_tag "$doc" "$@")
+    base=$(basename "$doc")
+    root="$OUT/$tag"
+    rm -rf "$root"
 
-    ART_LIVE_SPLAT=0 "$BIN" --live-view --viewport "$vp" "$@" "$doc" >"$logoff" 2>&1
-    rc=$?
-    if [ $rc -ne 0 ] || [ ! -s "$base" ]; then
-        echo "FAIL       $tag — splat-off run failed (exit $rc, no PNG); see $logoff"
-        fail=1
-        return 0
-    fi
-    mv "$base" "$off"
-
-    env -u ART_LIVE_SPLAT "$BIN" --live-view --viewport "$vp" "$@" "$doc" >"$logdef" 2>&1
-    rc=$?
-    if [ $rc -ne 0 ] || [ ! -s "$base" ]; then
-        echo "FAIL       $tag — default run failed (exit $rc, no PNG); see $logdef"
-        fail=1
-        return 0
-    fi
-    mv "$base" "$def"
-
-    # Did the two runs actually take different paths?
-    if grep -q '\[splat' "$logoff" 2>/dev/null; then
-        echo "  !! $tag: the splat-off run still logged [splat ...] — ART_LIVE_SPLAT=0 did not take effect"
-        fail=1
-    fi
-    marks=$(sed -n 's/.*\(\[splat [^]]*\]\).*/\1/p' "$logdef" | sort -u | tr '\n' ' ')
-    bad=0
-    check_size "$off" "$tag (splat-off)" "$vp" || bad=1
-    check_size "$def" "$tag (splat-default)" "$vp" || bad=1
-    if [ $bad -ne 0 ]; then
-        echo "NOT COMPARED  $tag — the PNGs are not the requested view (see above)"
-        fail=1
-        return 0
-    fi
-
-    if cmp -s "$off" "$def"; then
-        printf 'IDENTICAL  %-32s %-14s %s bytes\n' "$tag" "${marks:-walk}" \
-            "$(wc -c <"$off" | tr -d ' ')"
-        if [ -z "$marks" ]; then
-            echo "  note: default run used the walk (no [splat ...]) — walk vs walk, nothing exercised"
+    total_views=$((total_views + 1))
+    for mode in off default; do
+        dir="$root/$mode"
+        if ! mkdir -p "$dir" || ! cp "$doc" "$dir/$base"; then
+            echo "FAIL       $tag ($mode) — cannot prepare $dir"
+            fail=1
+            return 0
         fi
-        echo "           $off"
+        render "$mode" "$dir" "$dir/$base" "$@"
+        rc=$?
+        if [ $rc -ne 0 ]; then
+            echo "FAIL       $tag ($mode) — art2png exited $rc"
+            sed 's/^/           /' "$dir/run.log" | tail -n 6
+            fail=1
+            return 0
+        fi
+        if ! check_png "$dir/${base%.art}.live-view.png" "$tag ($mode)"; then
+            sed 's/^/           /' "$dir/run.log" | tail -n 6
+            fail=1
+            return 0
+        fi
+    done
+
+    off_png="$root/off/${base%.art}.live-view.png"
+    def_png="$root/default/${base%.art}.live-view.png"
+    off_sha=$(sha_of "$off_png")
+    def_sha=$(sha_of "$def_png")
+    off_bytes=$(bytes_of "$off_png")
+    def_bytes=$(bytes_of "$def_png")
+
+    if grep -q '\[splat' "$root/off/run.log" 2>/dev/null; then
+        echo "FAIL       $tag — the splat-off run logged [splat ...]; ART_LIVE_SPLAT=0 did not take"
+        fail=1
+    fi
+    marks=$(sed -n 's/.*\(\[splat [^]]*\]\).*/\1/p' "$root/default/run.log" | sort -u | tr '\n' ' ')
+    marks=${marks% }
+
+    if [ "$off_sha" = "$def_sha" ]; then
+        [ -n "$marks" ] && splat_views=$((splat_views + 1))
+        printf 'IDENTICAL  %-34s %8s B  %s..  %s\n' "$tag" "$off_bytes" \
+            "$(echo "$off_sha" | cut -c1-12)" "${marks:-walk (splat declined)}"
+        echo "           $root"
     else
-        echo "DIFFER!!   $tag ${marks:-(walk)}"
-        cmp "$off" "$def" | head -3
-        echo "           $off"
-        echo "           $def"
+        echo "DIFFER     $tag"
+        echo "           off     $off_bytes B  $off_sha"
+        echo "           default $def_bytes B  $def_sha"
+        echo "           $root"
         fail=1
     fi
 }
 
-usage() {
-    sed -n '2,27p' "$0"
+all_views() {
+    check_view art/kaos.art
+    check_view art/kaos.art --zoom 0.25
+    check_view art/kaos.art --zoom 0.05
+    check_view art/logo-sketch-s6d5h46e54h_03.art
+    check_view art/logo-sketch-s6d5h46e54h_03.art --zoom 0.05
+    check_view art/complex.art
+    check_view art/complex.art --zoom 0.3
+    check_view art/complex.art --zoom 0.05
+    check_view art/dots.art --zoom 20
+    check_view art/dots.art
 }
 
-# Standard matrix: the views that matter for the splat (regular zoom walks; deep
-# zoom-out splats; dots @ 20 must stay walk-only because radiusFactor > 1).
-all_cases() {
-    while IFS='|' read -r tag doc vp zoom pan rot; do
-        [ -n "${tag:-}" ] || continue
-        set --
-        [ -n "${zoom:-}" ] && set -- "$@" --zoom "$zoom"
-        [ -n "${pan:-}" ] && set -- "$@" --pan "$pan"
-        [ -n "${rot:-}" ] && set -- "$@" --rotate "$rot"
-        ab_case "$tag" "$doc" "$vp" "$@"
-    done <<'CASES'
-kaos|art/kaos.art|1920x1080|||
-kaos@0.21|art/kaos.art|1920x1080|0.21||
-kaos@0.05|art/kaos.art|1920x1080|0.05||
-logo@1|art/logo-sketch-s6d5h46e54h_03.art|1920x1080|||
-logo@0.05|art/logo-sketch-s6d5h46e54h_03.art|1920x1080|0.05||
-complex@1|art/complex.art|1920x1080|||
-complex@0.3|art/complex.art|1920x1080|0.3||
-complex@0.05|art/complex.art|1920x1080|0.05||
-dots@20|art/dots.art|1920x1080|20||
-dots@1|art/dots.art|1920x1080|||
-CASES
-}
+if [ "$ALL" -eq 1 ]; then
+    all_views
+elif [ -n "$DOC" ]; then
+    set --
+    [ -n "$ZOOM" ] && set -- "$@" --zoom "$ZOOM"
+    [ -n "$PAN" ] && set -- "$@" --pan "$PAN"
+    [ -n "$ROT" ] && set -- "$@" --rotate "$ROT"
+    check_view "$DOC" "$@"
+else
+    usage
+    exit 2
+fi
 
-case "${1:-}" in
-    ""|-h|--help)
-        usage
-        [ -z "${1:-}" ] && exit 2
-        exit 0
-        ;;
-    --all)
-        all_cases
-        ;;
-    *)
-        doc=$1
-        vp=${2:-1920x1080}
-        zoom=${3:-}
-        pan=${4:-}
-        rot=${5:-}
-        name=$(basename "$doc" .art)
-        tag="$name@${zoom:-1}"
-        [ -n "$pan" ] && tag="$tag+pan"
-        [ -n "$rot" ] && tag="$tag+rot"
-        set --
-        [ -n "$zoom" ] && set -- "$@" --zoom "$zoom"
-        [ -n "$pan" ] && set -- "$@" --pan "$pan"
-        [ -n "$rot" ] && set -- "$@" --rotate "$rot"
-        ab_case "$tag" "$doc" "$vp" "$@"
-        ;;
-esac
-
-if [ $fail -ne 0 ]; then
-    echo
-    echo "FAILED — at least one view was not identical (or did not run as asked)."
+echo
+if [ "$fail" -ne 0 ]; then
+    echo "FAILED — a view differed or did not render as asked. Images and logs: $OUT"
     exit 1
 fi
-echo
-echo "All views identical. Images in $OUT"
+echo "All $total_views views identical ($splat_views with the splat; the rest are walk vs walk)."
+echo "Images and logs: $OUT"

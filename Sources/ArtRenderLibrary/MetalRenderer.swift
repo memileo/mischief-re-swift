@@ -340,7 +340,15 @@ internal final class LiveBinRefLayer {
         }
         // Live tile size defaults to 16 (see LiveConfig.liveTileSize); ART_LIVE_TILE_SIZE
         // overrides, otherwise an explicit ART_TILE_SIZE is honoured, otherwise 16.
+        // The live composite covers whole 16×16 threadgroups per tile, so only multiples
+        // of 16 are meaningful — say so instead of silently ignoring a measurement knob.
         self.liveTileSize = LiveConfig.liveTileSize()
+        let liveTileRequest = ProcessInfo.processInfo.environment["ART_LIVE_TILE_SIZE"]
+            ?? ProcessInfo.processInfo.environment["ART_TILE_SIZE"]
+        if let raw = liveTileRequest, let n = Int(raw), n != self.liveTileSize {
+            print("Live view: tile size \(n) ignored — the live composite needs a multiple of 16 "
+                  + "in 16…64; using \(self.liveTileSize)")
+        }
         
         self.commandQueue = device.makeCommandQueue()
         

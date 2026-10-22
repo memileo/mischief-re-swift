@@ -51,6 +51,7 @@ struct LiveStrokeParams {
     var tileOriginX: UInt32
     var tileOriginY: UInt32
     var boxTilesPerRow: UInt32
+    var boxTilesPerCol: UInt32
     var tileSize: UInt32
     var textureWidth: UInt32
     var textureHeight: UInt32
@@ -68,6 +69,7 @@ struct PerTileParams {
     var tileOriginX: UInt32
     var tileOriginY: UInt32
     var boxTilesPerRow: UInt32
+    var boxTilesPerCol: UInt32
     var tileSize: UInt32
 }
 
@@ -746,6 +748,7 @@ extension MetalRenderer {
         var params = PerTileParams(tileOriginX: UInt32(boxMinX),
                                    tileOriginY: UInt32(boxMinY),
                                    boxTilesPerRow: UInt32(boxWidth),
+                                   boxTilesPerCol: UInt32(boxHeight),
                                    tileSize: UInt32(liveTile))
         if containsNoise {
             guard let pipeline = livePerTileNoiseCompositePipeline else {
@@ -1964,6 +1967,7 @@ extension MetalRenderer {
         var params = LiveStrokeParams(
             tileOriginX: UInt32(bin.minTileX), tileOriginY: UInt32(bin.minTileY),
             boxTilesPerRow: UInt32(bin.boxTilesPerRow),
+            boxTilesPerCol: UInt32(bin.maxTileY - bin.minTileY + 1),
             tileSize: UInt32(liveTile),
             textureWidth: UInt32(width), textureHeight: UInt32(height),
             stampCount: UInt32(bin.segmentCount),
