@@ -220,21 +220,6 @@ extension MetalRenderer {
                 livePerTileAACompositePipeline = nil
             }
         }
-        // Four-pixels-per-thread twin of the per-tile AA composite (ART_LIVE_PIX=4, the
-        // default; 1 selects the reference kernel above). Optional on purpose: without
-        // it the one-pixel kernel renders the same pixels, just with one gather per
-        // pixel instead of one per four.
-        if let fn = library.makeFunction(name: "livePerTileAACompositePix4Kernel") {
-            do {
-                livePerTileAAPix4CompositePipeline = try device.makeComputePipelineState(function: fn)
-            } catch {
-                failures.append("livePerTileAACompositePix4Kernel: \(error)")
-                livePerTileAAPix4CompositePipeline = nil
-            }
-        } else {
-            // Not fatal: the one-pixel kernel is the reference and stays exact.
-            print("Live view: livePerTileAACompositePix4Kernel not in metallib — composite stays one pixel per thread")
-        }
         // Per-tile noise-capable composite (AA + noise per stroke group). Optional like
         // the AA one: noisy layers fall back to per-stroke when the metallib predates it.
         if let fn = library.makeFunction(name: "livePerTileNoiseCompositeKernel") {
@@ -768,13 +753,6 @@ extension MetalRenderer {
                                    boxTilesPerCol: UInt32(boxHeight),
                                    tileSize: UInt32(liveTile),
                                    ablate: UInt32(LiveConfig.ablate()))
-        // Per-tile AA composite: four pixels per thread by default (ART_LIVE_PIX=4), one
-        // pixel per thread when disabled or when the metallib predates the four-lane
-        // kernel. Both kernels cover 16×16 pixels per group, so only the thread count
-        // differs; the pixel map is the kernel's business.
-        let pix4 = !containsNoise
-            && LiveConfig.pixelsPerThread() == 4
-            && livePerTileAAPix4CompositePipeline != nil
         if containsNoise {
             guard let pipeline = livePerTileNoiseCompositePipeline else {
                 throw MetalRendererError.pipelineMissing("livePerTileNoiseCompositeKernel")
@@ -798,8 +776,7 @@ extension MetalRenderer {
             encoder.setTexture(noise, index: 1)
             if let sampler = linearSampler { encoder.setSamplerState(sampler, index: 0) }
         } else {
-            guard let pipeline = pix4 ? livePerTileAAPix4CompositePipeline
-                                      : livePerTileAACompositePipeline else {
+            guard let pipeline = livePerTileAACompositePipeline else {
                 throw MetalRendererError.pipelineMissing("livePerTileAACompositeKernel")
             }
             encoder.setComputePipelineState(pipeline)
@@ -816,13 +793,12 @@ extension MetalRenderer {
             encoder.setBuffer(strokeGroupsBuffer, offset: 0, index: 8)
             encoder.setTexture(gpuRenderTarget, index: 0)
         }
-        let compositeThreads = MTLSize(width: 16, height: 16 / (pix4 ? 4 : 1), depth: 1)
-        let groupsPerTileX = (liveTile + 15) / 16
-        let groupsPerTileY = (liveTile + 15) / 16
+        let groupsPerTileX = (liveTile + Int(Self.liveThreads.width) - 1) / Int(Self.liveThreads.width)
+        let groupsPerTileY = (liveTile + Int(Self.liveThreads.height) - 1) / Int(Self.liveThreads.height)
         let groups = MTLSize(width: boxWidth * groupsPerTileX,
                              height: boxHeight * groupsPerTileY,
                              depth: 1)
-        encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: compositeThreads)
+        encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: Self.liveThreads)
     }
 
     static func milliseconds(since start: UInt64) -> Double {

@@ -69,7 +69,10 @@ final class SegmentBinnerTests: XCTestCase {
 }
 
 /// `SegmentPrune.radius` must never be smaller than the true ink extent (or a pixel would be
-/// wrongly pruned) and stay tight. Pure maths, runs on Linux.
+/// wrongly pruned) and stay tight. The stored value is *shape reach only* — the coverage
+/// margins are device-space constants the kernels add (see `aaDeviceMargin` /
+/// `noiseDeviceMargin`), because the AA/noise falloff is measured in canvas pixels and does
+/// not scale with the zoom. Pure maths, runs on Linux.
 final class SegmentPruneTests: XCTestCase {
     fileprivate func f(_ v: Float) -> Double { Double(v) }
 
@@ -77,36 +80,210 @@ final class SegmentPruneTests: XCTestCase {
         let r = SegmentPrune.radius(p0: SIMD2(-100, 0), p1: SIMD2(0, 0),
                                     p2: SIMD2(100, 0), p3: SIMD2(200, 0),
                                     radius0: 5, radius1: 5, segmentType: 0, isMarker: false)
-        XCTAssertEqual(f(r), 6.875, accuracy: 1e-4)
+        XCTAssertEqual(f(r), 5.0, accuracy: 1e-4)   // radius, no margin
     }
 
-    func testStraightCapsuleTinyRadiusUsesAbsoluteMarginFloor() {
+    /// No absolute margin is baked in any more: the old `max(0.75, 0.375·r)` floor made a
+    /// thin stroke's prune disc ~2.5× larger than its ink and a thick one's 1.375×.
+    func testStoredReachCarriesNoDeviceMargin() {
         let r = SegmentPrune.radius(p0: SIMD2(0, 0), p1: SIMD2(0, 0),
                                     p2: SIMD2(50, 0), p3: SIMD2(50, 0),
                                     radius0: 0.5, radius1: 0.5, segmentType: 0, isMarker: false)
-        XCTAssertEqual(f(r), 1.25, accuracy: 1e-4)
+        XCTAssertEqual(f(r), 0.5, accuracy: 1e-4)
     }
 
-    func testSplineRadiusIncludesControlPointBulge() {
+    /// The bulge is the Bézier handles' offset, not the control points': the spline
+    /// deviates from its chord by roughly `(p2-p0)/6` and `(p3-p1)/6`, so this span's
+    /// reach is 8.33 + 3, not the 50 + 3 the old Catmull-Rom-hull bound gave.
+    func testSplineRadiusUsesTheBezierHandleBulge() {
         let r = SegmentPrune.radius(p0: SIMD2(0, 50), p1: SIMD2(0, 0),
                                     p2: SIMD2(100, 0), p3: SIMD2(100, 50),
                                     radius0: 3, radius1: 3, segmentType: 1, isMarker: false)
-        XCTAssertEqual(f(r), 54.125, accuracy: 1e-3)
+        XCTAssertEqual(f(r), 8.3333 + 3, accuracy: 1e-3)
     }
 
     func testMarkerRadiusUsesLargerReach() {
         let r = SegmentPrune.radius(p0: SIMD2(0, 50), p1: SIMD2(0, 0),
                                     p2: SIMD2(100, 0), p3: SIMD2(100, 50),
                                     radius0: 3, radius1: 3, segmentType: 1, isMarker: true)
-        XCTAssertEqual(f(r), 63.125, accuracy: 1e-3)
+        XCTAssertEqual(f(r), 8.3333 + 12, accuracy: 1e-3)  // handle bulge + 4·3 chisel
+    }
+
+    /// The prune is only output-identical if `farOffChord` really bounds the span: the
+    /// kernels evaluate the Catmull-Rom curve at t ∈ [0, 1] only (pre-samples, Newton
+    /// steps clamped to the span, the marker sweep), and the cubic Bézier hull contains
+    /// the whole curve. Densely sample the span; a wrong Bézier conversion would
+    /// under-prune and silently drop ink.
+    func testSplineReachContainsTheWholeSpan() {
+        func spline(_ p0: SIMD2<Float>, _ p1: SIMD2<Float>, _ p2: SIMD2<Float>,
+                    _ p3: SIMD2<Float>, _ t: Float) -> SIMD2<Float> {
+            let t2: Float = t * t, t3: Float = t2 * t
+            let c0: SIMD2<Float> = 2.0 * p1
+            let c1: SIMD2<Float> = -p0 + p2
+            let c2: SIMD2<Float> = 2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3
+            let c3: SIMD2<Float> = -p0 + 3.0 * p1 - 3.0 * p2 + p3
+            return 0.5 * (c0 + c1 * t + c2 * t2 + c3 * t3)
+        }
+        let cases: [(SIMD2<Float>, SIMD2<Float>, SIMD2<Float>, SIMD2<Float>, Float)] = [
+            (SIMD2(0, 50), SIMD2(0, 0), SIMD2(100, 0), SIMD2(100, 50), 3),
+            (SIMD2(-40, 90), SIMD2(0, 0), SIMD2(10, 0), SIMD2(60, 120), 2),
+            (SIMD2(30, -70), SIMD2(0, 0), SIMD2(12, 1), SIMD2(-80, 40), 5.5),
+            (SIMD2(0, 0), SIMD2(0, 0), SIMD2(1, 1), SIMD2(2, 0), 0.2),
+            (SIMD2(0, 0), SIMD2(0, 0), SIMD2(40, 0), SIMD2(40, 0), 4),
+        ]
+        for (p0, p1, p2, p3, r) in cases {
+            let reach = SegmentPrune.radius(p0: p0, p1: p1, p2: p2, p3: p3,
+                                            radius0: r, radius1: r,
+                                            segmentType: 1, isMarker: false)
+            var worst: Float = 0
+            for i in 0...200 {
+                let c = spline(p0, p1, p2, p3, Float(i) / 200)
+                let d = SegmentPrune.segmentDistanceSq(ax: p1.x, ay: p1.y, bx: p2.x, by: p2.y,
+                                                       px: c.x, py: c.y).squareRoot()
+                worst = max(worst, d)
+            }
+            XCTAssertLessThanOrEqual(Double(worst), Double(reach - r) + 1e-3,
+                                     "span escapes the stored reach: \(worst) > \(reach - r)")
+            // ... and it must never be looser than the old p0/p3 hull bound.
+            let oldBound = max(
+                SegmentPrune.segmentDistanceSq(ax: p1.x, ay: p1.y, bx: p2.x, by: p2.y,
+                                               px: p0.x, py: p0.y).squareRoot(),
+                SegmentPrune.segmentDistanceSq(ax: p1.x, ay: p1.y, bx: p2.x, by: p2.y,
+                                               px: p3.x, py: p3.y).squareRoot())
+            XCTAssertLessThanOrEqual(Double(reach - r), Double(oldBound) + 1e-3,
+                                     "Bézier bounds loosened the reach: \(reach - r) > \(oldBound)")
+        }
     }
 
     func testNeverPrunesPixelActuallyOnTheInk() {
-        let radius = SegmentPrune.radius(p0: SIMD2(0, 0), p1: SIMD2(0, 0),
-                                         p2: SIMD2(100, 0), p3: SIMD2(100, 0),
-                                         radius0: 5, radius1: 5, segmentType: 0, isMarker: false)
-        XCTAssertLessThan(5.0, Double(radius))            // on-ink edge pixel kept
-        XCTAssertGreaterThan(20.0, Double(radius))        // far pixel pruned
+        let reach = SegmentPrune.radius(p0: SIMD2(0, 0), p1: SIMD2(0, 0),
+                                        p2: SIMD2(100, 0), p3: SIMD2(100, 0),
+                                        radius0: 5, radius1: 5, segmentType: 0, isMarker: false)
+        let prune = reach + SegmentPrune.aaDeviceMargin
+        XCTAssertLessThan(5.0, Double(prune))             // on-ink edge pixel kept
+        XCTAssertGreaterThan(20.0, Double(prune))         // far pixel pruned
+    }
+
+    /// The AA margin must clear the kernel's exact coverage cutoff
+    /// (`cov = 1 - smootherstep(-0.94, 0.94, sd + 0.5)` is 0 at sd = 0.44) and stay tight:
+    /// every extra 0.1 px of radius is ~2 % of the kept disc.
+    func testAADeviceMarginCoversTheCutoffTightly() {
+        XCTAssertGreaterThanOrEqual(SegmentPrune.aaDeviceMargin, SegmentPrune.aaCutoff)
+        XCTAssertLessThanOrEqual(SegmentPrune.aaDeviceMargin - SegmentPrune.aaCutoff, 0.1)
+    }
+
+    /// The noise kernels' coverage reaches `1.375·max(radius, 1)` from the shape, so
+    /// `reach + margin` must cover it for every radius — including the `max(radius, 1)`
+    /// floor on a thin stroke and an uneven segment whose *local* radius is the small one
+    /// (the margin has to hold at `rMin`, the farthest-reaching point of the stroke).
+    func testNoiseDeviceMarginCoversTheNoiseFalloff() {
+        for r: Float in [0, 0.2, 0.5, 0.9, 1, 1.5, 2, 5, 10, 40] {
+            let margin = SegmentPrune.noiseDeviceMargin(radius0: r, radius1: r)
+            let needed = SegmentPrune.noiseReachFactor * max(r, 1)
+            XCTAssertGreaterThanOrEqual(r + margin, needed - 1e-4, "r=\(r)")
+            XCTAssertGreaterThanOrEqual(margin, SegmentPrune.aaDeviceMargin, "r=\(r)")
+        }
+        // Uneven: the local radius at the painted pixel can be rMin, so the bound must use
+        // rMax for the stored reach but rMin for the falloff.
+        let uneven: [(Float, Float)] = [(0.5, 8), (1.5, 0.4), (2, 3), (0, 6), (3, 0)]
+        for (r0, r1) in uneven {
+            let margin = SegmentPrune.noiseDeviceMargin(radius0: r0, radius1: r1)
+            let rMax = max(r0, r1), rMin = min(r0, r1)
+            XCTAssertGreaterThanOrEqual(rMax + margin,
+                                        SegmentPrune.noiseReachFactor * max(rMin, 1) - 1e-4,
+                                        "r0=\(r0) r1=\(r1)")
+        }
+    }
+
+    /// End-to-end exactness for the real algorithm, not just the analytic curve: mirror
+    /// `sdSplineSegment` (7 pre-samples + 2 clamped Newton steps) and the kernel's coverage
+    /// gate, then check that every pixel it paints is inside `reach + aaDeviceMargin`.
+    func testSplineSdfPaintIsInsideThePrune() {
+        func pos(_ p0: SIMD2<Float>, _ p1: SIMD2<Float>, _ p2: SIMD2<Float>,
+                 _ p3: SIMD2<Float>, _ t: Float) -> SIMD2<Float> {
+            let t2: Float = t * t, t3: Float = t2 * t
+            let c0: SIMD2<Float> = 2.0 * p1
+            let c1: SIMD2<Float> = -p0 + p2
+            let c2: SIMD2<Float> = 2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3
+            let c3: SIMD2<Float> = -p0 + 3.0 * p1 - 3.0 * p2 + p3
+            return 0.5 * (c0 + c1 * t + c2 * t2 + c3 * t3)
+        }
+        func tangent(_ p0: SIMD2<Float>, _ p1: SIMD2<Float>, _ p2: SIMD2<Float>,
+                     _ p3: SIMD2<Float>, _ t: Float) -> SIMD2<Float> {
+            let c1: SIMD2<Float> = -p0 + p2
+            let c2: SIMD2<Float> = 2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3
+            let c3: SIMD2<Float> = -p0 + 3.0 * p1 - 3.0 * p2 + p3
+            return 0.5 * (c1 + 2.0 * c2 * t + 3.0 * c3 * t * t)
+        }
+        /// Mirror of `sdSplineSegment`.
+        func sdf(_ p: SIMD2<Float>, _ p0: SIMD2<Float>, _ p1: SIMD2<Float>,
+                 _ p2: SIMD2<Float>, _ p3: SIMD2<Float>,
+                 _ ra: Float, _ rb: Float) -> Float {
+            let preSamples = 6
+            var bestT: Float = 0, minDistSq: Float = 1e20
+            for i in 0...preSamples {
+                let t = Float(i) / Float(preSamples)
+                let d = p - pos(p0, p1, p2, p3, t)
+                let dSq = d.x * d.x + d.y * d.y
+                if dSq < minDistSq { minDistSq = dSq; bestT = t }
+            }
+            var t = bestT
+            for _ in 0..<2 {
+                let c = pos(p0, p1, p2, p3, t)
+                let tg = tangent(p0, p1, p2, p3, t)
+                let d = p - c
+                let lenSq = tg.x * tg.x + tg.y * tg.y
+                t = min(max(t + (d.x * tg.x + d.y * tg.y) / (lenSq + 1e-5), 0), 1)
+            }
+            let c = pos(p0, p1, p2, p3, t)
+            let d = p - c
+            let radius = ra + (rb - ra) * t
+            return (d.x * d.x + d.y * d.y).squareRoot() - radius
+        }
+        /// Mirror of the kernel's `1 - smootherstep(-0.94, 0.94, sd + 0.5)`.
+        func coverage(_ sd: Float) -> Float {
+            let x = sd + 0.5
+            let t = min(max((x + 0.94) / 1.88, 0), 1)
+            return 1 - t * t * t * (t * (6 * t - 15) + 10)
+        }
+        let cases: [(SIMD2<Float>, SIMD2<Float>, SIMD2<Float>, SIMD2<Float>, Float, Float)] = [
+            (SIMD2(0, 50), SIMD2(0, 0), SIMD2(100, 0), SIMD2(100, 50), 3, 3),
+            (SIMD2(-40, 90), SIMD2(0, 0), SIMD2(10, 0), SIMD2(60, 120), 2, 7),
+            (SIMD2(30, -70), SIMD2(0, 0), SIMD2(12, 1), SIMD2(-80, 40), 5.5, 1),
+            (SIMD2(0, 0), SIMD2(0, 0), SIMD2(40, 0), SIMD2(40, 0), 4, 4),
+            (SIMD2(-8, 3), SIMD2(0, 0), SIMD2(1.5, 0.5), SIMD2(4, 6), 0.7, 0.3),
+        ]
+        // The margin is derived from this cutoff: no coverage from 0.44 px outwards,
+        // coverage just inside it.
+        XCTAssertEqual(coverage(SegmentPrune.aaCutoff), 0)
+        XCTAssertGreaterThan(coverage(SegmentPrune.aaCutoff - 0.01), 0)
+        for (p0, p1, p2, p3, ra, rb) in cases {
+            let reach = SegmentPrune.radius(p0: p0, p1: p1, p2: p2, p3: p3,
+                                            radius0: ra, radius1: rb,
+                                            segmentType: 1, isMarker: false)
+            let prune = reach + SegmentPrune.aaDeviceMargin
+            let pad = reach + 2
+            let minX = Int((min(min(p0.x, p1.x), min(p2.x, p3.x)) - pad).rounded(.down))
+            let maxX = Int((max(max(p0.x, p1.x), max(p2.x, p3.x)) + pad).rounded(.up))
+            let minY = Int((min(min(p0.y, p1.y), min(p2.y, p3.y)) - pad).rounded(.down))
+            let maxY = Int((max(max(p0.y, p1.y), max(p2.y, p3.y)) + pad).rounded(.up))
+            var painted = 0
+            for py in stride(from: minY, through: maxY, by: 2) {
+                for px in stride(from: minX, through: maxX, by: 2) {
+                    let p = SIMD2<Float>(Float(px) + 0.5, Float(py) + 0.5)
+                    let sd = sdf(p, p0, p1, p2, p3, ra, rb)
+                    guard coverage(sd) > 0 else { continue }
+                    painted += 1
+                    XCTAssertLessThan(sd, SegmentPrune.aaCutoff + 1e-4)
+                    let d = SegmentPrune.segmentDistanceSq(ax: p1.x, ay: p1.y,
+                                                           bx: p2.x, by: p2.y,
+                                                           px: p.x, py: p.y).squareRoot()
+                    XCTAssertLessThanOrEqual(Double(d), Double(prune) + 1e-3,
+                                             "painted pixel outside the prune: d=\(d) prune=\(prune)")
+                }
+            }
+            XCTAssertGreaterThan(painted, 0, "test case painted nothing")
+        }
     }
 
     /// Regression for the ellipses marker bug: polyline strokes emit straight (type-0)
@@ -130,12 +307,12 @@ final class SegmentPruneTests: XCTestCase {
         XCTAssertEqual(plain.count, marker.count)
         for s in plain {
             XCTAssertEqual(s.segmentType, 0)
-            XCTAssertEqual(Double(Float(bitPattern: s.padding1)), 6.875, accuracy: 1e-4)
+            XCTAssertEqual(Double(Float(bitPattern: s.padding1)), 5.0, accuracy: 1e-4)
         }
         for s in marker {
             XCTAssertEqual(s.segmentType, 0)
-            // 4·5 + max(0.75, 0.375·5) = 21.875 — the chisel reach, not 6.875.
-            XCTAssertEqual(Double(Float(bitPattern: s.padding1)), 21.875, accuracy: 1e-4)
+            // 4·5 = 20 — the chisel reach, not the plain capsule's 5.
+            XCTAssertEqual(Double(Float(bitPattern: s.padding1)), 20.0, accuracy: 1e-4)
         }
     }
 
@@ -237,38 +414,6 @@ final class LiveConfigTests: XCTestCase {
         XCTAssertFalse(LiveConfig.binStageTimingEnabled(environment: [:]))
         XCTAssertTrue(LiveConfig.binStageTimingEnabled(environment: ["ART_LIVE_BINTIME": "1"]))
         XCTAssertFalse(LiveConfig.binStageTimingEnabled(environment: ["ART_LIVE_BINTIME": "0"]))
-    }
-
-    /// `ART_LIVE_PIX`: four lanes per thread by default, one when explicitly disabled,
-    /// anything else ignored (the kernel exists only for 1 and 4).
-    func testPixelsPerThreadDefaultsFour() {
-        XCTAssertEqual(LiveConfig.pixelsPerThread(environment: [:]), 4)
-        XCTAssertEqual(LiveConfig.pixelsPerThread(environment: ["ART_LIVE_PIX": "4"]), 4)
-        XCTAssertEqual(LiveConfig.pixelsPerThread(environment: ["ART_LIVE_PIX": "1"]), 1)
-        XCTAssertEqual(LiveConfig.pixelsPerThread(environment: ["ART_LIVE_PIX": "2"]), 4)
-        XCTAssertEqual(LiveConfig.pixelsPerThread(environment: ["ART_LIVE_PIX": "0"]), 4)
-    }
-
-    /// Geometry invariant behind the four-lane composite: groups still cover 16×16
-    /// pixels, and the four lanes of one thread (rows `4y … 4y+3` of the band) always
-    /// land in the same live tile — so they share one tile list, one block cursor and
-    /// one document order. Tile sizes are multiples of 16 (enforced elsewhere), which
-    /// is what makes the row bands tile-aligned.
-    func testPix4LanesShareOneTile() {
-        for tile in stride(from: 16, through: 64, by: 16) {
-            let groupsPerTile = (tile + 15) / 16
-            XCTAssertEqual(groupsPerTile * 16, tile)   // whole 16-row bands
-            for band in 0..<(groupsPerTile * 4) {      // band = thread row in the band stack
-                let row0 = band * 4
-                let tileOfFirst = row0 / tile
-                for k in 0..<4 {
-                    XCTAssertEqual((row0 + k) / tile, tileOfFirst,
-                                   "tile \(tile): rows \(row0)…\(row0 + 3) cross a tile")
-                }
-            }
-            // Each group covers 16 px wide × 16 px tall: 16 threads × 4 lanes.
-            XCTAssertEqual(16 / 4 * 4, 16)
-        }
     }
 
     func testBinCheckDefaultsOff() {
@@ -970,12 +1115,15 @@ final class GpuBinSpecTests: XCTestCase {
             let pruneDoc = SegmentPrune.radius(p0: p0, p1: p1, p2: p2, p3: p3,
                                                radius0: r, radius1: r,
                                                segmentType: 0, isMarker: false)
-            // (1) the prune radius still covers the 0.44 px AA ink tail beyond the
-            // radius, so every AA-contributing pixel is inside the splat disk. (The
-            // noisy tail is pruned identically by walk and splat — sharing the same
-            // `padding1` is what makes them match there.)
-            XCTAssertGreaterThanOrEqual(pruneDoc - r, 0.44, "AA tail uncovered r=\(r)")
-            let pruneDev = pruneDoc * rf
+            // (1) `padding1` is the camera-scaled shape reach, and both paths add the
+            // same device-pixel margin (the 0.44 px AA tail plus slack), so every
+            // AA-contributing pixel is inside the splat disk. (The noisy tail is pruned
+            // identically by walk and splat — sharing `padding1` + the margin is what
+            // makes them match there.)
+            XCTAssertGreaterThanOrEqual(pruneDoc - r, 0, "shape reach lost r=\(r)")
+            XCTAssertGreaterThanOrEqual(pruneDoc + SegmentPrune.aaDeviceMargin - r,
+                                        SegmentPrune.aaCutoff, "AA tail uncovered r=\(r)")
+            let pruneDev = pruneDoc * rf + SegmentPrune.aaDeviceMargin
             let pad = 1.4 * r * rf + 1
             // (2) disk ⊆ box for radiusFactor ≤ 1.
             if rf <= 1 {
@@ -1047,8 +1195,10 @@ final class GpuBinSpecTests: XCTestCase {
                                            segmentType: 1, isMarker: false)
         // Curve bulge (40) dominates: prune far exceeds the box pad at rf = 1.
         XCTAssertGreaterThan(pruneDoc * 1.0, 1.4 * r * 1.0 + 1)
-        // At a zoom-out scale the same segment flips to the cheap disk path.
-        XCTAssertLessThanOrEqual(pruneDoc * 0.02, 1.4 * r * 0.02 + 1)
+        // At a deep zoom-out the same segment flips to the cheap disk path. The coverage
+        // margin is device-space now (not scaled), so it has to be added unscaled.
+        XCTAssertLessThanOrEqual(pruneDoc * 0.01 + SegmentPrune.aaDeviceMargin,
+                                 1.4 * r * 0.01 + 1)
     }
 
     private func coRankMergeUnit(src: [UInt32], dst: inout [UInt32], u: GpuBinMergeUnit) {

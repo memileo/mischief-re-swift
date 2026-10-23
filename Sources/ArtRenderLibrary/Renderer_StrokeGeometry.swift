@@ -475,8 +475,9 @@ internal func flattenAndBuild(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRS
             segmentType = 1
         }
         
-        // Append the final GPU struct directly. `padding1` carries a conservative per-pixel
-        // prune radius (see SegmentPrune); the static kernels never read it.
+        // Append the final GPU struct directly. `padding1` carries the segment's shape
+        // reach from its chord (see SegmentPrune); the live kernels add their own
+        // device-pixel coverage margin, and the static kernels never read it.
         var seg = GPUSplineSegment(
             p0: SIMD2<Float>(Float(p0.x), Float(p0.y)),
             p1: SIMD2<Float>(Float(p1.x), Float(p1.y)),

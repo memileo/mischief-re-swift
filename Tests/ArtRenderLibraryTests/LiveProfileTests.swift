@@ -334,6 +334,152 @@ final class LiveProfileTests: XCTestCase {
                      cullMs + combineMs + tableMs + chunkMs + mergeMs + copyMs, combinedTotal))
     }
 
+    /// How much of the composite pass's SDF work is provably empty? The per-pixel prune
+    /// skips a segment whose chord is farther than `padding1` from the pixel; every
+    /// surviving (pixel, segment) pair runs an SDF. This probe walks the same pixel box
+    /// the binner lists (`1.4·r + 1` around the chord) and counts survivors under
+    ///
+    ///   * the old rule: `reach + max(0.75, 0.375·rMax)`, folded into `padding1` and
+    ///     scaled with the camera, and
+    ///   * the new rule: `reach` in `padding1` (camera-scaled) plus a device-pixel margin
+    ///     (`aaDeviceMargin` for clean strokes, `noiseDeviceMargin` for noisy ones),
+    ///
+    /// next to the exact ink cutoff, so the ratio predicts the SDF saving before a Mac run.
+    ///
+    ///     ART_LIVE_PROFILE_PRUNE=art/kaos.art swift test --filter testProfilePruneHeadroom
+    ///     ART_LIVE_PROFILE_PRUNE_STRIDE=11   # sample fewer segments (default 7)
+    func testProfilePruneHeadroom() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let spec = environment["ART_LIVE_PROFILE_PRUNE"] else {
+            throw XCTSkip("set ART_LIVE_PROFILE_PRUNE=art/kaos.art to measure prune headroom")
+        }
+        let sampleStride = max(1, Int(environment["ART_LIVE_PROFILE_PRUNE_STRIDE"] ?? "") ?? 7)
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // ArtRenderLibraryTests
+            .deletingLastPathComponent()   // Tests
+            .deletingLastPathComponent()   // repo root
+        let url = spec.hasPrefix("/") ? URL(fileURLWithPath: spec)
+                                      : URL(fileURLWithPath: spec, relativeTo: repoRoot)
+        let data = try Data(contentsOf: url)
+        guard let art = ArtParser(data: [UInt8](data)) else {
+            XCTFail("parse failed: \(url.path)")
+            return
+        }
+        // Same setup as `testProfileBinPlan`: the live view of a 1920×1080 canvas at zoom 1
+        // has an identity camera, so `radiusFactor` is 1 and `padding1` is already in
+        // device pixels.
+        let renderer = Renderer(canvasSize: CGSize(width: 1920, height: 1080), scale: 1.0)
+        guard let cache = renderer.buildLiveRenderCacheGeometry(art: art),
+              let position = cache.layers.firstIndex(where: { !$0.needsRebuild }) else {
+            XCTFail("no cached layer in \(url.lastPathComponent)")
+            return
+        }
+        let layer = cache.layers[position]
+
+        struct Bucket {
+            var segments = 0, pixels = 0, old = 0, new = 0, ink = 0
+        }
+        var buckets: [String: Bucket] = [:]
+        var strokes = 0, segments = 0, noisy = 0, sampled = 0
+        var radiusHistogram = [Int](repeating: 0, count: 6)   // ≤1 ≤2 ≤4 ≤8 ≤16 >16
+        var sumOld = 0.0, sumNew = 0.0, sumInk = 0.0
+        let width = 1920, height = 1080
+
+        for op in layer.ops {
+            guard case .stroke(let s) = op else { continue }
+            strokes += 1
+            segments += s.segments.count
+            for (i, seg) in s.segments.enumerated() {
+                if seg.noiseSeed != 0 { noisy += 1 }
+                let rMax = max(seg.radius0, seg.radius1)
+                let rMin = min(seg.radius0, seg.radius1)
+                let bucket = rMax <= 1 ? 0 : rMax <= 2 ? 1 : rMax <= 4 ? 2
+                           : rMax <= 8 ? 3 : rMax <= 16 ? 4 : 5
+                radiusHistogram[bucket] += 1
+                guard i % sampleStride == 0 else { continue }
+                sampled += 1
+
+                // `radius` is the new shape-only reach (no margin) — exactly `padding1`
+                // at radiusFactor 1.
+                let reach = SegmentPrune.radius(
+                    p0: seg.p0, p1: seg.p1, p2: seg.p2, p3: seg.p3,
+                    radius0: seg.radius0, radius1: seg.radius1,
+                    segmentType: seg.segmentType, isMarker: false)   // per-tile path: no markers
+                let isNoisy = seg.noiseSeed != 0
+                let oldMargin = max(0.75, 0.375 * rMax)
+                let newMargin = isNoisy
+                    ? SegmentPrune.noiseDeviceMargin(radius0: seg.radius0, radius1: seg.radius1)
+                    : SegmentPrune.aaDeviceMargin
+                let inkReach = isNoisy
+                    ? reach - rMax + SegmentPrune.noiseReachFactor * max(rMin, 1)
+                    : reach + SegmentPrune.aaCutoff
+                let oldPrune = reach + oldMargin
+                let newPrune = reach + newMargin
+
+                // The binner's pixel box: pad = 1.4·rMax + 1 around the chord. Sample it
+                // on a stride that keeps the work bounded for fat strokes.
+                let pad = 1.4 * rMax + 1
+                let minX = Int((min(seg.p1.x, seg.p2.x) - pad).rounded(.down))
+                let maxX = Int((max(seg.p1.x, seg.p2.x) + pad).rounded(.up))
+                let minY = Int((min(seg.p1.y, seg.p2.y) - pad).rounded(.down))
+                let maxY = Int((max(seg.p1.y, seg.p2.y) + pad).rounded(.up))
+                let area = max(1, (maxX - minX + 1) * (maxY - minY + 1))
+                let pixelStride = max(1, Int((Double(area) / 4096.0).squareRoot().rounded(.up)))
+
+                let key = "type\(seg.segmentType) \(isNoisy ? "noise" : "clean")"
+                var b = buckets[key] ?? Bucket()
+                b.segments += 1
+                var y = minY
+                while y <= maxY {
+                    var x = minX
+                    while x <= maxX {
+                        if x >= 0 && x < width && y >= 0 && y < height {
+                            let d2 = SegmentPrune.segmentDistanceSq(
+                                ax: seg.p1.x, ay: seg.p1.y, bx: seg.p2.x, by: seg.p2.y,
+                                px: Float(x) + 0.5, py: Float(y) + 0.5)
+                            let d = d2.squareRoot()
+                            b.pixels += 1
+                            if d <= oldPrune { b.old += 1 }
+                            if d <= newPrune { b.new += 1 }
+                            if d <= inkReach { b.ink += 1 }
+                        }
+                        x += pixelStride
+                    }
+                    y += pixelStride
+                }
+                buckets[key] = b
+                sumOld += Double(oldPrune)
+                sumNew += Double(newPrune)
+                sumInk += Double(inkReach)
+            }
+        }
+
+        let names = ["≤1", "≤2", "≤4", "≤8", "≤16", ">16"]
+        print("\n=== prune headroom: \(url.lastPathComponent) (sample 1/\(sampleStride)) ===")
+        print(String(format: "  strokes %d | segments %d | noisy %d (%.1f%%) | sampled %d",
+                     strokes, segments, noisy,
+                     segments > 0 ? 100.0 * Double(noisy) / Double(segments) : 0, sampled))
+        print("  rMax histogram: " + zip(names, radiusHistogram)
+            .map { "\($0) \($1)" }.joined(separator: "  "))
+        print("  bucket             segs    boxPx     old      new      ink   new/old")
+        var totals = Bucket()
+        for key in buckets.keys.sorted() {
+            let b = buckets[key]!
+            totals.segments += b.segments; totals.pixels += b.pixels
+            totals.old += b.old; totals.new += b.new; totals.ink += b.ink
+            print(String(format: "  %-14@ %7d %8d %7d %8d %8d   %5.2f%%",
+                         key as NSString, b.segments, b.pixels, b.old, b.new, b.ink,
+                         b.old > 0 ? 100.0 * Double(b.new) / Double(b.old) : 0))
+        }
+        print(String(format: "  %-14@ %7d %8d %7d %8d %8d   %5.2f%%",
+                     "TOTAL" as NSString, totals.segments, totals.pixels,
+                     totals.old, totals.new, totals.ink,
+                     totals.old > 0 ? 100.0 * Double(totals.new) / Double(totals.old) : 0))
+        let n = Double(max(1, sampled))
+        print(String(format: "  mean prune radius: old %.2f px  new %.2f px  ink %.2f px  (sample is 1/%d of segments)",
+                     sumOld / n, sumNew / n, sumInk / n, sampleStride))
+    }
+
     /// Minimum of three runs: Swift on Linux pays lazy-page and allocator costs on the
     /// first pass, and the interactive frame sees the steady state.
     private static func measure(_ body: () -> Void) -> Double {

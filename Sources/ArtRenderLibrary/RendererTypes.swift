@@ -180,22 +180,35 @@ public enum SegmentBinner {
 
 // MARK: - Per-segment prune radius (platform-independent; unit-tested on Linux)
 
-/// A conservative upper bound on how far a segment's ink can sit from its chord p1→p2,
-/// used by the live kernels to skip a candidate segment for a given pixel (see the gate in
-/// `segmentKernels.metal`). A pixel whose distance to the chord exceeds this radius cannot
-/// receive any coverage from the segment, so the expensive SDF is skipped with identical
-/// output.
+/// A conservative upper bound on how far a segment's *shape* can sit from its chord
+/// p1→p2, used by the live kernels to skip a candidate segment for a given pixel (see the
+/// gate in `segmentKernels.metal`). A pixel whose distance to the chord exceeds
+/// `radius + deviceMargin` cannot receive any coverage from the segment, so the expensive
+/// SDF is skipped with identical output.
 ///
 /// Bounds it relies on:
 ///   * a straight capsule (segmentType 0) draws only p1→p2 + radius, so its ink never
 ///     leaves the chord;
-///   * a spline (type 1 / 2) sweeps the Catmull-Rom curve, which stays inside the convex
-///     hull of the four control points; the hull's farthest point from the chord p1→p2 is
-///     p0 or p3 (p1, p2 are on the chord);
-///   * a chisel marker sweeps a capsule reaching ~4·radius (3r along the 45° axis + r).
-/// The margin is at least 0.75 px (the AA kernel's coverage is 0 past ~0.44 px) and at
-/// least 0.375·rMax (the noise kernel's coverage tail) — the larger of the two keeps the
-/// single stored value valid for both kernels.
+///   * a spline (type 1 / 2) evaluates the Catmull-Rom curve only at t ∈ [0, 1], and that
+///     curve lies inside the convex hull of its cubic Bézier control points
+///     B0 = p1, B1 = p1 + (p2-p0)/6, B2 = p2 - (p3-p1)/6, B3 = p2. B0 and B3 are the chord
+///     ends, so `max(dist(B1), dist(B2))` bounds the curve's distance from the chord.
+///     (Bounding the *Catmull-Rom* control points p0/p3 instead — the obvious choice, and
+///     what this used to do — is ~6× looser, because a spline deviates from its chord by
+///     about a sixth of the neighbour offsets, not by all of it. On `kaos` that loose
+///     bound made the prune radius ~2× the ink and was ~60 % of all SDF evaluations.)
+///   * a chisel marker sweeps a capsule reaching ~4·radius (3r along the 45° axis + r)
+///     from the curve.
+///
+/// The stored value (`GPUSplineSegment.padding1`) is *shape only*: it lives in document
+/// space and scales with the camera like the radii. The coverage margins are added by the
+/// kernels in **device pixels**, because they describe the falloff in canvas space and do
+/// not scale with the zoom — `aaDeviceMargin` for the AA kernels (coverage is exactly zero
+/// past 0.44 px) and `noiseDeviceMargin` for the noise twins (their falloff reaches
+/// 1.375·max(radius, 1) from the shape). Folding a scaled margin into `padding1` was both
+/// too loose when zoomed in (kaos: 1.375·r vs the 1.0·r + 0.5 px the ink needs — over half
+/// of every SDF evaluation was spent on provably empty pixels) and too tight when zoomed
+/// out (the constant tail shrinks with the camera).
 public enum SegmentPrune {
     /// Squared distance from point (px,py) to segment a–b.
     static func segmentDistanceSq(ax: Float, ay: Float, bx: Float, by: Float,
@@ -212,6 +225,32 @@ public enum SegmentPrune {
         return dx * dx + dy * dy
     }
 
+    /// Coverage of the AA kernels is exactly zero past this distance from the shape:
+    /// `cov = 1 - smootherstep(-0.94, 0.94, sd + 0.5)` reaches 0 at `sd = 0.44`.
+    public static let aaCutoff: Float = 0.44
+
+    /// Device-space prune margin the AA kernels add to the stored shape reach
+    /// (`aaCutoff` + slack for the prune test's own float rounding).
+    public static let aaDeviceMargin: Float = 0.5
+
+    /// The noise kernels' coverage reaches `noiseReachFactor · max(radius, 1)` from the
+    /// shape: `nd = dist / (1.1·max(radius, 1))` and the airbrush falloff is zero at
+    /// `nd = 1.25`. Mirror of the constant in `segmentKernels.metal`.
+    public static let noiseReachFactor: Float = 1.375
+
+    /// Device-space prune margin for the noise kernels (see `noiseReachFactor`). A thick
+    /// stroke keeps the scaled falloff `0.375·rMax`; when the local radius drops below
+    /// one pixel the kernel's `max(radius, 1)` floor reaches farther than that, up to
+    /// `1.375 - r`. Tested against the kernel's coverage formula in
+    /// `SegmentPruneTests`; keep in step with `segmentKernels.metal`.
+    public static func noiseDeviceMargin(radius0: Float, radius1: Float) -> Float {
+        let rMax = max(radius0, radius1)
+        let rMin = min(radius0, radius1)
+        var margin = max(aaDeviceMargin, (noiseReachFactor - 1.0) * rMax)
+        if rMin < 1.0 { margin = max(margin, noiseReachFactor - rMin) }
+        return margin
+    }
+
     public static func radius(p0: SIMD2<Float>, p1: SIMD2<Float>, p2: SIMD2<Float>, p3: SIMD2<Float>,
                               radius0: Float, radius1: Float,
                               segmentType: UInt32, isMarker: Bool) -> Float {
@@ -220,13 +259,24 @@ public enum SegmentPrune {
         if segmentType == 0 {
             farOffChord = 0
         } else {
-            farOffChord = max(
+            // Cubic Bézier form of this Catmull-Rom span (B0 = p1, B3 = p2 are the chord
+            // ends); the curve is inside hull(B0…B3), so the handles bound its deviation.
+            let b1x = p1.x + (p2.x - p0.x) / 6, b1y = p1.y + (p2.y - p0.y) / 6
+            let b2x = p2.x - (p3.x - p1.x) / 6, b2y = p2.y - (p3.y - p1.y) / 6
+            let handleReach = max(
+                segmentDistanceSq(ax: p1.x, ay: p1.y, bx: p2.x, by: p2.y, px: b1x, py: b1y).squareRoot(),
+                segmentDistanceSq(ax: p1.x, ay: p1.y, bx: p2.x, by: p2.y, px: b2x, py: b2y).squareRoot())
+            // The Catmull-Rom control hull also contains the span, but with non-uniform
+            // point spacing its chord-distance bound can be *tighter* than the handles'
+            // (a far-back p0 pushes B1 past the chord end), so take the smaller of the two
+            // — both are valid bounds, and neither is ever looser than the old p0/p3 rule.
+            let pointReach = max(
                 segmentDistanceSq(ax: p1.x, ay: p1.y, bx: p2.x, by: p2.y, px: p0.x, py: p0.y).squareRoot(),
                 segmentDistanceSq(ax: p1.x, ay: p1.y, bx: p2.x, by: p2.y, px: p3.x, py: p3.y).squareRoot())
+            farOffChord = min(handleReach, pointReach)
         }
         let reach: Float = isMarker ? (4.0 * rMax) : rMax
-        let margin: Float = max(0.75, 0.375 * rMax)
-        return farOffChord + reach + margin
+        return farOffChord + reach
     }
 }
 
@@ -262,17 +312,6 @@ public enum LiveConfig {
     public static func perTileEnabled(environment: [String: String]? = nil) -> Bool {
         let env = environment ?? ProcessInfo.processInfo.environment
         return env["ART_LIVE_PERTILE"] != "0"
-    }
-
-    /// Pixels per thread in the per-tile AA composite: 4 (default) or 1
-    /// (`ART_LIVE_PIX=1`). Both are pixel-identical by construction — the four-lane
-    /// kernel pays the dependent 64-byte segment gather, the tile-list walk and the
-    /// per-stroke bookkeeping once per four pixels instead of once per pixel. The knob
-    /// is for A/B timing and as an escape hatch if a GPU dislikes the register pressure.
-    /// Noisy layers always use the one-pixel noise kernel.
-    public static func pixelsPerThread(environment: [String: String]? = nil) -> Int {
-        let env = environment ?? ProcessInfo.processInfo.environment
-        return env["ART_LIVE_PIX"] == "1" ? 1 : 4
     }
 
     /// GPU tile binning (transform + tile ranges + counts on the GPU, scatter + sort on

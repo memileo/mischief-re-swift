@@ -40,8 +40,10 @@ kaos zoom-out — and parallelism `segments × disk` (a few M threads). ~85× fe
 ### Exactness argument (the whole correctness proof)
 
 The walk evaluates segment `s` at pixel `p` iff `s` is in `p`'s tile list and
-`liveSegDist(p, p1, p2) ≤ padding1` (the prune). Pixels that fail the prune contribute
-exactly 0 to `curMax`, so the walk's output is a function of only
+`liveSegDist(p, p1, p2) ≤ padding1 + margin` (the prune; `padding1` is the camera-scaled
+shape reach and `margin` is the kernel's device-pixel coverage tail — 0.5 px for AA, the
+noise falloff otherwise). Pixels that fail the prune contribute exactly 0 to `curMax`, so
+the walk's output is a function of only
 
     W(s) = { p ∈ range(s) : liveSegDist(p, s) ≤ prune(s) }
 
@@ -188,13 +190,16 @@ dots in any document (it is not splat-specific, and it does not depend on the
 
 ## Correctness invariant, stated precisely
 
-The disk path needs `prune_dev ≤ pad_dev`, i.e. `margin_doc·rf ≤ 0.4·r_doc·rf + 1`
-(`pad = 1.4·rMax_dev + 1`). For `r_doc ≥ 2` (`margin_doc = 0.375·r_doc`) that holds for
-**any** `rf`; for `r_doc < 2` it degrades at large `rf`. So the kernel's per-segment
-`prune <= pad` test is the real correctness switch, and `ART_LIVE_SPLAT_MAX_RF = 1.0` is
-a *performance* gate (below it the disk is cheap; above it the disk can exceed the tile
-band, so the walk is not worse). Do not raise `MAX_RF` expecting a win at zoom-in — the
-tile is only 16 px, so the walk's expansion waste shrinks as `r_dev` grows.
+The disk path wants `prune_dev ≤ pad_dev`, i.e. `reach_doc·rf + margin_dev ≤ 1.4·r_doc·rf + 1`
+(`pad = 1.4·rMax_dev + 1`; the margin is a device-pixel constant now, no longer scaled).
+For a straight capsule (`reach_doc = r_doc`, `margin_dev ≤ 1.4`) it holds for **any** `rf`;
+for a spline with a large handle bulge (`reach_doc` includes `farOffChord`) it can fail at
+radiusFactor ≈ 1, which is exactly what the kernel's per-segment `prune <= pad` test
+catches: those segments iterate their tile range instead of the disk (both exact, the disk
+is just cheaper). `ART_LIVE_SPLAT_MAX_RF = 1.0` is a *performance* gate (below it the disk
+is cheap; above it the disk can exceed the tile band, so the walk is not worse). Do not
+raise `MAX_RF` expecting a win at zoom-in — the tile is only 16 px, so the walk's expansion
+waste shrinks as `r_dev` grows.
 
 ## Next round (corrected)
 
@@ -415,10 +420,10 @@ timings* should pass `--warmup 1`.
 (four walk kernels + the splat's disk trim). The three point-to-segment cases compare
 squared distances directly and the perpendicular case multiplies through by `|ba|²`, so
 the gate costs ~8 ops with no `sqrt` and no divide instead of a divide plus a `length`.
-`SegmentPrune.radius` stores `reach + max(0.75, 0.375·r)`, i.e. at least 0.75 px more than
-the last pixel with non-zero coverage, so the rounding difference between the two forms
-cannot flip a contributing pixel; the kaos pixel gate and `stroke-splat-ab.sh --all` are
-the check.
+`SegmentPrune.radius` stores the shape reach and the kernels add a device-pixel margin
+(0.5 px for the AA kernels, the noise falloff for the noise twins — see Round 7), so the
+rounding difference between the two forms cannot flip a contributing pixel; the kaos pixel
+gate and `stroke-splat-ab.sh --all` are the check.
 
 ### Next step, decided by the numbers
 
@@ -564,40 +569,113 @@ Three chips (bit 16 = 10.9 ms, blend/write ≈ 0, floor ≈ 12.5) all say the sa
 kernel is one load-to-use stall per listed segment. Cutting arithmetic cannot help; cutting
 *iterations per pixel* or *stalls per iteration* can.
 
-### The change: four pixels per thread
+### The change that was tried: four pixels per thread (rejected)
 
-`livePerTileAACompositePix4Kernel` (ART_LIVE_PIX, default 4; `ART_LIVE_PIX=1` selects the
-reference one-pixel kernel). One thread owns four vertically adjacent pixels of its tile:
+`livePerTileAACompositePix4Kernel` (ART_LIVE_PIX, default 4) gave one thread four
+vertically adjacent pixels: the tile-list walk and the 64-byte `segments[segIdx]` gather
+were paid once per four pixels, and the four prunes/SDFs could interleave. It was exact
+(`pix-ab.sh`: 1 vs 4 byte-equal) and it did exactly what the latency model predicted — and
+it was still ~1 ms *slower*:
 
-* the tile-list walk, the stroke-group cursor and the per-stroke bookkeeping are paid once
-  per four pixels instead of once per pixel;
-* the dependent 64-byte `segments[segIdx]` gather is issued **once** and serves all four
-  lanes — the whole point (bit 16 is half the pass);
-* the four prunes and four SDFs are independent, so they interleave and fill the stall the
-  one-pixel kernel exposed, which is exactly what a latency-bound loop needs.
+```
+pix1  23.77 / 24.94   render+comp
+pix4  25.09 / 25.12   render+comp
 
-Dispatch geometry is unchanged at 16×16 pixels per group (`threadsPerThreadgroup` becomes
-16×4, and a thread's lanes are rows `4y … 4y+3`). Live tile sizes are multiples of 16, so
-the four lanes always share one tile — hence one list, one order, one cursor. Per-lane
-state (`pos`, `acc`, `curMax`, the block box test, the write) is duplicated; everything
-shared is shared. Exactness is structural: same segments, same order, same prune, same SDF,
-same per-pixel write. `ART_LIVE_PIX=1` vs `4` must be byte-identical, and all ablation bits
-are still wired so `composite-ablate.sh` attributes the new kernel unchanged. Noisy layers
-keep the one-pixel noise kernel.
+ablation (pix4):  bit0 25.09 | bit1 10.32 | bit2 6.78 | bit4 23.87 | bit8 24.96 | bit16 7.47
+ablation (pix1):  bit0 23.44 | bit1 15.53 | bit2 12.81 | bit4 23.20 | bit8 23.84 | bit16 12.53
+```
+
+Read it as a resource model rather than one chain: `pix4` halved the loop/gather floor
+(12.81 → 6.78) as designed, but the SDF's *marginal* cost doubled (7.91 → 14.77) because
+four lanes per thread means four times fewer warps, and the SDF is 10–12 dependent curve
+evaluations with two divisions. At pix1 the SDF's issue slots hide under the gather stalls
+(12.8 + 18.3 − 7.7 overlap ≈ 23.4); at pix4 there is nothing left to hide behind
+(6.8 + 18.3 ≈ 25.1). **Net: no.** Reverted in full — kernel, pipeline, `LiveConfig` knob,
+tests and `Scripts/pix-ab.sh` are gone. The data point is kept because it fixes the budget:
+the composite is ~18 ms of SDF work, ~13 ms of loop+loads at pix1, and only ~7.7 ms of the
+loop is hidden.
+
+That leaves exactly two exact levers: fewer SDF evaluations, or a cheaper loop. Round 7
+took the first one, and it turned out the prune bound was not merely loose — it was
+*double* the ink radius.
+
+## Round 7 — the prune bound was 2× the ink: Bézier hull + device-space margin
+
+### What was wrong
+
+`padding1` was `farOffChord + reach + max(0.75, 0.375·rMax)`:
+
+1. **`farOffChord` used the Catmull-Rom control points p0/p3.** A CR span deviates from its
+   chord by about a *sixth* of the neighbour offsets — the curve lives in the Bézier hull
+   B0 = p1, B1 = p1 + (p2-p0)/6, B2 = p2 - (p3-p1)/6, B3 = p2, and only B0/B3 are on the
+   chord. Bounding p0/p3 is the obvious-but-6×-loose choice. (Guarded by the p0/p3 hull
+   too: `min(handleReach, pointReach)`, because with non-uniform spacing a far-back p0 can
+   push B1 past the chord end and make the handle bound the looser one. Both are valid,
+   neither is ever looser than the old rule.)
+2. **The margin was folded into the camera-scaled value.** The AA tail (0.44 px) and the
+   noise falloff (1.375·max(r,1)) are *device-pixel* constants, so scaling
+   `max(0.75, 0.375·rMax)` with the zoom was too loose at zoom-in (1.375·r vs the 1.0·r +
+   0.5 px the ink needs) and too tight at zoom-out (the constant tail shrank below 0.44 px,
+   and a thin noisy stroke's `max(radius, 1)` floor needs up to 1.375 − r).
+
+### Measured on Linux before touching the Mac
+
+`ART_LIVE_PROFILE_PRUNE=art/kaos.art swift test --filter testProfilePruneHeadroom` walks the
+same pixel box the binner lists (`1.4·r + 1` around the chord) and counts prune survivors:
+
+```
+strokes 2214 | segments 321611 | noisy 0 (0.0%)
+rMax histogram: ≤1 0  ≤2 61337  ≤4 98442  ≤8 161832  ≤16 0  >16 0
+bucket           segs    boxPx     old      new      ink   new/old
+type0 clean      8722  5959682 2636702  1968203  1935740   74.65%
+type1 clean     30725 11793829 5723726  4026399  3952534   70.35%
+type2 clean      7451  2101346  965682   626802   613060   64.91%
+TOTAL           46898 19854857 9326110  6621404  6501334   71.00%
+mean prune radius: old 5.73 px  new 4.68 px  ink 4.62 px
+```
+
+Those `old`/`new` columns are both under the *new* `farOffChord`; against the shipped code
+the pass count goes **14.70 M → 6.62 M (45 %)**, the mean prune radius **9.77 → 4.68 px**,
+and the survivors sit within 1.8 % of the *exact* ink cutoff (6.50 M) — there is nothing
+left to squeeze here. kaos has no noisy segments at all, so the noise margin costs it
+nothing; other documents keep the scaled `0.375·r` tail.
+
+SDF was ~18.3 ms (Round 6, pix4-exposed), so a 55 % cut predicts
+`render+comp 23.4 → ~13–14 ms`, i.e. the 16 ms target, with the loop untouched.
+
+### The change
+
+* `SegmentPrune.radius` returns **shape reach only**: `min(handle hull, control hull) + rMax`
+  (markers: `+ 4·rMax`). Document space, scales with the camera like the radii.
+* The kernels add the **device-space** margin themselves:
+  `as_type<float>(padding1) + 0.5f` in the two AA kernels (0.44 px cutoff + rounding),
+  `+ liveNoisePruneMargin(r0, r1)` in the two noise kernels, where
+  `max(0.5, 0.375·rMax, rMin < 1 ? 1.375 − rMin : 0)`; the splat kernel uses the same two
+  expressions, so the walk's and the splat's contributing sets stay identical.
+* `0` keeps meaning "never prune" (only degenerate `rMax = 0` type-0 segments).
+
+### Why it is still output-identical
+
+* The curve is only evaluated at t ∈ [0, 1] (`PRE_SAMPLES`, Newton steps clamp, the marker
+  sweep), and a cubic Bézier lies in the convex hull of its handles, so every evaluated
+  curve point is at most `handleReach` from the chord.
+* Paint ⇒ `dist(p, curve) ≤ r + 0.44`; with the 1-Lipschitz chord distance,
+  `dist(p, chord) ≤ handleReach + rMax + 0.44`, and the kernel prunes at
+  `handleReach + rMax + 0.5`.
+* Noise: paint ⇒ the pixel is at most `1.375·max(r, 1)` from the curve; the margin covers it
+  for every local radius between rMin and rMax.
+* Static kernels do not read `padding1` at all, so `art/kaos.png` ground truth cannot move.
 
 ### Files
 
-* `ArtQuickLook/ArtRenderShaders/segmentKernels.metal` — new kernel (the one-pixel kernel
-  above it stays as the reference and the fallback).
-* `Sources/ArtRenderLibrary/MetalRenderer_LiveCompositing.swift` — pipeline (optional:
-  a stale metallib keeps the one-pixel kernel and prints a note), kernel selection,
-  16×16-pixel group geometry with 16×4 threads.
-* `Sources/ArtRenderLibrary/MetalRenderer.swift` — pipeline property.
-* `Sources/ArtRenderLibrary/RendererTypes.swift` — `LiveConfig.pixelsPerThread`.
-* `Tests/ArtRenderLibraryTests/TileUnionTests.swift` — knob defaults, and the tile-alignment
-  invariant (four lanes can never straddle a tile at 16/32/48/64).
-* `Scripts/pix-ab.sh` — copy-per-mode (`tmp/pix-ab/<doc>@<zoom>/<pix>/`) SHA-256 A/B of
-  `ART_LIVE_PIX=1` vs `4`; reports `INCONCLUSIVE` if the metallib lacks the new kernel.
+* `Sources/ArtRenderLibrary/RendererTypes.swift` — `SegmentPrune`: Bézier/point hull reach,
+  `aaCutoff`, `aaDeviceMargin`, `noiseReachFactor`, `noiseDeviceMargin`.
+* `ArtQuickLook/ArtRenderShaders/segmentKernels.metal` — `liveNoisePruneMargin` and the five
+  prune sites (per-stroke AA/noise, per-tile AA/noise, splat disk radius).
+* `Tests/ArtRenderLibraryTests/TileUnionTests.swift` — hull reach values, a dense
+  span-containment test, and the margin-coverage tests.
+* `Tests/ArtRenderLibraryTests/LiveProfileTests.swift` — `testProfilePruneHeadroom` (opt-in).
+* `SPLAT-DESIGN.md` — this section.
 
 ### Run this (metallib rebuild IS needed this round)
 
@@ -605,36 +683,22 @@ keep the one-pixel noise kernel.
 sh Scripts/build-metallib.sh          # or the ArtRenderShaders scheme in Xcode
 swift build -c release
 
-sh Scripts/pix-ab.sh art/kaos.art            # 1 vs 4 must be byte-identical
-sh Scripts/stroke-splat-ab.sh --all          # 10/10 IDENTICAL
-sh Scripts/stroke-prune-ab.sh --modes 0,1,2 art/kaos.art
+sh Scripts/stroke-splat-ab.sh --all                       # 10/10 IDENTICAL
+sh Scripts/stroke-prune-ab.sh --modes 0,1,2 art/kaos.art  # byte-equal
+# kaos zoom-1 pixel gate vs art/kaos.png (~2 bytes is the historical pass)
 
-# timing (BINTIME), 4 vs 1
-ART_LIVE_BINTIME=1 ART_LIVE_PIX=4 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/kaos.art
-ART_LIVE_BINTIME=1 ART_LIVE_PIX=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/kaos.art
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/kaos.art
+sh Scripts/composite-ablate.sh                            # re-baseline the composite
 ```
 
-`pix-ab.sh` fails with `INCONCLUSIVE` when the metallib still lacks the four-lane kernel
-(both modes would then run the same kernel — an identical result would mean nothing).
+Expect `render+comp` ≈ 13–14 ms and bit 1 (SDF) to fall to ~4 ms; the loop/gather bits
+(12.8 / 12.5) stay put. If that holds, the composite is loop-bound again and the next exact
+levers are, in order:
 
-Expect `render+comp` to fall by roughly the gather half of the pass (24.0 → ~14–18) if the
-four chains fill the stall; the floor (12.53) is now the hard part, because it is per-lane
-bookkeeping that pix4 has already divided by four once. Then re-run
-`sh Scripts/composite-ablate.sh` on the *default* kernel to see what is left.
-
-If pix4 lands where the model says, the next deciders are:
-
-1. **pix8** (16×2 threads): another halving of gather and loop per pixel; the risk is
-   register pressure (8 × `acc` + 8 SDF temporaries). It is a one-constant change in the
-   same kernel if pix4 is clean.
-2. **SDF cost** (bit 1 = 7.91): only approximations can move this, and only where the pixel
-   gate allows a documented tolerance.
-3. **Tighter bin pad** (exact, ~10–15 % fewer incidences): the bin box still uses
-   `1.4·r + 1`, while the *prune* radius is `r + max(0.75, 0.375·r)` (plus `farOffChord`
-   for splines). For every non-marker segment the prune radius already covers the paint
-   (`r + 0.44`), so `pad = pruneRadius + 0.5` is still conservative — and it shrinks the
-   box by 4–14 % per side, which is 8–26 % fewer tile incidences, i.e. 8–26 % less loop,
-   gather and SDF. Markers must keep `4·r + 2`. Touches `SegmentPadding.pad` and its GPU
-   mirror `liveBinRangeForSeg`, so it needs its own A/B round.
-4. **`xform`** (4.3–4.9): threadgroup-local histogram instead of ~1.45 M atomics into 7800
-   counters.
+1. **`xform` 4.3–4.9 ms** — one global-atomic histogram (1.45 M atomics into 7800 counters);
+   a threadgroup-local histogram per tile block removes the contention.
+2. **Bin pad** — `1.4·r + 1` is now much larger than the (much tighter) prune radius; the
+   tile box can shrink to `reach + 0.5` without changing any pixel, cutting incidences and
+   the sort/merge volume.
+3. **SDF math** — only with a documented tolerance: the spline SDF is 7 curve samples + 2
+   Newton steps per evaluation, and kaos spends most of its SDF budget in `type 1`.
