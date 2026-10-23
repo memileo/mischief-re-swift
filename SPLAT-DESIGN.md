@@ -517,3 +517,124 @@ After the gate, the same profile prints `blockTable 7.59 | memcpys 0.01` and `bl
 
 
 
+
+## Round 6 — the gate paid off, and the composite is latency-bound
+
+### What the Mac said (kaos zoom 1, `--warmup 1`)
+
+Prune gate (table dropped), warm frame:
+
+```
+Live view: 33 ms total (bin 2, alloc 0, encode 0, gpu 30, paper 1)
+xform 4.34  scatter 0.66  sort 0.60  render+comp 24.05
+```
+
+`ART_LIVE_STROKE_PRUNE=2` (table forced back), same frame: `bin 38`,
+`render+comp 32.48`, `total 78`. So the gate is a straight win on *both* sides — the table
+cost 40 ms of wall clock and 8.4 ms of GPU, and the fallback (walking the tile list) is both
+cheaper and exact. All three modes stay byte-identical
+(`stroke-prune-ab.sh --modes 0,1,2`), 10/10 splat views identical.
+
+### The fresh ablation (same frame, table gone)
+
+| bit | `render+comp` | Δ | stage |
+|---|---|---|---|
+| 0 | 23.44 | — | — |
+| 1 | 15.53 | 7.91 | SDF + coverage |
+| 2 | 12.81 | 10.63 | loop + list loads + segment loads |
+| 4 | 23.20 | 0.24 | blend/quantise |
+| 8 | 23.84 | −0.40 | target write |
+| 16 | 12.53 | 10.91 | the 64-byte `segments[segIdx]` gather |
+
+Two things changed from Round 4: the floor dropped 12.67 → 12.53 while the total dropped
+33.69 → 23.44 (the table's 8.4 ms of GPU box tests are gone), and **blend/write are now
+free** (0.24 / −0.40 vs 1.72 / 1.96). Blend and write were never really 2 ms of work; they
+were part of the same latency window. Removing them now just moves where the stall lands.
+
+That is the real diagnosis: the pass is **latency-bound, not throughput-bound**. It walks
+`372,460,288` (pixel × listed-segment) iterations in 23.4 ms, and the prune rejects the
+large majority before any SDF runs — the arithmetic for 372M iterations is ≲1 ms at this
+GPU's ALU rate, so ~95 % of the frame is waiting on the dependent chain
+
+```
+tileList[j] → segIdx → segments[segIdx] (64 B gather) → prune → SDF → curMax
+```
+
+Three chips (bit 16 = 10.9 ms, blend/write ≈ 0, floor ≈ 12.5) all say the same thing: the
+kernel is one load-to-use stall per listed segment. Cutting arithmetic cannot help; cutting
+*iterations per pixel* or *stalls per iteration* can.
+
+### The change: four pixels per thread
+
+`livePerTileAACompositePix4Kernel` (ART_LIVE_PIX, default 4; `ART_LIVE_PIX=1` selects the
+reference one-pixel kernel). One thread owns four vertically adjacent pixels of its tile:
+
+* the tile-list walk, the stroke-group cursor and the per-stroke bookkeeping are paid once
+  per four pixels instead of once per pixel;
+* the dependent 64-byte `segments[segIdx]` gather is issued **once** and serves all four
+  lanes — the whole point (bit 16 is half the pass);
+* the four prunes and four SDFs are independent, so they interleave and fill the stall the
+  one-pixel kernel exposed, which is exactly what a latency-bound loop needs.
+
+Dispatch geometry is unchanged at 16×16 pixels per group (`threadsPerThreadgroup` becomes
+16×4, and a thread's lanes are rows `4y … 4y+3`). Live tile sizes are multiples of 16, so
+the four lanes always share one tile — hence one list, one order, one cursor. Per-lane
+state (`pos`, `acc`, `curMax`, the block box test, the write) is duplicated; everything
+shared is shared. Exactness is structural: same segments, same order, same prune, same SDF,
+same per-pixel write. `ART_LIVE_PIX=1` vs `4` must be byte-identical, and all ablation bits
+are still wired so `composite-ablate.sh` attributes the new kernel unchanged. Noisy layers
+keep the one-pixel noise kernel.
+
+### Files
+
+* `ArtQuickLook/ArtRenderShaders/segmentKernels.metal` — new kernel (the one-pixel kernel
+  above it stays as the reference and the fallback).
+* `Sources/ArtRenderLibrary/MetalRenderer_LiveCompositing.swift` — pipeline (optional:
+  a stale metallib keeps the one-pixel kernel and prints a note), kernel selection,
+  16×16-pixel group geometry with 16×4 threads.
+* `Sources/ArtRenderLibrary/MetalRenderer.swift` — pipeline property.
+* `Sources/ArtRenderLibrary/RendererTypes.swift` — `LiveConfig.pixelsPerThread`.
+* `Tests/ArtRenderLibraryTests/TileUnionTests.swift` — knob defaults, and the tile-alignment
+  invariant (four lanes can never straddle a tile at 16/32/48/64).
+* `Scripts/pix-ab.sh` — copy-per-mode (`tmp/pix-ab/<doc>@<zoom>/<pix>/`) SHA-256 A/B of
+  `ART_LIVE_PIX=1` vs `4`; reports `INCONCLUSIVE` if the metallib lacks the new kernel.
+
+### Run this (metallib rebuild IS needed this round)
+
+```
+sh Scripts/build-metallib.sh          # or the ArtRenderShaders scheme in Xcode
+swift build -c release
+
+sh Scripts/pix-ab.sh art/kaos.art            # 1 vs 4 must be byte-identical
+sh Scripts/stroke-splat-ab.sh --all          # 10/10 IDENTICAL
+sh Scripts/stroke-prune-ab.sh --modes 0,1,2 art/kaos.art
+
+# timing (BINTIME), 4 vs 1
+ART_LIVE_BINTIME=1 ART_LIVE_PIX=4 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/kaos.art
+ART_LIVE_BINTIME=1 ART_LIVE_PIX=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/kaos.art
+```
+
+`pix-ab.sh` fails with `INCONCLUSIVE` when the metallib still lacks the four-lane kernel
+(both modes would then run the same kernel — an identical result would mean nothing).
+
+Expect `render+comp` to fall by roughly the gather half of the pass (24.0 → ~14–18) if the
+four chains fill the stall; the floor (12.53) is now the hard part, because it is per-lane
+bookkeeping that pix4 has already divided by four once. Then re-run
+`sh Scripts/composite-ablate.sh` on the *default* kernel to see what is left.
+
+If pix4 lands where the model says, the next deciders are:
+
+1. **pix8** (16×2 threads): another halving of gather and loop per pixel; the risk is
+   register pressure (8 × `acc` + 8 SDF temporaries). It is a one-constant change in the
+   same kernel if pix4 is clean.
+2. **SDF cost** (bit 1 = 7.91): only approximations can move this, and only where the pixel
+   gate allows a documented tolerance.
+3. **Tighter bin pad** (exact, ~10–15 % fewer incidences): the bin box still uses
+   `1.4·r + 1`, while the *prune* radius is `r + max(0.75, 0.375·r)` (plus `farOffChord`
+   for splines). For every non-marker segment the prune radius already covers the paint
+   (`r + 0.44`), so `pad = pruneRadius + 0.5` is still conservative — and it shrinks the
+   box by 4–14 % per side, which is 8–26 % fewer tile incidences, i.e. 8–26 % less loop,
+   gather and SDF. Markers must keep `4·r + 2`. Touches `SegmentPadding.pad` and its GPU
+   mirror `liveBinRangeForSeg`, so it needs its own A/B round.
+4. **`xform`** (4.3–4.9): threadgroup-local histogram instead of ~1.45 M atomics into 7800
+   counters.

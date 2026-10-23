@@ -264,6 +264,17 @@ public enum LiveConfig {
         return env["ART_LIVE_PERTILE"] != "0"
     }
 
+    /// Pixels per thread in the per-tile AA composite: 4 (default) or 1
+    /// (`ART_LIVE_PIX=1`). Both are pixel-identical by construction — the four-lane
+    /// kernel pays the dependent 64-byte segment gather, the tile-list walk and the
+    /// per-stroke bookkeeping once per four pixels instead of once per pixel. The knob
+    /// is for A/B timing and as an escape hatch if a GPU dislikes the register pressure.
+    /// Noisy layers always use the one-pixel noise kernel.
+    public static func pixelsPerThread(environment: [String: String]? = nil) -> Int {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        return env["ART_LIVE_PIX"] == "1" ? 1 : 4
+    }
+
     /// GPU tile binning (transform + tile ranges + counts on the GPU, scatter + sort on
     /// the GPU, tiny prefix on the CPU) is the default; set `ART_LIVE_GPUBIN=0` to force
     /// the CPU binning path for A/B comparison. Missing pipelines also fall back to CPU

@@ -1352,6 +1352,192 @@ kernel void livePerTileAACompositeKernel(
     if (acc.a > 0.0001f && (ablate & 8u) == 0u) target.write(acc, pixel);
 }
 
+// MARK: - Per-tile AA composite, four pixels per thread (ART_LIVE_PIX=4)
+//
+// Same maths, same iteration order and same ablation bits as
+// `livePerTileAACompositeKernel` above — that kernel is the reference implementation and
+// the two must stay in step (the pixel gate compares them: ART_LIVE_PIX=1 vs 4 must be
+// byte-identical).
+//
+// What changes is the thread-to-pixel map. One thread owns FOUR vertically adjacent
+// pixels of its tile, so the tile-list walk, the stroke-group bookkeeping and — the
+// expensive part — the dependent 64-byte `segments[segIdx]` gather are paid once per
+// four pixels instead of once per pixel. The four SDF evaluations are independent, so
+// they fill the load-latency window the one-pixel kernel exposes (kaos zoom 1: the
+// gather alone was 10.9 ms of a 23.4 ms pass, and the loop measured latency-bound, not
+// throughput-bound).
+//
+// Tile decode uses the base pixel. The four lanes are rows gid.y*4 … gid.y*4+3 of the
+// same 16-pixel band, and live tile sizes are multiples of 16 (enforced on the CPU), so
+// all four lanes always fall inside ONE tile — hence one tile list, one block cursor,
+// one document order. `pixel`/`pos` are per lane because the trailing-thread guard, the
+// block box test and the write are per pixel.
+kernel void livePerTileAACompositePix4Kernel(
+    const device PerTileParams &params    [[buffer(0)]],
+    const device GPUSplineSegment *segments [[buffer(1)]],   // global, document (stroke) order
+    const device uint32_t *strokeOfSegment [[buffer(2)]],     // global segIdx -> stroke idx
+    const device TileIndex *tileStartCount [[buffer(3)]],     // per box-local tile: start/count
+    const device uint32_t *tileList [[buffer(4)]],            // global segIdx, ascending (= doc order)
+    const device float4 *strokeColor [[buffer(5)]],           // per stroke: pen colour
+    const device uint32_t *strokeFlags [[buffer(6)]],         // per stroke: bit0 = eraser
+    const device uint2 *strokeGroupTiles [[buffer(7)]],       // per box-local tile: (start, count) groups
+    const device LiveStrokeGroupBlock *strokeGroups [[buffer(8)]], // flat block table
+    texture2d<float, access::read_write> target [[texture(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint PIX = 4u;
+    uint w = target.get_width();
+    uint h = target.get_height();
+    uint2 originPx = uint2(params.tileOriginX, params.tileOriginY) * params.tileSize;
+    uint2 base = originPx + uint2(gid.x, gid.y * PIX);
+    // Rows only grow downward from the base pixel, so an off-target base puts all four
+    // lanes off-target — same early-out as the reference kernel.
+    if (base.x >= w || base.y >= h) return;
+
+    uint2 tileID = base / params.tileSize;
+    // Same trailing-thread guard as the one-pixel kernel: the dispatch covers whole
+    // 16×16 groups per tile, so anything outside the layer's tile box must not index
+    // the per-tile tables. All four lanes share `tileID`, so one check covers them.
+    if (tileID.x - params.tileOriginX >= params.boxTilesPerRow ||
+        tileID.y - params.tileOriginY >= params.boxTilesPerCol) return;
+    uint localTile = (tileID.y - params.tileOriginY) * params.boxTilesPerRow
+                   + (tileID.x - params.tileOriginX);
+    TileIndex tc = tileStartCount[localTile];
+
+    // ART_LIVE_ABLATE: same bits as the reference kernel (0 in normal use, wrong pixels
+    // otherwise) so `Scripts/composite-ablate.sh` attributes this kernel unchanged.
+    const uint ablate = params.ablate;
+
+    // Lane state. `live` = the lane's pixel exists on the target; the other three arrays
+    // are the exact per-pixel state the one-pixel kernel keeps in scalars.
+    float2 pos[PIX];
+    float4 acc[PIX];
+    float curMax[PIX];
+    bool active[PIX];
+    bool live[PIX];
+    for (uint k = 0; k < PIX; ++k) {
+        pos[k] = float2(base.x, base.y + k) + float2(0.5f, 0.5f);
+        acc[k] = float4(0.0f);
+        curMax[k] = 0.0f;
+        active[k] = true;
+        live[k] = (base.x < w) && (base.y + k < h);
+    }
+
+    // Block skip table: identical contract to the reference kernel (count 0 → the direct
+    // segment walk). The cursor is per thread but uniform across the group; only the
+    // per-lane box test differs.
+    uint2 groupsInfo = strokeGroupTiles[localTile];
+    const uint gBase = groupsInfo.x;
+    const uint gCount = groupsInfo.y;
+    uint blockCursor = 0u;
+    uint nextFirst = (gCount > 0u) ? strokeGroups[gBase].segStart : 0u;
+    bool haveCur = false;
+    uint curStroke = 0xFFFFFFFFu;       // no stroke yet
+
+    for (uint j = 0; j < tc.count; ++j) {
+        uint segIdx = tileList[tc.start + j];        // ascending global index == document order
+        if (gCount > 0u) {
+            if (segIdx >= nextFirst) {
+                do {
+                    LiveStrokeGroupBlock g = strokeGroups[gBase + blockCursor];
+                    ++blockCursor;
+                    if (haveCur && curStroke != g.strokeID) {   // stroke boundary: composite the last
+                        if ((ablate & 4u) == 0u) {
+                            float4 col = strokeColor[curStroke];
+                            uint fl = strokeFlags[curStroke];
+                            for (uint k = 0; k < PIX; ++k) {
+                                if (curMax[k] >= 0.001f) {
+                                    perTileCompositeStroke(acc[k], col, fl, curMax[k] * col.a);
+                                }
+                            }
+                        }
+                        for (uint k = 0; k < PIX; ++k) curMax[k] = 0.0f;
+                    }
+                    curStroke = g.strokeID;
+                    haveCur = true;
+                    for (uint k = 0; k < PIX; ++k) {
+                        active[k] = (pos[k].x >= g.minX && pos[k].y >= g.minY &&
+                                     pos[k].x < g.maxX  && pos[k].y < g.maxY);
+                    }
+                    nextFirst = (blockCursor < gCount)
+                        ? strokeGroups[gBase + blockCursor].segStart : 0xFFFFFFFFu;
+                } while (segIdx >= nextFirst);
+            }
+        } else {
+            uint sId = strokeOfSegment[segIdx];
+            if (sId != curStroke) {                       // crossed into a new stroke: composite the last
+                if (curStroke != 0xFFFFFFFFu && (ablate & 4u) == 0u) {
+                    float4 col = strokeColor[curStroke];
+                    uint fl = strokeFlags[curStroke];
+                    for (uint k = 0; k < PIX; ++k) {
+                        if (curMax[k] >= 0.001f) {
+                            perTileCompositeStroke(acc[k], col, fl, curMax[k] * col.a);
+                        }
+                    }
+                }
+                for (uint k = 0; k < PIX; ++k) {
+                    active[k] = true;
+                    curMax[k] = 0.0f;
+                }
+                curStroke = sId;
+            }
+        }
+        // Every lane box-missed this block: nothing to stamp (same early-out as the
+        // reference kernel's `if (!strokeActive) continue;`, hoisted over the lanes).
+        if (!(active[0] || active[1] || active[2] || active[3])) continue;
+
+        // One gather per four pixels — the whole point of this kernel.
+        uint segLoad = ((ablate & 16u) != 0u) ? 0u : segIdx;   // bit 16: hoistable load address
+        GPUSplineSegment seg = segments[segLoad];
+        float pruneRadius = (seg.padding1 != 0u) ? as_type<float>(seg.padding1) : 3.4e38f;
+        float r2 = pruneRadius * pruneRadius;
+
+        for (uint k = 0; k < PIX; ++k) {
+            if (!active[k] || !live[k]) continue;    // box miss / off-target: stamps nothing
+            if ((ablate & 2u) != 0u) continue;       // bit 2: prune rejects all
+            if (liveSegPruned(pos[k], seg.p1, seg.p2, r2)) continue;
+
+            float signedDist = 1e6f;
+            float t = 0.0f;
+            if ((ablate & 1u) == 0u) {
+                if (seg.segmentType == 0) {
+                    SDFResult res = sdUnevenCapsule(pos[k], seg.p1, seg.p2, seg.radius0, seg.radius1);
+                    signedDist = res.dist; t = res.t;
+                } else if (seg.segmentType == 1) {
+                    SDFResult res = sdSplineSegment(pos[k], seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+                    signedDist = res.dist; t = res.t;
+                } else if (seg.segmentType == 2) {
+                    SDFResult res = sdSoftEnvelopeSpline(pos[k], seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+                    signedDist = res.dist; t = res.t;
+                }
+            }
+            float opacity = mix(seg.opacity0, seg.opacity1, t);
+            float edgeWidth = 0.94f;
+            float bias = 0.5f;
+            float cov = 1.0f - smootherstep(-edgeWidth, edgeWidth, signedDist + bias);
+            float stamped = cov * opacity;
+            if (stamped > curMax[k]) curMax[k] = stamped;
+        }
+    }
+    // Composite the final stroke group.
+    if (curStroke != 0xFFFFFFFFu && (ablate & 4u) == 0u) {
+        float4 col = strokeColor[curStroke];
+        uint fl = strokeFlags[curStroke];
+        for (uint k = 0; k < PIX; ++k) {
+            if (curMax[k] >= 0.001f) {
+                perTileCompositeStroke(acc[k], col, fl, curMax[k] * col.a);
+            }
+        }
+    }
+
+    if ((ablate & 8u) == 0u) {
+        for (uint k = 0; k < PIX; ++k) {
+            if (!live[k]) continue;
+            if (acc[k].a > 0.0001f) target.write(acc[k], base + uint2(0u, k));
+        }
+    }
+}
+
 // MARK: - Per-tile noise-capable composite (one dispatch per layer, AA + noise)
 //
 // Same one-write-per-pixel structure as `livePerTileAACompositeKernel`, but each stroke

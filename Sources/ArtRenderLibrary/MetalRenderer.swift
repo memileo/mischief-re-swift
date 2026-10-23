@@ -75,6 +75,10 @@ class MetalRenderer {
     internal var liveSegmentNoiseCompositePipeline: MTLComputePipelineState?
     // Per-tile live composite (one dispatch per layer; AA-only fast path).
     internal var livePerTileAACompositePipeline: MTLComputePipelineState?
+    // Four-pixels-per-thread twin of the per-tile AA composite (ART_LIVE_PIX=4, the
+    // default). Optional: a metallib predating it keeps the one-pixel kernel below,
+    // which is the reference implementation and produces the same pixels.
+    internal var livePerTileAAPix4CompositePipeline: MTLComputePipelineState?
     // Per-tile live composite for layers containing noise (AA + noise per stroke group).
     // Optional: noisy layers fall back to per-stroke when the installed metallib
     // predates this kernel.

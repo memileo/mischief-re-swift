@@ -239,6 +239,38 @@ final class LiveConfigTests: XCTestCase {
         XCTAssertFalse(LiveConfig.binStageTimingEnabled(environment: ["ART_LIVE_BINTIME": "0"]))
     }
 
+    /// `ART_LIVE_PIX`: four lanes per thread by default, one when explicitly disabled,
+    /// anything else ignored (the kernel exists only for 1 and 4).
+    func testPixelsPerThreadDefaultsFour() {
+        XCTAssertEqual(LiveConfig.pixelsPerThread(environment: [:]), 4)
+        XCTAssertEqual(LiveConfig.pixelsPerThread(environment: ["ART_LIVE_PIX": "4"]), 4)
+        XCTAssertEqual(LiveConfig.pixelsPerThread(environment: ["ART_LIVE_PIX": "1"]), 1)
+        XCTAssertEqual(LiveConfig.pixelsPerThread(environment: ["ART_LIVE_PIX": "2"]), 4)
+        XCTAssertEqual(LiveConfig.pixelsPerThread(environment: ["ART_LIVE_PIX": "0"]), 4)
+    }
+
+    /// Geometry invariant behind the four-lane composite: groups still cover 16×16
+    /// pixels, and the four lanes of one thread (rows `4y … 4y+3` of the band) always
+    /// land in the same live tile — so they share one tile list, one block cursor and
+    /// one document order. Tile sizes are multiples of 16 (enforced elsewhere), which
+    /// is what makes the row bands tile-aligned.
+    func testPix4LanesShareOneTile() {
+        for tile in stride(from: 16, through: 64, by: 16) {
+            let groupsPerTile = (tile + 15) / 16
+            XCTAssertEqual(groupsPerTile * 16, tile)   // whole 16-row bands
+            for band in 0..<(groupsPerTile * 4) {      // band = thread row in the band stack
+                let row0 = band * 4
+                let tileOfFirst = row0 / tile
+                for k in 0..<4 {
+                    XCTAssertEqual((row0 + k) / tile, tileOfFirst,
+                                   "tile \(tile): rows \(row0)…\(row0 + 3) cross a tile")
+                }
+            }
+            // Each group covers 16 px wide × 16 px tall: 16 threads × 4 lanes.
+            XCTAssertEqual(16 / 4 * 4, 16)
+        }
+    }
+
     func testBinCheckDefaultsOff() {
         XCTAssertFalse(LiveConfig.binCheckEnabled(environment: [:]))
         XCTAssertTrue(LiveConfig.binCheckEnabled(environment: ["ART_LIVE_BINCHECK": "1"]))
