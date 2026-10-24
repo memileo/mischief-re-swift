@@ -487,9 +487,11 @@ public enum LiveConfig {
     /// `livePerTileAACompositeKernel`; noisy layers take the noise twin, which ignores
     /// the mask. Each bit is a dispatch-uniform branch, so 0 is the shipping kernel:
     ///   1  no SDF — isolates SDF + coverage
-    ///   2  prune rejects everything — loop + tile-list/segment loads + block table only
+    ///   2  prune rejects everything — loop + tile-list staging + staged prune (walk floor)
     ///   4  no per-stroke blend/quantise
     ///   8  no pixel write
+    ///   16 constant-address segment fetch (the prune no longer depends on it — it reads the
+    ///      staged chord/radius, so this bit is now additive with the saturation skip)
     ///   16 constant-address segment load (hoists the 64-byte fetch of the tile's segment)
     public static func ablate(environment: [String: String]? = nil) -> Int {
         let env = environment ?? ProcessInfo.processInfo.environment

@@ -1080,3 +1080,168 @@ under-reports the shape.
 4. **`xform` 4.3–4.9 ms on kaos** — global atomics into 7800 counters → threadgroup-local
    histogram.
 5. **SDF math** — only with an accepted tolerance.
+
+## Round 11 — stage the tile list in threadgroup memory: the walk was a chain of dependent loads
+
+### What Round 10 bought (warm, user's Mac)
+
+| view | before | after |
+|---|---|---|
+| complex @zoom 10 L0 `render+comp` | 9.98 | **6.76** |
+| complex @zoom 10 L1 | 1.86 | **1.55** |
+| complex @zoom 10 total | 27 | **21** |
+| kaos `render+comp` | 19.14 | **17.76** |
+| qwerty `render+comp` / total | 5.49 / 24 | **5.18 / 12** |
+
+All identity gates byte-equal (splat 10/10, prune 0/1/2 on kaos), so the exact pad is
+sound. Two things stand out in the numbers:
+
+* `sdf` fell 433 M → 237 M and `chunks` 7813 → 7614 on the zoom-10 layer — the binned set
+  really was 20–26 % fatter than the ink.
+* the sort fell **2.98 → 0.43 ms** because `passes 1 → 0`: with fewer incidences each
+  chunk's bitonic fits one pass, so the co-rank merge disappeared. That is the incidence
+  count paying twice (elements *and* passes), which is worth remembering for later rounds.
+
+### Where the 21 ms is now
+
+```
+layer 0  render+comp 6.76 | xform 1.05 | scatter 0.65 | sort 0.43
+layer 1  render+comp 1.55 | xform 0.57 | scatter 0.34 | sort 0.22
+total 21 = gpu 12 + bin 5 + paper 1
+```
+
+Ablation (skip ON, `--zoom 10 --pan 500,-400`): 6.77 / 8.37 / 6.94 / 6.04 / 6.21 / 7.83.
+
+Read that with Round 9's warning in mind (bits 1 and 16 un-do the saturation skip, so they
+run *longer* than the baseline). What matters is **bit 2 = 6.94 ≈ 6.77 baseline**: with the
+SDF switched off, the kernel still costs the whole frame. The SDF, blend and write are now
+rounding error; **the entry walk is the frame**.
+
+### Why the walk is expensive even though it "just skips"
+
+Per entry, per pixel, the old loop did:
+
+1. `tileList[tc.start + j]` — 4 B from global;
+2. `strokeOfSegment[segIdx]` — a *random* 4 B global load, needed to know whether the entry
+   starts a new stroke (and therefore whether the running max must be flushed);
+3. `segments[segIdx]` — the 64 B segment record, fetched **before** the prune test, so every
+   entry paid it even though the prune then rejected almost all of them;
+4. the prune itself, and only then the SDF for the survivors.
+
+Steps 1–3 are a dependent chain, and steps 2–3 are *irregular* addresses. All 256 threads
+of the group read the same addresses (a broadcast), so the bytes are not the problem — the
+serialized latency chain is: 157 entries × 3 dependent loads is the kernel's critical path.
+
+### The change
+
+The threadgroup that composites a 16×16 tile now stages the tile's prune record once, then
+walks it from threadgroup memory:
+
+* `tgSeg[j]` — the global segment index (4 B);
+* `tgStroke[j]` — that segment's stroke (4 B), so the boundary test needs no global read;
+* `tgChord[j]` — `p1.xy, p2.xy` in device space (16 B);
+* `tgPad2[j]` — the segment's prune radius² (4 B), `padding1 + 0.5` for the AA kernel and
+  `padding1 + liveNoisePruneMargin` for the noise twin — the same two expressions the walk
+  used, just evaluated once per entry per group instead of once per pixel per entry.
+
+That is 28 B × 128 entries = **3.5 KB** of threadgroup memory per group (≈9 groups still fit
+a 32 KB budget). The walk then reads four `threadgroup` values per entry, prunes from
+`tgChord`/`tgPad2`, and only fetches the 64 B `GPUSplineSegment` for the entries that survive
+the prune. The stage loop itself is coalesced (`tileList` ascending, `strokeOfSegment`
+ascending, `segments` ascending) and costs one bucket per entry per *group*, not per pixel.
+
+Two details that are easy to get wrong:
+
+* **The stage is chunked.** A tile can hold more entries than the stage (`kaos` averages
+  157/tile, so two chunks; a dense zoom-in tile can hold thousands). `base` walks the tile
+  list in `LIVE_STAGE`-sized chunks and the walk state — current stroke, running max, block
+  cursor, `nextFirst` — lives in registers and carries across chunks. Identical output.
+* **No early return.** `threadgroup_barrier` requires every thread of the group to reach it,
+  and the old kernel returned early for pixels past the canvas edge (1080 is not a whole
+  number of 16 px tiles, so the last tile row *does* hit it). The kernel now clamps the tile
+  index instead and skips only the final write, so the whole group runs the same number of
+  chunks. (The clamp is a no-op for every group inside the box; a dispatched group can never
+  straddle a tile, since the tile size is a multiple of the 16 px threadgroup.)
+
+Exactness is structural, not approximate: the staged values are literally the values the old
+loop read from global memory, and the walk order is unchanged. The kernel is a different
+kernel, so the **metallib has to be rebuilt**, but no buffer, struct or dispatch changed.
+
+One caveat: for `ART_LIVE_TILE_SIZE > 16` the four (or 9/16) threadgroups of one tile each
+stage the whole tile list redundantly, so staging wins less there. The default is 16, where
+one group owns exactly one tile.
+
+### Also in this round: `bin` is attributable now
+
+`bin` is 5 ms at zoom 10 and 2–5 ms elsewhere, and until now the Mac had no breakdown (the
+Linux probe only approximates it, and it is 6× slower). Under `ART_LIVE_BINTIME=1` the GPU
+path now prints one extra line per layer:
+
+```
+livebin layer 0: cpu cull 0.42 prep 0.05 counts 0.09 table 1.31 plan+upload 0.18 ms | alloc 0.00
+```
+
+* `cull` — the per-stroke viewport test + layer tile box;
+* `prep` — visible-stroke bytes + the transform/box params;
+* `counts` — the counts readback memcpy + `GpuBinSpec.combine` (prefix sum);
+* `table` — the stroke-block table build (`strokeBlockTable`), or ~0 when the gate drops it;
+* `plan+upload` — chunk plan, merge plan and the memcpys into the shared buffers.
+
+Gated on `ART_LIVE_BINTIME`, so the shipping path takes no extra timestamps.
+
+### Files
+
+* `ArtQuickLook/ArtRenderShaders/segmentKernels.metal` — `LIVE_STAGE`, the stage in both
+  `livePerTileAACompositeKernel` and `livePerTileNoiseCompositeKernel`, prune from the staged
+  record, no early return, ablation-comment update.
+* `Sources/ArtRenderLibrary/RendererTypes.swift` — `ablate` doc (bits 2/16 mean something
+  narrower now: the prune no longer touches the segment).
+* `Sources/ArtRenderLibrary/MetalRenderer_LiveCompositing.swift` — per-stage `bin` timing
+  under `ART_LIVE_BINTIME`. No pixel or buffer change.
+* `SPLAT-DESIGN.md` — this section.
+
+### Run this (metallib rebuild required, no Swift struct change)
+
+```
+sh Scripts/build-metallib.sh
+swift build -c release
+
+sh Scripts/stroke-splat-ab.sh --all                      # must stay 10/10 identical
+sh Scripts/stroke-prune-ab.sh --modes 0,1,2 art/kaos.art # must stay byte-equal
+# kaos zoom-1 pixel gate vs art/kaos.png; qwerty marker gate vs its static render
+
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/kaos.art
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/qwerty.art
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 --zoom 10 --pan 500,-400 art/complex.art
+
+sh Scripts/composite-ablate.sh --zoom 10 --pan 500,-400 art/complex.art
+```
+
+Decision rule for this round: **`render+comp` must fall** (target L0 ≈ 4–5 ms, kaos ≈ 15–16,
+qwerty ≈ 4). `tiles`/`chunks`/`sdf` must not move at all — if they do, the stage changed the
+entry set, which can only be a bug. If `render+comp` gets *worse*, the walk was
+bandwidth-bound rather than latency-bound and the stage can be reverted on its own (it is one
+self-contained hunk per kernel).
+
+Also price the CPU side while the metallib is built — this is the data Round 12 needs:
+
+```
+ART_LIVE_STROKE_PRUNE=0 ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 --zoom 10 --pan 500,-400 art/complex.art
+ART_LIVE_STROKE_PRUNE=0 ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/qwerty.art
+```
+
+`bin` at zoom 10 is 5 ms and qwerty 3 ms; the difference between those two lines and the
+default run is the block-table build's price on each. If it is most of `bin`, the table wants
+to be built only for tiles whose list actually got long (or dropped where the saturation skip
+already covers the tile).
+
+### Still open, in order
+
+1. **`bin`** — price it with the two lines above; then either an on-demand block table or
+   moving the count/prefix work fully to the GPU.
+2. **`xform` 1.0–1.1 ms per layer** — global atomics into a per-tile counter array; a
+   threadgroup-local histogram first would cut most of the atomic traffic.
+3. **The walk floor** — if staging lands where expected, the floor becomes the 4 B stride
+   itself; the next lever is the per-entry 8×8 sub-cell mask (skip entries whose ink cannot
+   touch the pixel's 2×2 px cell) or run-length stroke groups per tile.
+4. **SDF math** — only with an accepted tolerance.

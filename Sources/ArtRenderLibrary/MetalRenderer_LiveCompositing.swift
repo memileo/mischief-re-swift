@@ -892,6 +892,11 @@ extension MetalRenderer {
         let ref = try ensureBinRefState(device: device, docID: ObjectIdentifier(cache),
                                         layer: layer)
         var cpuStart = DispatchTime.now().uptimeNanoseconds
+        // Per-stage CPU attribution, computed only under ART_LIVE_BINTIME (the totals are
+        // always accumulated; this only splits the `bin` window into its parts so a Mac
+        // run can say which one to attack).
+        let cpuStageTiming = LiveConfig.binStageTimingEnabled()
+        var tCull = 0.0, tPrep = 0.0, tPrefix = 0.0, tTable = 0.0, tPlan = 0.0
         var visStrokeIDs: [Int] = []
         visStrokeIDs.reserveCapacity(layer.ops.count)
         var layerBox: (minX: Int, minY: Int, maxX: Int, maxY: Int)? = nil
@@ -933,7 +938,9 @@ extension MetalRenderer {
         let boxW = box.maxX - box.minX + 1, boxH = box.maxY - box.minY + 1
         let boxTiles = boxW * boxH
         guard boxTiles > 0 else { return false }
-        liveTiming.binMilliseconds += Self.milliseconds(since: cpuStart)
+        let cullMilliseconds = Self.milliseconds(since: cpuStart)
+        liveTiming.binMilliseconds += cullMilliseconds
+        if cpuStageTiming { tCull = cullMilliseconds }
 
         // Reference state is ensured above the timing window; here only per-frame data
         // prep follows.
@@ -982,7 +989,9 @@ extension MetalRenderer {
             boxMinX: Int32(box.minX), boxMinY: Int32(box.minY),
             boxW: Int32(boxW), boxH: Int32(boxH),
             tilesPerRow: UInt32(tilesX))
-        liveTiming.binMilliseconds += Self.milliseconds(since: cpuStart)
+        let prepMilliseconds = Self.milliseconds(since: cpuStart)
+        if cpuStageTiming { tPrep = prepMilliseconds }
+        liveTiming.binMilliseconds += prepMilliseconds
 
         try ensureRenderTargets(width: width, height: height)
         try clearTexture(gpuRenderTarget!)
@@ -1043,6 +1052,8 @@ extension MetalRenderer {
         }
         let (entries, starts, total) = GpuBinSpec.combine(counts: countsArr)
         liveTiming.inkedTiles += countsArr.reduce(0) { $0 + ($1 > 0 ? 1 : 0) }
+        var cpuMark = DispatchTime.now().uptimeNanoseconds
+        if cpuStageTiming { tPrefix = Self.milliseconds(since: prefixStart) }
         if total == 0 {
             // Visible strokes, but none reaches a tile (all ranges empty): mirrors the CPU
             // path's per-stroke culling. Compositing the cleared target is identity.
@@ -1220,6 +1231,7 @@ extension MetalRenderer {
         allocWindow += Self.milliseconds(since: aGroups)
         guard groupsReady else { return false }
         if LiveConfig.strokePruneEnabled() {
+            let aTable = DispatchTime.now().uptimeNanoseconds
             let table = GpuBinSpec.strokeBlockTable(
                 visibleStrokes: visStrokeIDs,
                 blockFirst: ref.strokeBlockFirst, blockCount: ref.strokeBlockCount,
@@ -1289,6 +1301,10 @@ extension MetalRenderer {
         } else {
             groupHeaderBuf = liveEmptyGroupHeader!
             groupEntryBuf = liveEmptyStrokeGroups!
+        }
+        if cpuStageTiming {
+            tTable = Self.milliseconds(since: aTable)
+            cpuMark = DispatchTime.now().uptimeNanoseconds
         }
         if ref.tileListCap < total {
             let aTile = DispatchTime.now().uptimeNanoseconds
@@ -1380,6 +1396,12 @@ extension MetalRenderer {
         // slot `starts[t] + bump(heads[t])`, so seeding heads with starts would add
         // the base twice and store past the tile list (GPU validation fault + hangs).
         // Heads are .private — zeroed by blit fill in CB2 below, not by CPU memset.
+        if cpuStageTiming {
+            tPlan = Self.milliseconds(since: cpuMark)
+            print(String(format: "livebin layer %d: cpu cull %.2f prep %.2f counts %.2f "
+                          + "table %.2f plan+upload %.2f ms | alloc %.2f",
+                          position, tCull, tPrep, tPrefix, tTable, tPlan, allocWindow))
+        }
         liveTiming.allocMilliseconds += allocWindow
         liveTiming.binMilliseconds += max(0, Self.milliseconds(since: prefixStart) - allocWindow)
 
