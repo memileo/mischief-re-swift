@@ -478,6 +478,18 @@ final class LiveConfigTests: XCTestCase {
         XCTAssertTrue(LiveConfig.strokePruneEnabled(environment: ["ART_LIVE_STROKE_PRUNE": "1"]))
         XCTAssertFalse(LiveConfig.strokePruneEnabled(environment: ["ART_LIVE_STROKE_PRUNE": "0"]))
     }
+
+    /// The per-pixel saturation skip is on unless `ART_LIVE_SATURATE=0`; it is exact by
+    /// construction (`cov ≤ 1`, `opacity ≤ 1` ⇒ the max over a stroke's segments cannot
+    /// exceed 1), so the knob exists only to A/B its cost, not to gate pixels.
+    func testSaturationSkipDefaultsOn() {
+        XCTAssertTrue(LiveConfig.saturationSkipEnabled(environment: [:]))
+        XCTAssertTrue(LiveConfig.saturationSkipEnabled(environment: ["ART_LIVE_SATURATE": "1"]))
+        XCTAssertFalse(LiveConfig.saturationSkipEnabled(environment: ["ART_LIVE_SATURATE": "0"]))
+        // Anything else keeps the default (no silent opt-out from a typo).
+        XCTAssertTrue(LiveConfig.saturationSkipEnabled(environment: ["ART_LIVE_SATURATE": ""]))
+        XCTAssertTrue(LiveConfig.saturationSkipEnabled(environment: ["ART_LIVE_SATURATE": "off"]))
+    }
 }
 
 /// GPU binning spec: grid sizing, conservative layer-box math, count prefixing.

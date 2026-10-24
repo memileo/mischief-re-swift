@@ -73,6 +73,11 @@ struct PerTileParams {
     var tileSize: UInt32
     /// `ART_LIVE_ABLATE` mask — 0 in normal use (see `LiveConfig.ablate`).
     var ablate: UInt32
+    /// bit0 = per-pixel stroke-saturation skip (`ART_LIVE_SATURATE=0` A/Bs it off).
+    /// Exact by construction: a pixel's coverage for a stroke is a max over its segments
+    /// of `cov · opacity`, and both factors are ≤ 1, so once the running max reaches 1 the
+    /// rest of that stroke's segments cannot change it (see the kernel's `satCeil`).
+    var flags: UInt32
 }
 
 // Must match `LiveBinTransformParams` in segmentKernels.metal field for field, in order.
@@ -760,7 +765,8 @@ extension MetalRenderer {
                                    boxTilesPerRow: UInt32(boxWidth),
                                    boxTilesPerCol: UInt32(boxHeight),
                                    tileSize: UInt32(liveTile),
-                                   ablate: UInt32(LiveConfig.ablate()))
+                                   ablate: UInt32(LiveConfig.ablate()),
+                                   flags: LiveConfig.saturationSkipEnabled() ? 1 : 0)
         if containsNoise {
             guard let pipeline = livePerTileNoiseCompositePipeline else {
                 throw MetalRendererError.pipelineMissing("livePerTileNoiseCompositeKernel")

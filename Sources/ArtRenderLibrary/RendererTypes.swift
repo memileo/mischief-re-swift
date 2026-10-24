@@ -478,6 +478,20 @@ public enum LiveConfig {
         guard let v = env["ART_LIVE_ABLATE"], let n = Int(v) else { return 0 }
         return min(max(n, 0), 31)
     }
+
+    /// Per-pixel stroke-saturation skip in the per-tile composite kernels (default on;
+    /// `ART_LIVE_SATURATE=0` A/Bs it off). A pixel's coverage for one stroke is the max
+    /// over that stroke's segments in the tile of `cov · opacity`; `cov ≤ 1` (coverage
+    /// functions saturate at 1) and `opacity ≤ 1` (the geometry builder clamps point
+    /// opacity), so once that max hits exactly 1 no later segment of the same stroke can
+    /// raise it, and the rest of the stroke is dead work for this pixel — including its
+    /// 64-byte segment load. Pixel-identical by construction; it only removes work that
+    /// cannot change the max. Wide strokes are the case it targets: at a radius of r
+    /// device px a pixel sits inside ~r/segmentLength segments of the *same* stroke.
+    public static func saturationSkipEnabled(environment: [String: String]? = nil) -> Bool {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        return env["ART_LIVE_SATURATE"] != "0"
+    }
 }
 
 // MARK: - GPU tile binning spec (platform-independent; unit-tested on Linux)

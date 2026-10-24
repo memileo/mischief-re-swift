@@ -811,3 +811,138 @@ markers; only the extra 4-byte flags load per stroke boundary is new).
 Then the next exact lever is still `xform` (4.3–4.9 ms of global atomics into 7800
 counters → a threadgroup-local histogram), then the bin pad, then (only with an accepted
 tolerance) the SDF math.
+
+## Round 9 — reading the ablation, and why width² is the real cost model
+
+Round 8 shipped: qwerty 77 → **14 ms** warm (one `livebin` line, `segs 68221 tiles 2352`,
+`render+comp 6.01`), 10/10 splat views identical, prune modes 0/1/2 byte-equal, kaos
+unmoved (20.73 vs 19.29 is duplicate-run variance on this machine). Round 9 asks the next
+question — wide strokes — and starts by reading the ablation table properly.
+
+### How to read `ART_LIVE_ABLATE`
+
+Each bit removes exactly one stage behind a dispatch-uniform branch; every run still has
+all the others, so a delta is that stage's **marginal** cost *in the presence of the rest*,
+not its share of a sum. They need not add up, and the two small/negative ones are the
+interesting part. kaos zoom 1, pix1:
+
+| bit | what it removes | `render+comp` | marginal vs bit 0 |
+|----|------------------|---------------|-------------------|
+| 0 | nothing (baseline) | 18.87 | — |
+| 1 | the SDF + coverage | 15.41 | **3.46 ms** |
+| 2 | every segment (prune rejects all) | 12.91 | **5.96 ms** for everything after the walk |
+| 4 | the per-stroke blend/quantise | 18.98 | ≈ 0 (noise) |
+| 8 | the pixel write | 19.56 | ≈ 0 (noise) |
+| 16 | the real 64 B segment load (hot address) | 12.61 | **6.26 ms** |
+
+Read the other way: **12.6–12.9 ms of the ~19 ms is the walk itself** — the `tileList`
+read, the block-table cursor, and the 64-byte dependent load of the segment that the loop
+cannot hoist (one per pixel, per list entry). Then:
+
+* bit 16 vs bit 2 (12.61 vs 12.91) is the giveaway: with the segment coming from a hot
+  address, the SDF costs ~0.3 ms. Its 3.46 ms at bit 1 is *latency it uncovers*, not
+  arithmetic it performs. The SDF is not the bill; it is what the bill buys.
+* blend and write are negative — they hide under the load latency, so removing them frees
+  nothing.
+
+So the majority of `render+comp` is the per-`(pixel, segment)` visit and its load. Two
+consequences: a cheaper SDF is the wrong target (Round 6 proved the marginal *doubles*
+when occupancy drops), and every lever has to remove **visits**, not instructions.
+
+### The cost model, and what "wide" really does
+
+`render+comp` ≈ 256 × Σ_tiles |tileList| (one evaluation per pixel per list entry, minus
+prunes). All three documents land at the same rate, ~18–20 G evaluations/s:
+
+| view | segments | tiles | evaluations | render+comp |
+|---|---|---|---|---|
+| kaos zoom 1 | 321 611 | 7800 | 372 M | 20.2 ms |
+| qwerty zoom 1 | 68 221 | 2352 | 97 M | 6.0 ms |
+| complex zoom 10 | 33 216 | 16 320 | 433 M | 24.5 ms (2 layers) |
+
+complex at zoom 10 costs **4.5× qwerty with 4.6× fewer segments**: 1.69 M list entries
+over 12 707 ink tiles = **133 entries per ink tile**, against qwerty's 40. It is not the
+document, it is the overdraw: at device radius `r`, one pixel sits inside roughly
+`r / segmentLength` segments of the *same* stroke, and that stroke's segments fill
+`(tileSize + 2r)² / tileSize²` tiles each. Both factors grow with `r`, so ink work grows
+like `r²` while the segment count stays fixed — which is exactly what the user hit by
+zooming to 10.
+
+### The change: per-pixel stroke saturation is dead work
+
+A pixel's coverage for one stroke is `max` over that stroke's segments in the tile of
+`stamped = cov · opacity`. Both factors are ≤ 1 — the coverage functions saturate at
+exactly 1.0 (`smootherstep` returns 1 for arguments past its edge, `covPencil`/`covAirbrush`
+are bounded by 1) and point opacity is clamped to 0…1 when the segment is built
+(`Renderer_StrokeGeometry`, `opacity = max(0, min(1, opacity))`, then span interpolation
+between clamped values). So `curMax ≤ 1`, and **once `curMax == 1` no later segment of that
+stroke can change the pixel**. The stroke's remaining segments are provably dead: skipping
+them skips their 64-byte load as well, which is the 6.3 ms term.
+
+That is the whole change: one compare in each per-tile kernel (`curMax >= satCeil`, with
+`satCeil = 1` normally and `3.4e38` under `ART_LIVE_SATURATE=0` for the A/B). It is not an
+approximation — it is the associativity of `max` plus the fact that 1 is its ceiling. A
+translucent pen (point opacity < 1 everywhere) simply never reaches the ceiling and keeps
+the old walk: the test is self-limiting rather than needing a per-stroke opacity bound.
+
+Expected shape of the numbers: it can only remove work from the SDF+load half of the
+frame, because the `tileList` read and the block-table cursor still happen for every list
+entry. So `k / 256` of the entries being saturated is worth at most `k/256 × 9.7 ms` on
+kaos. It should be near-invisible where the overdraw is ~1 (qwerty), visible on kaos
+(radius 2–8 px, several of a stroke's own segments per tile) and largest at zoom 10, where
+a 50-px stroke re-walks itself dozens of times per pixel.
+
+### Files
+
+* `ArtQuickLook/ArtRenderShaders/segmentKernels.metal` — `PerTileParams.flags`, the
+  `PT_SAT_CEIL` note, the guard in both per-tile kernels.
+* `Sources/ArtRenderLibrary/MetalRenderer_LiveCompositing.swift` — `flags` field +
+  construction.
+* `Sources/ArtRenderLibrary/RendererTypes.swift` — `LiveConfig.saturationSkipEnabled`.
+* `Tests/ArtRenderLibraryTests/TileUnionTests.swift` — knob defaults.
+* `Scripts/live-var-ab.sh` — generic env A/B (copy the doc per value, compare SHA-256).
+
+### Run this (metallib rebuild IS needed: `PerTileParams` grew by 4 bytes)
+
+```
+sh Scripts/build-metallib.sh          # or the ArtRenderShaders scheme
+swift build -c release
+
+# pixel identity, wide-stroke view included
+sh Scripts/live-var-ab.sh art/kaos.art art/complex.art
+sh Scripts/live-var-ab.sh --zoom 10 --pan 500,-400 art/complex.art
+sh Scripts/stroke-splat-ab.sh --all                     # 10/10 identical
+# kaos zoom-1 gate vs art/kaos.png
+
+# timing: ON vs OFF, same view twice
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/kaos.art
+ART_LIVE_BINTIME=1 ART_LIVE_SATURATE=0 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/kaos.art
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/qwerty.art
+ART_LIVE_BINTIME=1 ART_LIVE_SATURATE=0 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/qwerty.art
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 --zoom 10 --pan 500,-400 art/complex.art
+ART_LIVE_BINTIME=1 ART_LIVE_SATURATE=0 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 --zoom 10 --pan 500,-400 art/complex.art
+
+# and the wide-stroke frame's own ablation, since kaos's mix does not transfer
+sh Scripts/composite-ablate.sh --zoom 10 --pan 500,-400 art/complex.art
+```
+
+Also worth re-running the zoom-10 ablation (`ART_LIVE_ABLATE=0,1,2,16`): the bet here is
+that its SDF+load share is *larger* than kaos's, because every one of those 133 entries
+per tile is a dependent 64 B load.
+
+### Still open, in order
+
+1. **Make the skip jump the list, not just the segment.** The remaining 12.6 ms floor is
+   the `tileList` read itself: a saturated stroke still pays 4 bytes per entry to discover
+   it is saturated. A per-block `jStart` (the list index where the block begins) would let
+   a saturated stroke advance `j` to the next stroke's first block — a few 24-byte block
+   reads instead of ~35 list reads. Costs one uint per block in `GpuBinStrokeBlock`.
+2. **Stage the tile's segments in threadgroup memory.** Every pixel in a tile loads the
+   same 64-byte records; one threadgroup is already exactly one 16×16 tile, so a preload
+   into threadgroup memory (64 × 128 = 8 KB for the first 128 entries, global fallback
+   beyond) replaces 256 dependent loads per entry with one coalesced load. Watch occupancy:
+   the kernel was register-limited at ~7 SIMD groups before Round 5.
+3. **`xform` (4.3–4.9 ms)** — global atomics into 7800 counters → threadgroup-local
+   histogram.
+4. **Bin pad** — still much larger than the prune radius.
+5. **SDF math** — only with an accepted tolerance.

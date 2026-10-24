@@ -16,7 +16,8 @@
 # (use stroke-splat-ab.sh for identity). Each view renders from a private copy of the
 # document under tmp/, with one warmup frame, so the numbers are steady state.
 #
-# Usage: Scripts/composite-ablate.sh [--viewport WxH] [--zoom Z] [doc.art]
+# Usage: Scripts/composite-ablate.sh [--viewport WxH] [--zoom Z] [--pan X,Y]
+#                                  [--rotate DEG] [doc.art]
 # Defaults: art/kaos.art at zoom 1, viewport 1920x1080.
 # Env: ART2PNG (binary, default .build/release/art2png),
 #      ART_ABLATE_OUT (output dir, default tmp/ablate — project-local and gitignored).
@@ -28,6 +29,8 @@ OUT=${ART_ABLATE_OUT:-$ROOT/tmp/ablate}
 
 VP=1920x1080
 ZOOM=1
+PAN=""
+ROTATE=""
 DOC="$ROOT/art/kaos.art"
 
 die() {
@@ -44,6 +47,8 @@ while [ $# -gt 0 ]; do
         -h|--help) usage; exit 0 ;;
         --viewport) [ $# -ge 2 ] || die "--viewport needs WxH"; VP=$2; shift 2 ;;
         --zoom)     [ $# -ge 2 ] || die "--zoom needs a number"; ZOOM=$2; shift 2 ;;
+        --pan)      [ $# -ge 2 ] || die "--pan needs X,Y"; PAN=$2; shift 2 ;;
+        --rotate)   [ $# -ge 2 ] || die "--rotate needs degrees"; ROTATE=$2; shift 2 ;;
         -*)         die "unknown option '$1' — see --help" ;;
         *)          DOC=$1; shift ;;
     esac
@@ -56,6 +61,12 @@ done
 base=$(basename "$DOC" .art)
 mkdir -p "$OUT" || die "cannot create $OUT"
 
+# Render arguments, built once; empty PAN/ROTATE must not become stray words.
+set -- --live-view --viewport "$VP" --zoom "$ZOOM" --warmup 1
+[ -n "$PAN" ] && set -- "$@" --pan "$PAN"
+[ -n "$ROTATE" ] && set -- "$@" --rotate "$ROTATE"
+VIEWARGS="$*"
+
 printf '%-4s %-12s %s\n' bit render+comp livebin
 for bit in 0 1 2 4 8 16; do
     dir="$OUT/$bit"
@@ -64,9 +75,9 @@ for bit in 0 1 2 4 8 16; do
     log="$dir/run.log"
     # art2png writes <input>.live-view.png next to its input, i.e. next to this copy.
     {
-        echo "+ ART_LIVE_ABLATE=$bit ART_LIVE_BINTIME=1 $BIN --live-view --viewport $VP --zoom $ZOOM --warmup 1 $base.art"
-        ART_LIVE_ABLATE=$bit ART_LIVE_BINTIME=1 "$BIN" --live-view --viewport "$VP" \
-            --zoom "$ZOOM" --warmup 1 "$dir/$base.art"
+        echo "+ ART_LIVE_ABLATE=$bit ART_LIVE_BINTIME=1 $BIN $VIEWARGS $base.art"
+        # shellcheck disable=SC2086
+        ART_LIVE_ABLATE=$bit ART_LIVE_BINTIME=1 "$BIN" $VIEWARGS "$dir/$base.art"
     } >"$log" 2>&1 || {
         echo "run failed for bit $bit — $log:" >&2
         tail -5 "$log" >&2

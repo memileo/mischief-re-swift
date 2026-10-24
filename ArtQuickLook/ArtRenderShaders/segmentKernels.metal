@@ -1219,7 +1219,17 @@ struct PerTileParams {
     uint boxTilesPerCol;
     uint tileSize;
     uint ablate;            // ART_LIVE_ABLATE — counting/time attribution only (0 = normal)
+    uint flags;             // bit0 = saturation skip (ART_LIVE_SATURATE=0 turns it off)
 };
+
+// A stroke's contribution to one pixel is `max` over its segments of `stamped = cov ·
+// opacity`, with cov ≤ 1 and opacity ≤ 1 (the geometry builder clamps point opacity to
+// 0…1), so `curMax` can never exceed 1. Once it *is* 1, no later segment of the same
+// stroke can raise it: the remaining segments of that stroke are provably dead for this
+// pixel and can be skipped without touching their 64-byte segment record — a max-only
+// short circuit, not an approximation. It pays where a stroke covers a pixel many times
+// over: a wide stroke puts ~radius/segmentLength of its own segments in one tile.
+#define PT_SAT_CEIL(params) (((params).flags & 0x1u) != 0u ? 1.0f : 3.4e38f)
 
 // MARK: - Per-tile AA composite (one dispatch per layer, AA only), stroke-box pruning
 //
@@ -1281,6 +1291,7 @@ kernel void livePerTileAACompositeKernel(
     //   8  no pixel write         → target write time
     //   16 constant segment load  → the 64-byte per-iteration segment load
     const uint ablate = params.ablate;
+    const float satCeil = PT_SAT_CEIL(params);
 
     // Block skip table: per box-local tile, blocks ascending by segStart, each with a
     // conservative half-open device box. The cursor advances exactly when the walk's
@@ -1338,6 +1349,7 @@ kernel void livePerTileAACompositeKernel(
             }
         }
         if (!strokeActive) continue;    // box-missed block: every segment stamps nothing
+        if (curMax >= satCeil) continue;    // saturated stroke: this pixel's max is final
 
         uint segLoad = ((ablate & 16u) != 0u) ? 0u : segIdx;   // bit 16: hoistable load address
         GPUSplineSegment seg = segments[segLoad];
@@ -1451,6 +1463,7 @@ kernel void livePerTileNoiseCompositeKernel(
     uint curStroke = 0xFFFFFFFFu;
     float curMax = 0.0f;
     bool curNoisy = false;
+    const float satCeil = PT_SAT_CEIL(params);
 
     for (uint j = 0; j < tc.count; ++j) {
         uint segIdx = tileList[tc.start + j];
@@ -1517,6 +1530,7 @@ kernel void livePerTileNoiseCompositeKernel(
             }
         }
         if (!strokeActive) continue;    // box-missed block: every segment stamps nothing
+        if (curMax >= satCeil) continue;    // saturated stroke: this pixel's max is final
 
         GPUSplineSegment seg = segments[segIdx];
         float pruneRadius = (seg.padding1 != 0u)
