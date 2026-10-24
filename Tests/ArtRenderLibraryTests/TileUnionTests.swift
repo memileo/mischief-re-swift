@@ -817,6 +817,52 @@ final class GpuBinSpecTests: XCTestCase {
         })
     }
 
+    /// A chisel marker's ink reaches 4·r from the curve, a capsule's only ~1.4·r. The
+    /// block box pads the composite's whole-stroke cull, so a marker block padded with the
+    /// capsule rule would skip pixels the chisel actually stamps (clipped / aliased
+    /// marker edges, the very bug `SegmentPadding` records for the bin box).
+    func testStrokeBlockTablePadsMarkerBlocksToTheChiselReach() {
+        let camera = (a: Float(1), b: Float(0), c: Float(0), d: Float(1),
+                      tx: Float(0), ty: Float(0))
+        let counts: [UInt32] = .init(repeating: 128, count: 32 * 32)
+        func table(marker: Bool) -> (entries: Int, tiles: Int) {
+            let t = GpuBinSpec.strokeBlockTable(
+                visibleStrokes: [0],
+                blockFirst: [0], blockCount: [1],
+                blockStroke: [0], blockSegStart: [0],
+                blockRects: [SIMD4<Float>(100, 100, 100, 100)],
+                blockMaxRadius: [10],
+                blockIsMarker: [marker],
+                camera: camera, radiusFactor: 1,
+                tileCounts: counts,
+                box: (0, 0, 31, 31),
+                texW: 512, texH: 512, tilesX: 32, tilesY: 32,
+                invTile: 1 / 16)
+            let tiles = stride(from: 1, to: t.header.count, by: 2)
+                .reduce(0) { $0 + Int(t.header[$1]) }
+            return (t.entries.count, tiles)
+        }
+        let capsule = table(marker: false)
+        let chisel = table(marker: true)
+        // Capsule: 1.4·10 + 3.5 = 17.5 px around x = 100 → 82.5…118.5, and the range is
+        // floor/ceil (superset) → tiles 5…8 (4×4).
+        XCTAssertEqual(capsule.tiles, 16)
+        // Chisel: 4·10 + 3.5 = 43.5 px → 56.5…143.5 → tiles 3…9 (7×7).
+        XCTAssertEqual(chisel.tiles, 49)
+        XCTAssertEqual(capsule.entries, 16)
+        XCTAssertEqual(chisel.entries, 49)
+        // nil keeps the per-call behaviour, so the static path is untouched.
+        let legacy = GpuBinSpec.strokeBlockTable(
+            visibleStrokes: [0], blockFirst: [0], blockCount: [1],
+            blockStroke: [0], blockSegStart: [0],
+            blockRects: [SIMD4<Float>(100, 100, 100, 100)],
+            blockMaxRadius: [10],
+            camera: camera, radiusFactor: 1, tileCounts: counts,
+            box: (0, 0, 31, 31), texW: 512, texH: 512, tilesX: 32, tilesY: 32,
+            invTile: 1 / 16)
+        XCTAssertEqual(legacy.entries.count, 16)
+    }
+
     func testStrokeBlockTableOrderingGatingAndBudget() {
         // Doc-stroke 0 with two blocks; stroke 1 with one block. Both touch the dense
         // tile (1,1) of a 2×2 box; smaller canvas so tile mapping actually divides.
@@ -1333,8 +1379,8 @@ final class GpuBinSpecTests: XCTestCase {
         XCTAssertTrue(run(tileCounts: [0, 0, 0], order: []))
     }
 }
-/// Per-tile eligibility: cuts and markers force per-stroke; noise is allowed (handled by
-/// the noise-capable per-tile kernel). Pure, runs on Linux.
+/// Per-tile eligibility: cuts force per-stroke, markers are per-tile-able unless the layer
+/// also has noise (the noise-capable per-tile kernel has no chisel SDF). Pure, runs on Linux.
 final class LivePerTileEligibilityTests: XCTestCase {
     private func stroke(noise: Bool = false, marker: Bool = false) -> LiveDeviceOp {
         let seg = GPUSplineSegment(p0: SIMD2(0, 0), p1: SIMD2(0, 0),
@@ -1352,18 +1398,44 @@ final class LivePerTileEligibilityTests: XCTestCase {
         XCTAssertTrue(LivePerTileEligibility.isEligible([stroke(), stroke(noise: true)]))
     }
 
-    func testCutAndMarkerForcePerStroke() {
+    /// Markers are per-tile-able now (the AA kernel has the chisel SDF): a marker layer
+    /// without noise takes one dispatch, exactly like any other layer.
+    func testMarkerLayersAreEligibleWhenClean() {
+        XCTAssertTrue(LivePerTileEligibility.isEligible([stroke(marker: true)]))
+        XCTAssertTrue(LivePerTileEligibility.isEligible([stroke(), stroke(marker: true)]))
+        XCTAssertTrue(LivePerTileEligibility.isEligible([stroke(marker: true), stroke()]))
+    }
+
+    /// But the noise kernel owns the whole layer when *any* segment is noisy, and it has no
+    /// marker SDF — so that combination stays on the per-stroke path.
+    func testMarkerPlusNoiseStaysPerStroke() {
+        XCTAssertFalse(LivePerTileEligibility.isEligible([stroke(marker: true),
+                                                          stroke(noise: true)]))
+        XCTAssertFalse(LivePerTileEligibility.isEligible([stroke(noise: true),
+                                                          stroke(marker: true)]))
+    }
+
+    func testCutForcesPerStroke() {
         let cut = LiveDeviceOp.cut(meta: CutMeta(inverseAffine: .identity,
                                                  rect: [0, 0, 10, 10]))
         XCTAssertFalse(LivePerTileEligibility.isEligible([stroke(), cut]))
-        XCTAssertFalse(LivePerTileEligibility.isEligible([stroke(marker: true)]))
     }
 
-    func testStrokeFlagsCarryNoiseBit() {
+    func testStrokeFlagsCarryNoiseAndMarkerBits() {
         XCTAssertEqual(LivePerTileEligibility.strokeFlags(isEraser: false, hasNoise: false), 0)
         XCTAssertEqual(LivePerTileEligibility.strokeFlags(isEraser: true, hasNoise: false), 1)
         XCTAssertEqual(LivePerTileEligibility.strokeFlags(isEraser: false, hasNoise: true), 2)
         XCTAssertEqual(LivePerTileEligibility.strokeFlags(isEraser: true, hasNoise: true), 3)
+        // bit2 = marker, independent of the other two (read by the AA kernel and the
+        // fused binning kernel's tile pad).
+        XCTAssertEqual(LivePerTileEligibility.strokeFlags(isEraser: false, hasNoise: false,
+                                                          isMarker: true), 4)
+        XCTAssertEqual(LivePerTileEligibility.strokeFlags(isEraser: true, hasNoise: false,
+                                                          isMarker: true), 5)
+        XCTAssertEqual(LivePerTileEligibility.strokeFlags(isEraser: false, hasNoise: true,
+                                                          isMarker: true), 6)
+        XCTAssertEqual(LivePerTileEligibility.strokeFlags(isEraser: true, hasNoise: true,
+                                                          isMarker: true), 7)
     }
 }
 

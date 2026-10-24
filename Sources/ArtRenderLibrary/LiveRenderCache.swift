@@ -245,25 +245,33 @@ public enum LiveDeviceOp {
 
 /// Per-tile eligibility (pure; unit-tested on Linux). The per-tile kernels implement the
 /// plain AA composite and the noise composite, both grouped by stroke with per-stroke
-/// 8-bit quantisation — so any layer without cuts and without markers is eligible,
-/// noise included. Markers need the chisel SDF (per-stroke path only); cuts erase below
-/// them, so ordering forces the per-stroke path.
+/// 8-bit quantisation — so any layer without cuts is eligible, noise and markers included.
+/// The one exception: markers need the chisel SDF, which only the **AA** per-tile kernel
+/// implements. `needsNoise` picks the noise kernel for the whole layer, so a layer that
+/// holds both a marker and a noisy segment stays on the per-stroke path (still exact, one
+/// dispatch per stroke). Cuts erase below them, so ordering forces the per-stroke path.
 public enum LivePerTileEligibility {
     public static func isEligible(_ ops: [LiveDeviceOp]) -> Bool {
+        var hasMarker = false
+        var hasNoise = false
         for op in ops {
             switch op {
             case .cut:
                 return false
-            case .stroke(_, _, _, let isMarker):
-                if isMarker { return false }
+            case .stroke(let segments, _, _, let isMarker):
+                if isMarker { hasMarker = true }
+                if !hasNoise { hasNoise = segments.contains { $0.noiseSeed != 0 } }
             }
         }
-        return true
+        return !(hasMarker && hasNoise)
     }
 
-    /// Per-stroke flags bit1 = hasNoise. Pure helper so the bit layout is pinned by tests.
-    public static func strokeFlags(isEraser: Bool, hasNoise: Bool) -> UInt32 {
-        (isEraser ? 1 : 0) | (hasNoise ? 2 : 0)
+    /// Per-stroke flags, shared by the binning and composite kernels:
+    /// bit0 = eraser, bit1 = hasNoise, bit2 = isMarker. Pure helper so the bit layout is
+    /// pinned by tests.
+    public static func strokeFlags(isEraser: Bool, hasNoise: Bool,
+                                   isMarker: Bool = false) -> UInt32 {
+        (isEraser ? 1 : 0) | (hasNoise ? 2 : 0) | (isMarker ? 4 : 0)
     }
 }
 

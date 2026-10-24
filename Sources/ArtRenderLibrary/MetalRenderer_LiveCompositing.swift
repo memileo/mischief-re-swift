@@ -507,9 +507,11 @@ extension MetalRenderer {
         // ── 1+2. Tile-bin the layer into the staging arena, then encode it.
         //
         // The *per-tile* path composites the whole layer in ONE dispatch (one canvas write
-        // per pixel + high occupancy — the memory fix) for layers without cuts/markers
-        // (noise included via the noise-capable kernel). Anything else uses the proven
-        // *per-stroke* path (one dispatch per stroke) — the only way cut/marker stay exact.
+        // per pixel + high occupancy — the memory fix) for layers without cuts (noise
+        // included via the noise-capable kernel, markers via the AA kernel's bit2 chisel
+        // branch). Anything else uses the proven *per-stroke* path (one dispatch per
+        // stroke) — the only way cuts stay exact, and the fallback for a layer that holds
+        // both a marker and a noisy segment (the noise kernel has no marker SDF).
         var clock = DispatchTime.now().uptimeNanoseconds
         var perTilePlan: PerTilePlan?
         if Self.perTileEnabled, isPerTileEligible(layerOps) {
@@ -575,9 +577,10 @@ extension MetalRenderer {
         if let err = commandBuffer.error { throw err }
     }
     
-    /// A layer is per-tile-able only if it has no cut ops and no marker strokes. Noise is
-    /// allowed: layers containing noise use the noise-capable per-tile kernel, clean
-    /// layers the AA one. Pure logic lives in `LivePerTileEligibility` (Linux-tested).
+    /// A layer is per-tile-able unless it has cut ops (ordering) or a marker stroke together
+    /// with a noisy segment (the noise-capable per-tile kernel has no chisel SDF). Noise
+    /// alone is allowed: such layers use the noise per-tile kernel, clean ones the AA one.
+    /// Pure logic lives in `LivePerTileEligibility` (Linux-tested).
     private func isPerTileEligible(_ ops: [LiveDeviceOp]) -> Bool {
         LivePerTileEligibility.isEligible(ops)
     }
@@ -592,18 +595,21 @@ extension MetalRenderer {
                                   width: Int, height: Int) throws -> PerTilePlan {
         var segments: [GPUSplineSegment] = []
         var strokeOfSegment: [UInt32] = []
+        var segmentIsMarker: [Bool] = []
         var strokeColors: [SIMD4<Float>] = []
         var strokeFlags: [UInt32] = []
         let liveTile = liveTileSize
         for op in layerOps {
-            if case .stroke(let segs, let color, let isEraser, _) = op {
+            if case .stroke(let segs, let color, let isEraser, let isMarker) = op {
                 let strokeIndex = UInt32(strokeColors.count)
                 strokeColors.append(color)
                 let hasNoise = segs.contains { $0.noiseSeed != 0 }
                 strokeFlags.append(LivePerTileEligibility.strokeFlags(isEraser: isEraser,
-                                                                      hasNoise: hasNoise))
+                                                                      hasNoise: hasNoise,
+                                                                      isMarker: isMarker))
                 segments.append(contentsOf: segs)
                 strokeOfSegment.append(contentsOf: Array(repeating: strokeIndex, count: segs.count))
+                segmentIsMarker.append(contentsOf: Array(repeating: isMarker, count: segs.count))
             }
         }
 
@@ -615,7 +621,9 @@ extension MetalRenderer {
 
         let boxed = buildSegmentTileIndicesBoxed(segments: segments,
                                                  textureWidth: width, textureHeight: height,
-                                                 tileSize: liveTile, isMarker: false, transform: nil)
+                                                 tileSize: liveTile, isMarker: false,
+                                                 markerFlags: segmentIsMarker,
+                                                 transform: nil)
         plan.tileListCount = boxed.tileList.count
         plan.tileBoxCount = boxed.tileIndices.count
         plan.minTileX = boxed.minTileX
@@ -861,9 +869,9 @@ extension MetalRenderer {
         let invTile = 1.0 / Float(liveTile)
 
         // Cull strokes on the CPU via reference bounds (4-point transform each — the same
-        // test `deviceOps` applies) and accumulate the layer tile box. Markers among the
-        // *visible* strokes force the CPU path, exactly like the CPU eligibility check on
-        // the post-cull op list.
+        // test `deviceOps` applies) and accumulate the layer tile box.
+        // A *visible* marker forces the CPU/per-stroke path only when the layer also has a
+        // noisy stroke (the noise kernel owns the whole layer then and has no marker SDF).
         // Same radius factor formula as `deviceOps` — passed in, never recomputed on GPU.
         // Computed before the cull loop (the stroke boxes padding needs it too).
         let scaleX = sqrt(camera.a * camera.a + camera.c * camera.c)
@@ -878,6 +886,7 @@ extension MetalRenderer {
         var visStrokeIDs: [Int] = []
         visStrokeIDs.reserveCapacity(layer.ops.count)
         var layerBox: (minX: Int, minY: Int, maxX: Int, maxY: Int)? = nil
+        var hasVisibleMarker = false
         // The prune table's per-stroke boxes are built later from the ref state's block
         // records; the cull loop only collects visible stroke ids + the layer box.
         var strokeID = -1
@@ -887,7 +896,7 @@ extension MetalRenderer {
             guard LiveRenderCache.intersects(s.bounds, camera: camera, viewport: viewport) else {
                 continue
             }
-            if s.isMarker { return false }
+            if s.isMarker { hasVisibleMarker = true }
             visStrokeIDs.append(strokeID)
             // Transformed-bounds AABB (mirrors `intersects`' corner mapping).
             let p0 = CGPoint(x: s.bounds.minX, y: s.bounds.minY).applying(camera)
@@ -921,6 +930,9 @@ extension MetalRenderer {
         // prep follows.
         var needsNoise = false
         for id in visStrokeIDs where ref.strokeHasNoise[id] { needsNoise = true; break }
+        // A marker needs the chisel SDF, which only the AA per-tile kernel implements; the
+        // noise twin has no marker branch, so both together stay on the CPU/per-stroke path.
+        if hasVisibleMarker && needsNoise { return false }
         if needsNoise && noiseTexture == nil { return false }
         if needsNoise && livePerTileNoiseCompositePipeline == nil { return false }
         if !needsNoise && livePerTileAACompositePipeline == nil { return false }
@@ -989,6 +1001,9 @@ extension MetalRenderer {
         enc1.setBuffer(ranges, offset: 0, index: 5)
         enc1.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 6)
         enc1.setBuffer(counts, offset: 0, index: 7)
+        // Per-stroke flags (bit2 = marker) so a chisel stroke's tile range gets the 4·r
+        // pad instead of the 1.4·r one — the same pad `SegmentPadding` uses on the CPU.
+        enc1.setBuffer(ref.strokeFlags, offset: 0, index: 8)
         enc1.dispatchThreadgroups(binGroups(ref.segCount), threadsPerThreadgroup: binThreads)
         enc1.endEncoding()
         guard let copyEnc = cb1.makeBlitCommandEncoder() else { return false }
@@ -1043,7 +1058,13 @@ extension MetalRenderer {
         // walk is already cheap, so the splat must lose there — measured:
         // complex.art @ 0.3 went 3.5 ms (walk) → 16.1 ms (splat) before this gate.
         let splatCost = LiveConfig.splatCostRatio()
-        let splatFits = LiveConfig.splatEnabled()
+        // The splat kernel stamps the plain capsule/spline coverage; a chisel marker needs
+        // the marker SDF, which only the walk implements. Rare, so the walk stays exact.
+        let splatHasMarker = visStrokeIDs.contains {
+            $0 >= 0 && $0 < ref.strokeIsMarker.count && ref.strokeIsMarker[$0]
+        }
+        let splatFits = !splatHasMarker
+            && LiveConfig.splatEnabled()
             && radiusFactor <= LiveConfig.splatMaxRadiusFactor()
             && splatPixels * splatBatch <= LiveConfig.splatSlotBudget()
         let splatWins = splatFits && GpuBinSpec.splatCheaperThanWalk(
@@ -1195,6 +1216,7 @@ extension MetalRenderer {
                 blockStroke: ref.blockStroke, blockSegStart: ref.blockSegStart,
                 blockRects: ref.blockRects,
                 blockMaxRadius: ref.blockMaxRadius,
+                blockIsMarker: ref.blockIsMarker,
                 camera: (a: Float(camera.a), b: Float(camera.b),
                          c: Float(camera.c), d: Float(camera.d),
                          tx: Float(camera.tx), ty: Float(camera.ty)),
@@ -1631,6 +1653,7 @@ extension MetalRenderer {
         var bSegStart: [Int32] = []
         var bRects: [SIMD4<Float>] = []
         var bMaxR: [Float] = []
+        var bMarker: [Bool] = []
         segments.reserveCapacity(layer.cachedSegmentCount)
         for op in layer.ops {
             guard case .stroke(let s) = op else { continue }
@@ -1638,7 +1661,8 @@ extension MetalRenderer {
             colors.append(s.color)
             let hasNoise = s.segments.contains { $0.noiseSeed != 0 }
             flags.append(LivePerTileEligibility.strokeFlags(isEraser: s.isEraser,
-                                                            hasNoise: hasNoise))
+                                                            hasNoise: hasNoise,
+                                                            isMarker: s.isMarker))
             bounds.append(s.bounds)
             markers.append(s.isMarker)
             noisy.append(hasNoise)
@@ -1679,6 +1703,7 @@ extension MetalRenderer {
                 bSegStart.append(Int32(segStart))
                 bRects.append(SIMD4<Float>(bx0, by0, bx1, by1))
                 bMaxR.append(bR)
+                bMarker.append(s.isMarker)
                 nBlocks += 1
             }
             blockCount.append(nBlocks)
@@ -1710,7 +1735,7 @@ extension MetalRenderer {
             strokeSegCounts: segCounts, strokeMaxRadius: maxRadii,
             strokeBlockFirst: blockFirst, strokeBlockCount: blockCount,
             blockStroke: bStroke, blockSegStart: bSegStart, blockRects: bRects,
-            blockMaxRadius: bMaxR)
+            blockMaxRadius: bMaxR, blockIsMarker: bMarker)
         liveBinLayers[layer.layerIndex] = ref
         return ref
     }

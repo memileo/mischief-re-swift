@@ -236,7 +236,8 @@ extension Renderer {
                 let strokesInLayer = cache.strokeCount(at: position)
                 let viewportRect = CGRect(origin: .zero, size: CGSize(width: width, height: height))
                 // GPU-binned per-tile path first: same pixels, ~bulk CPU work moved to GPU.
-                // Returns false when ineligible (cuts/markers) or unavailable → CPU below.
+                // Returns false when ineligible (cuts; markers only together with noise)
+                // or unavailable → CPU below.
                 if mr.renderCachedLayerGPU(cache: cache, position: position,
                                            camera: cameraTransform, viewport: viewportRect,
                                            width: width, height: height,

@@ -1192,8 +1192,9 @@ kernel void liveSegmentNoiseCompositeKernel(
 // stroke). That is the memory win: the Instruments profile showed the per-stroke kernel is
 // ~98% memory-stall with only ~7 resident SIMD-groups (register-limited occupancy), and a
 // single large dispatch both removes the k× canvas traffic and raises occupancy. It is used
-// for layers without cut ops and without markers (noise included via the noise-capable
-// twin below); anything else falls back to the per-stroke path above.
+// for layers without cut ops (noise included via the noise-capable twin below, markers via
+// the stroke's bit2 flag → the same chisel SDF the per-stroke AA kernel uses); a layer with
+// both markers and noise falls back to the per-stroke path.
 
 // Source-over of one stroke's coverage onto the running accumulator. `flagsBit0` = eraser.
 static inline void perTileCompositeStroke(thread float4 &acc, float4 col, uint flagsValue, float a) {
@@ -1226,7 +1227,8 @@ struct PerTileParams {
 // stroke, carried as (segStart, strokeID) plus a conservative half-open device-space
 // stamp box [min, max). Must match `GpuBinStrokeBlock` field for field (uint, uint,
 // four plain floats — scalar alignment, stride 24). The pad (CPU: 1.4·maxRadius·
-// radiusFactor + 3.5 px over the block's transformed AABB) covers every stamp cutoff
+// radiusFactor + 3.5 px over the block's transformed AABB, or 4·maxRadius·radiusFactor +
+// 3.5 for a chisel-marker block) covers every stamp cutoff
 // (AA cov > 0 needs signedDist < 0.44 ⇒ chord distance < r(t)+0.44; noise cov > 0 needs
 // chord distance < 1.375·max(r,1); the stored prune gate only tightens). A pixel outside
 // the box therefore provably stamps nothing for the block's segments — skipping it
@@ -1247,7 +1249,7 @@ kernel void livePerTileAACompositeKernel(
     const device TileIndex *tileStartCount [[buffer(3)]],     // per box-local tile: start/count
     const device uint32_t *tileList [[buffer(4)]],            // global segIdx, ascending (= doc order)
     const device float4 *strokeColor [[buffer(5)]],           // per stroke: pen colour
-    const device uint32_t *strokeFlags [[buffer(6)]],         // per stroke: bit0 = eraser
+    const device uint32_t *strokeFlags [[buffer(6)]],         // per stroke: bit0 = eraser, bit2 = marker
     const device uint2 *strokeGroupTiles [[buffer(7)]],       // per box-local tile: (start, count) groups
     const device LiveStrokeGroupBlock *strokeGroups [[buffer(8)]], // flat block table
     texture2d<float, access::read_write> target [[texture(0)]],
@@ -1296,6 +1298,7 @@ kernel void livePerTileAACompositeKernel(
     bool haveCur = false;
     float4 acc = float4(0.0f);          // canvas is cleared before the layer, so start transparent
     uint curStroke = 0xFFFFFFFFu;       // no stroke yet
+    uint curFlags = 0u;                 // per-stroke flags (bit2 = marker)
     float curMax = 0.0f;
 
     for (uint j = 0; j < tc.count; ++j) {
@@ -1308,11 +1311,12 @@ kernel void livePerTileAACompositeKernel(
                     if (haveCur && curStroke != g.strokeID) {   // stroke boundary: composite the last
                         if (curMax >= 0.001f && (ablate & 4u) == 0u) {
                             float4 col = strokeColor[curStroke];
-                            perTileCompositeStroke(acc, col, strokeFlags[curStroke], curMax * col.a);
+                            perTileCompositeStroke(acc, col, curFlags, curMax * col.a);
                         }
                         curMax = 0.0f;
                     }
                     curStroke = g.strokeID;
+                    curFlags = strokeFlags[curStroke];
                     haveCur = true;
                     strokeActive = (pos.x >= g.minX && pos.y >= g.minY &&
                                     pos.x < g.maxX  && pos.y < g.maxY);
@@ -1325,10 +1329,11 @@ kernel void livePerTileAACompositeKernel(
             if (sId != curStroke) {                       // crossed into a new stroke: composite the last
                 if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f && (ablate & 4u) == 0u) {
                     float4 col = strokeColor[curStroke];
-                    perTileCompositeStroke(acc, col, strokeFlags[curStroke], curMax * col.a);
+                    perTileCompositeStroke(acc, col, curFlags, curMax * col.a);
                 }
                 strokeActive = true;
                 curStroke = sId;
+                curFlags = strokeFlags[sId];
                 curMax = 0.0f;
             }
         }
@@ -1347,7 +1352,15 @@ kernel void livePerTileAACompositeKernel(
         float signedDist = 1e6f;
         float t = 0.0f;
         if ((ablate & 1u) == 0u) {
-            if (seg.segmentType == 0) {
+            if ((curFlags & 4u) != 0u) {                  // chisel marker stroke
+                if (seg.segmentType == 0) {
+                    SDFResult res = sdSlantedMarkerStraight(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
+                    signedDist = res.dist; t = res.t;
+                } else {
+                    SDFResult res = sdSlantedMarkerSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+                    signedDist = res.dist; t = res.t;
+                }
+            } else if (seg.segmentType == 0) {
                 SDFResult res = sdUnevenCapsule(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
                 signedDist = res.dist; t = res.t;
             } else if (seg.segmentType == 1) {
@@ -1368,7 +1381,7 @@ kernel void livePerTileAACompositeKernel(
     // Composite the final stroke group.
     if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f && (ablate & 4u) == 0u) {
         float4 col = strokeColor[curStroke];
-        perTileCompositeStroke(acc, col, strokeFlags[curStroke], curMax * col.a);
+        perTileCompositeStroke(acc, col, curFlags, curMax * col.a);
     }
 
     if (acc.a > 0.0001f && (ablate & 8u) == 0u) target.write(acc, pixel);
@@ -1382,9 +1395,10 @@ kernel void livePerTileAACompositeKernel(
 // That matches the per-stroke path exactly — which picks the noise kernel per stroke —
 // including the per-stroke 8-bit quantisation in `perTileCompositeStroke`.
 //
-// Markers never reach here (the CPU eligibility excludes them); cuts never reach here
-// either (they force the per-stroke path). `noiseScale` is the same 0.4 constant the
-// per-stroke noise twin uses.
+// Markers reach only the AA kernel above (bit2 flag); a layer that contains both a marker
+// and a noisy segment stays on the per-stroke path, so this kernel never has to pick a
+// marker SDF. Cuts never reach here either (they force the per-stroke path). `noiseScale`
+// is the same 0.4 constant the per-stroke noise twin uses.
 kernel void livePerTileNoiseCompositeKernel(
     const device PerTileParams &params    [[buffer(0)]],
     const device GPUSplineSegment *segments [[buffer(1)]],
@@ -1803,9 +1817,9 @@ kernel void liveSplatWriteKernel(
 // render kernels see the same ascending document order the CPU binner produces — the
 // render kernels themselves are UNTOUCHED by this work.
 //
-// Only per-tile-eligible layers use this path (no cuts, no markers — enforced on the
-// CPU, which falls back to the CPU binning when ineligible). `isMarker` is therefore
-// hardcoded to the plain `1.4r + 1` padding here, exactly like the CPU per-tile plan.
+// Only per-tile-eligible layers (no cuts; markers only in a noise-free layer) use this
+// path (enforced on the CPU, which falls back to per-stroke when ineligible). The tile
+// pad is therefore `SegmentPadding`'s rule, marker-aware via the stroke's bit2 flag.
 
 // `LiveBinTransformParams` — must match the Swift struct field for field (scalars only).
 struct LiveBinTransformParams {
@@ -1836,15 +1850,16 @@ struct LiveBinBoxParams {
 };
 
 // Tile range for one camera-transformed segment: mirror of
-// `buildSegmentTileIndicesBoxed` with isMarker == false (per-tile layers never contain
-// markers): pad = 1.4 * rMax + 1, strict-inequality off-canvas cull,
-// truncation-toward-zero int conversion, clamp to the grid. Returns the
-// `SegTileRange.empty` sentinel (1,0,0,0) when off-canvas or degenerate. Used by the
-// fused transform+count kernel.
+// `buildSegmentTileIndicesBoxed` (pad = 1.4 * rMax + 1 for a capsule/spline, or
+// 4 * rMax + 2 for a chisel marker — the same `SegmentPadding.pad` rule, fed by the
+// stroke's bit2 flag), strict-inequality off-canvas cull, truncation-toward-zero int
+// conversion, clamp to the grid. Returns the `SegTileRange.empty` sentinel (1,0,0,0) when
+// off-canvas or degenerate. Used by the fused transform+count kernel.
 inline int4 liveBinRangeForSeg(constant LiveBinTransformParams &p,
-                               float2 p1, float2 p2, float r0, float r1) {
+                               float2 p1, float2 p2, float r0, float r1,
+                               bool isMarker) {
     float rMax = max(r0, r1);
-    float pad = 1.4f * rMax + 1.0f;
+    float pad = isMarker ? (4.0f * rMax + 2.0f) : (1.4f * rMax + 1.0f);
     float minX = min(p1.x, p2.x) - pad;
     float maxX = max(p1.x, p2.x) + pad;
     float minY = min(p1.y, p2.y) - pad;
@@ -1882,6 +1897,7 @@ kernel void liveBinTransformCountKernel(
     device int4 *outRanges [[buffer(5)]],
     constant LiveBinBoxParams &b [[buffer(6)]],
     device atomic_uint *counts [[buffer(7)]],
+    const device uint *strokeFlags [[buffer(8)]],   // bit2 = isMarker (tile pad 4r+2)
     uint3 tpg [[thread_position_in_grid]])
 {
     uint gid = tpg.x;
@@ -1917,7 +1933,7 @@ kernel void liveBinTransformCountKernel(
     o.padding1 = as_type<uint>(prune); o.padding2 = s.padding2;
     outSegs[gid] = o;
 
-    int4 r = liveBinRangeForSeg(p, p1, p2, r0, r1);
+    int4 r = liveBinRangeForSeg(p, p1, p2, r0, r1, (strokeFlags[sId] & 4u) != 0u);
     outRanges[gid] = r;
     if (r.x > r.z || r.y > r.w) return;   // empty sentinel — nothing to count
     // Clamp to the layer box: stroke-bounds boxes don't carry the full 1.4r+1 binning

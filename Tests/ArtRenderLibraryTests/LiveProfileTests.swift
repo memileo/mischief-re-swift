@@ -334,6 +334,98 @@ final class LiveProfileTests: XCTestCase {
                      cullMs + combineMs + tableMs + chunkMs + mergeMs + copyMs, combinedTotal))
     }
 
+    /// Which live path a document takes, and why.
+    ///
+    /// The per-tile path composites a whole layer in one dispatch. A cut op — or a marker
+    /// stroke in a layer that also has noise — drops that layer onto the per-stroke path:
+    /// one dispatch per stroke. That is how `qwerty.art` (a fifth of kaos's geometry, 1141
+    /// strokes) rendered several times slower with only 8 marker strokes; since the AA
+    /// per-tile kernel has the chisel SDF, clean marker layers are per-tile-able. This probe
+    /// reports the reason and the dispatch geometry a layer would produce.
+    ///
+    ///     ART_LIVE_PROFILE_ELIGIBLE=art/qwerty.art swift test --filter testProfileEligibility
+    func testProfileEligibility() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let spec = environment["ART_LIVE_PROFILE_ELIGIBLE"] else {
+            throw XCTSkip("set ART_LIVE_PROFILE_ELIGIBLE=art/qwerty.art to probe the live path")
+        }
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // ArtRenderLibraryTests
+            .deletingLastPathComponent()   // Tests
+            .deletingLastPathComponent()   // repo root
+        let url = spec.hasPrefix("/") ? URL(fileURLWithPath: spec)
+                                      : URL(fileURLWithPath: spec, relativeTo: repoRoot)
+        let data = try Data(contentsOf: url)
+        guard let art = ArtParser(data: [UInt8](data)) else {
+            XCTFail("parse failed: \(url.path)")
+            return
+        }
+        let renderer = Renderer(canvasSize: CGSize(width: 1920, height: 1080), scale: 1.0)
+        guard let cache = renderer.buildLiveRenderCacheGeometry(art: art) else {
+            XCTFail("no cache for \(url.lastPathComponent)")
+            return
+        }
+        let tile = 16
+
+        print("\n=== live path eligibility: \(url.lastPathComponent) ===")
+        for (position, layer) in cache.layers.enumerated() {
+            guard !layer.needsRebuild else {
+                print("  layer \(position): needsRebuild (paste/merge) — per-frame rebuild")
+                continue
+            }
+            if let ops = cache.deviceOps(forLayerAt: position, camera: .identity) {
+                let eligible = LivePerTileEligibility.isEligible(ops)
+                var strokes = 0, segments = 0, markers = 0, cuts = 0, noisy = 0
+                var dispatchTiles = 0
+                var unionMinX = Int.max, unionMinY = Int.max
+                var unionMaxX = Int.min, unionMaxY = Int.min
+                for op in ops {
+                    switch op {
+                    case .cut:
+                        cuts += 1
+                    case .stroke(let s, _, _, let isMarker):
+                        strokes += 1
+                        segments += s.count
+                        if isMarker { markers += 1 }
+                        if s.contains(where: { $0.noiseSeed != 0 }) { noisy += 1 }
+                        var minX = Float.greatestFiniteMagnitude
+                        var minY = Float.greatestFiniteMagnitude
+                        var maxX = -Float.greatestFiniteMagnitude
+                        var maxY = -Float.greatestFiniteMagnitude
+                        for seg in s {
+                            let pad = (seg.padding1 != 0
+                                       ? Float(bitPattern: seg.padding1)
+                                       : max(seg.radius0, seg.radius1)) + 1
+                            minX = min(minX, min(seg.p1.x, seg.p2.x) - pad)
+                            maxX = max(maxX, max(seg.p1.x, seg.p2.x) + pad)
+                            minY = min(minY, min(seg.p1.y, seg.p2.y) - pad)
+                            maxY = max(maxY, max(seg.p1.y, seg.p2.y) + pad)
+                        }
+                        let w = max(0, Int(maxX) - Int(minX) + 1)
+                        let h = max(0, Int(maxY) - Int(minY) + 1)
+                        dispatchTiles += ((w + tile - 1) / tile) * ((h + tile - 1) / tile)
+                        unionMinX = min(unionMinX, Int(minX)); unionMinY = min(unionMinY, Int(minY))
+                        unionMaxX = max(unionMaxX, Int(maxX)); unionMaxY = max(unionMaxY, Int(maxY))
+                    }
+                }
+                let unionTiles = unionMinX <= unionMaxX
+                    ? ((unionMaxX - unionMinX) / tile + 1) * ((unionMaxY - unionMinY) / tile + 1)
+                    : 0
+                var reasons: [String] = []
+                if !eligible {
+                    if cuts > 0 { reasons.append("\(cuts) cut ops") }
+                    if markers > 0 && noisy > 0 { reasons.append("markers + noise") }
+                }
+                print(String(format: "  layer %d: strokes %d | segments %d | noisy %d | cuts %d | markers %d",
+                             position, strokes, segments, noisy, cuts, markers))
+                print(String(format: "    per-tile %@%@ | per-stroke path: %d dispatches over %d tile-threads vs %d tiles for the whole layer",
+                             eligible ? "ELIGIBLE" : "blocked",
+                             reasons.isEmpty ? "" : " (" + reasons.joined(separator: ", ") + ")",
+                             strokes, dispatchTiles, unionTiles))
+            }
+        }
+    }
+
     /// How much of the composite pass's SDF work is provably empty? The per-pixel prune
     /// skips a segment whose chord is farther than `padding1` from the pixel; every
     /// surviving (pixel, segment) pair runs an SDF. This probe walks the same pixel box
@@ -404,7 +496,7 @@ final class LiveProfileTests: XCTestCase {
                 let reach = SegmentPrune.radius(
                     p0: seg.p0, p1: seg.p1, p2: seg.p2, p3: seg.p3,
                     radius0: seg.radius0, radius1: seg.radius1,
-                    segmentType: seg.segmentType, isMarker: false)   // per-tile path: no markers
+                    segmentType: seg.segmentType, isMarker: false)   // kaos: no marker strokes
                 let isNoisy = seg.noiseSeed != 0
                 let oldMargin = max(0.75, 0.375 * rMax)
                 let newMargin = isNoisy

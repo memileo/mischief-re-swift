@@ -828,6 +828,9 @@ public enum GpuBinSpec {
     /// (rect = doc-space inclusive AABB covering the stroke's cached segment bounds);
     /// `blockMaxRadius` = per block, max(radius0, radius1) doc space (pads the block's
     /// box; tighter than a stroke-level pad on tapering strokes);
+    /// `blockIsMarker` = per block, whether its stroke is a chisel marker (its ink reaches
+    /// 4·r from the curve, not 1.4·r — a marker block padded like a capsule would cull
+    /// pixels the chisel actually stamps);
     /// `camera`/`radiusFactor` = the exact same transform formulas the fused kernel
     /// uses (device = (a·x + c·y + tx, b·x + d·y + ty), radius scaled by
     /// radiusFactor); `tileCounts` = per box-local tile entry count (density gate);
@@ -847,6 +850,7 @@ public enum GpuBinSpec {
                                         blockStroke: [Int32], blockSegStart: [Int32],
                                         blockRects: [SIMD4<Float>],
                                         blockMaxRadius: [Float],
+                                        blockIsMarker: [Bool]? = nil,
                                         camera: (a: Float, b: Float, c: Float,
                                                  d: Float, tx: Float, ty: Float),
                                         radiusFactor: Float,
@@ -887,7 +891,10 @@ public enum GpuBinSpec {
                 defer { b += 1 }
                 guard b < blockRects.count, b < blockStroke.count,
                       b < blockSegStart.count, b < blockMaxRadius.count else { break }
-                let pad = 1.4 * blockMaxRadius[b] * radiusFactor + 3.5
+                let markerPad = blockIsMarker.map { $0.count > b && $0[b] } ?? false
+                // A chisel marker's ink reaches 4·r from the curve (3r along the 45° axis
+                // + r); a capsule/spline only 1.4·r covers its AA flank.
+                let pad = (markerPad ? 4.0 : 1.4) * blockMaxRadius[b] * radiusFactor + 3.5
                 let r = blockRects[b]
                 // Camera-apply the four doc corners (affine, row-major like CGAffineTransform.apply).
                 let x0 = camera.a * r.x + camera.c * r.y + camera.tx

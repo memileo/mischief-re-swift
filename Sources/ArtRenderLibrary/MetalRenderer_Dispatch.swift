@@ -868,12 +868,16 @@ extension MetalRenderer {
     /// not the canvas (the win that makes small tiles affordable). Returns the box (origin
     /// + dimensions) so the caller dispatches the kernel over exactly it; the kernel then
     /// indexes tiles relative to `minTile`.
+    /// `markerFlags` (optional, per segment) overrides `isMarker` for mixed layers: the
+    /// per-tile plan bins capsule/spline and chisel-marker strokes together, and a marker
+    /// needs the 4·r pad while its neighbours need 1.4·r. nil keeps the whole-call flag.
     func buildSegmentTileIndicesBoxed(
         segments: [GPUSplineSegment],
         textureWidth: Int,
         textureHeight: Int,
         tileSize: Int,
         isMarker: Bool = false,
+        markerFlags: [Bool]? = nil,
         transform: CGAffineTransform? = nil
     ) -> (tileIndices: [TileIndex], tileList: [UInt32],
         minTileX: Int, minTileY: Int, boxWidth: Int, boxHeight: Int)
@@ -891,8 +895,9 @@ extension MetalRenderer {
             ranges.withUnsafeMutableBufferPointer { rp in
                 for i in segs.indices {
                     let seg = segs[i]
+                    let marker = markerFlags.map { i < $0.count && $0[i] } ?? isMarker
                     let padding = SegmentPadding.pad(radiusMax: max(seg.radius0, seg.radius1),
-                                                     isMarker: isMarker)
+                                                     isMarker: marker)
                     var minX = min(seg.p1.x, seg.p2.x) - padding
                     var maxX = max(seg.p1.x, seg.p2.x) + padding
                     var minY = min(seg.p1.y, seg.p2.y) - padding

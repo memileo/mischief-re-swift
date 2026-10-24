@@ -702,3 +702,112 @@ levers are, in order:
    the sort/merge volume.
 3. **SDF math** — only with a documented tolerance: the spline SDF is 7 curve samples + 2
    Newton steps per evaluation, and kaos spends most of its SDF budget in `type 1`.
+
+## Round 8 — eight marker strokes cost 1141 dispatches
+
+### What was wrong
+
+Round 7's ablation says the kaos composite is loop-bound again (12.8 ms floor, SDF marginal
+3.4 ms). But a user document exposed a much bigger hole: `art/qwerty.art` has **1/5 of
+kaos's points** (1141 strokes / 68 221 segments vs 2214 / 321 611), yet it took **77 ms
+warm, `gpu 56`** against kaos's 28 ms / `gpu 25`.
+
+`ART_LIVE_PROFILE_ELIGIBLE=art/qwerty.art swift test --filter testProfileEligibility`
+(before this round; it now prints `per-tile ELIGIBLE`):
+
+```
+layer 0: strokes 1141 | segments 68221 | noisy 0 | cuts 0 | markers 8
+  per-tile blocked (8 marker strokes) | per-stroke path: 1141 dispatches over 19689
+  tile-threads vs 2070 tiles for the whole layer
+```
+
+**Eight marker strokes** out of 1141 dropped the whole layer onto the per-stroke path: 1141
+dispatches (each with its own tile-box launch) covering 19 689 tile-threads — 9.5× the
+per-tile path's 2070 — and `bin 7–13`. The per-tile path was marker-free only because
+`LivePerTileEligibility` excluded markers and the AA kernel had no chisel branch; neither was
+a correctness requirement, just an unimplemented case.
+
+### The change
+
+Markers are now per-tile-eligible **when the layer has no noisy segment**:
+
+* `LivePerTileEligibility.isEligible` — cuts still force the per-stroke path; a marker is
+  allowed unless the layer also has a noisy stroke. The per-tile *noise* kernel owns the
+  whole layer when any segment is noisy and has no marker SDF, so `markers + noise` stays
+  on the proven per-stroke path (one rare combination, still exact).
+* `strokeFlags` bit layout: bit0 = eraser, bit1 = hasNoise, **bit2 = isMarker** (independent
+  of the per-stroke `LiveStrokeParams.flags`, which keeps bit1 = marker).
+* Pads — a chisel reaches 4·r from the curve, a capsule only ~1.4·r, and all three binning
+  stages must agree or the marker tips clip:
+  * fused GPU transform kernel: `strokeFlags` bound at buffer 8, `pad = marker ? 4·rMax + 2
+    : 1.4·rMax + 1`;
+  * CPU per-tile plan: `buildSegmentTileIndicesBoxed(..., markerFlags:)` (per segment, so a
+    mixed layer pads each segment by its own rule; `nil` keeps the old whole-call flag for
+    the static path);
+  * stroke-block table: `blockIsMarker` → `pad = (marker ? 4 : 1.4)·rMax·radiusFactor + 3.5`.
+* Per-tile AA kernel — caches `curFlags` when the stroke changes (block and direct walks)
+  and picks `sdSlantedMarkerStraight` / `sdSlantedMarkerSpline` for bit2 strokes, exactly
+  the two calls the per-stroke AA kernel makes for `params.flags & 2`.
+* The splat kernel has no marker SDF, so a layer with any *visible* marker declines the
+  splat and takes the walk (the walk is exact by the Round 7 argument).
+
+### Why it is still output-identical
+
+* The per-tile path already reproduces the per-stroke path pixel for pixel for capsules and
+  splines: same tile list, same per-stroke max-coverage, same per-stroke 8-bit quantisation
+  in `perTileCompositeStroke`, one canvas write per pixel.
+* A marker stroke differs *only* in the distance function. The per-stroke AA kernel applies
+  `sdSlantedMarker*` to every segment of a marker stroke; the per-tile kernel now does the
+  same for the stroke group's segments (`curFlags & 4`), with the same opacity/t and the same
+  `smootherstep` coverage.
+* Markers are excluded from the noise kernel in both paths: per-stroke, a noisy stroke picks
+  the noise kernel *before* looking at `isMarker` (so marker-ness is ignored there); per-tile
+  we keep the whole `markers + noise` layer on the per-stroke path rather than reimplement
+  that interaction.
+* The bin/block pads only ever grow to the true reach, so they can add provably-empty tiles,
+  never drop ink.
+
+### Files
+
+* `Sources/ArtRenderLibrary/LiveRenderCache.swift` — eligibility + bit2 flags.
+* `Sources/ArtRenderLibrary/RendererTypes.swift` — `strokeBlockTable(blockIsMarker:)`.
+* `Sources/ArtRenderLibrary/MetalRenderer.swift` — `LiveBinRefLayer.blockIsMarker`.
+* `Sources/ArtRenderLibrary/MetalRenderer_Dispatch.swift` — `markerFlags` in
+  `buildSegmentTileIndicesBoxed`.
+* `Sources/ArtRenderLibrary/MetalRenderer_LiveCompositing.swift` — plan flags + per-segment
+  marker pads, ref-state flags/blocks, transform-kernel binding, splat gate, visible-marker
+  cull rule.
+* `ArtQuickLook/ArtRenderShaders/segmentKernels.metal` — `liveBinRangeForSeg(isMarker:)` +
+  buffer 8, `curFlags` and the chisel branch in `livePerTileAACompositeKernel`.
+* `Tests/ArtRenderLibraryTests/TileUnionTests.swift` — eligibility (clean markers yes,
+  markers + noise no), bit2 layout, block-table marker pad (16 vs 49 tiles).
+* `Tests/ArtRenderLibraryTests/LiveProfileTests.swift` — `testProfileEligibility` (opt-in).
+* `SPLAT-DESIGN.md` — this section.
+
+### Run this (metallib rebuild IS needed: MSL + buffer index changed)
+
+```
+sh Scripts/build-metallib.sh          # or the ArtRenderShaders scheme in Xcode
+swift build -c release
+
+# the new A/B: per-tile ON vs OFF on the marker document, then on kaos
+ART_LIVE_PERTILE=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/qwerty.art
+ART_LIVE_PERTILE=0 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/qwerty.art
+# compare the two .live-view.png byte for byte (same for art/kaos.art)
+
+sh Scripts/stroke-splat-ab.sh --all                       # 10/10 IDENTICAL
+sh Scripts/stroke-prune-ab.sh --modes 0,1,2 art/kaos.art  # byte-equal
+# kaos zoom-1 pixel gate vs art/kaos.png
+
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/kaos.art
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/qwerty.art
+```
+
+Expect qwerty to report **one `livebin` line** (`segs 68221`, `tiles ~2070`, no per-stroke
+dispatches), `render+comp` in kaos territory (~10–14 ms) and `total` ~20–25 ms instead of 77,
+with the PNGs byte-identical to the per-stroke render. kaos must not move (it has no
+markers; only the extra 4-byte flags load per stroke boundary is new).
+
+Then the next exact lever is still `xform` (4.3–4.9 ms of global atomics into 7800
+counters → a threadgroup-local histogram), then the bin pad, then (only with an accepted
+tolerance) the SDF math.

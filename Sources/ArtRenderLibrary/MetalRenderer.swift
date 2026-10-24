@@ -133,6 +133,8 @@ internal final class LiveBinRefLayer {
                                      // `pruneBlockSize` consecutive segments of one stroke)
     var blockMaxRadius: [Float]      // flat per block: max(radius0, radius1) over its
                                      // segments, doc space — pads the block's box
+    var blockIsMarker: [Bool]        // flat per block: its stroke is a chisel marker
+                                     // (4·r reach, not 1.4·r)
     // Frame buffers (sized geometrically, reused across frames):
     var frameSegments: MTLBuffer?    // N × GPUSplineSegment, device space (.private)
     var ranges: MTLBuffer?           // N × int4 tile ranges (.private)
@@ -181,7 +183,7 @@ internal final class LiveBinRefLayer {
          strokeSegCounts: [Int], strokeMaxRadius: [Float],
          strokeBlockFirst: [Int], strokeBlockCount: [Int],
          blockStroke: [Int32], blockSegStart: [Int32], blockRects: [SIMD4<Float>],
-         blockMaxRadius: [Float]) {
+         blockMaxRadius: [Float], blockIsMarker: [Bool]) {
         self.docID = docID
         self.segCount = segCount
         self.strokeCount = strokeCount
@@ -201,6 +203,7 @@ internal final class LiveBinRefLayer {
         self.blockSegStart = blockSegStart
         self.blockRects = blockRects
         self.blockMaxRadius = blockMaxRadius
+        self.blockIsMarker = blockIsMarker
     }
 }
 
