@@ -81,7 +81,7 @@ struct PerTileParams {
 }
 
 // Must match `LiveBinTransformParams` in segmentKernels.metal field for field, in order.
-// All 4-byte scalars: 4 uint + 10 float = stride 56 on both sides.
+// All 4-byte scalars: 4 uint + 10 float + 1 uint = stride 60 on both sides.
 struct LiveBinTransformParams {
     var segCount: UInt32
     var tilesPerRow: UInt32
@@ -97,6 +97,9 @@ struct LiveBinTransformParams {
     var camD: Float
     var camTX: Float
     var camTY: Float
+    /// 1 = the layer composites through the noise-capable kernel, whose prune reach is
+    /// `liveNoisePruneMargin` instead of the AA margin — the bin pad has to match it.
+    var noiseLayer: UInt32
 }
 
 // Must match `LiveBinBoxParams` in segmentKernels.metal field for field, in order.
@@ -972,7 +975,8 @@ extension MetalRenderer {
             texW: texW, texH: texH, invTile: invTile, radiusFactor: radiusFactor,
             camA: Float(camera.a), camB: Float(camera.b),
             camC: Float(camera.c), camD: Float(camera.d),
-            camTX: Float(camera.tx), camTY: Float(camera.ty))
+            camTX: Float(camera.tx), camTY: Float(camera.ty),
+            noiseLayer: needsNoise ? 1 : 0)
         var bp = LiveBinBoxParams(
             segCount: UInt32(ref.segCount),
             boxMinX: Int32(box.minX), boxMinY: Int32(box.minY),
@@ -1276,7 +1280,7 @@ extension MetalRenderer {
                 if LiveConfig.binStageTimingEnabled() {
                     let incidences = countsArr.reduce(0) { $0 + Int($1) }
                     print("livebin layer \(position): prune table skipped — "
-                          + "\(table.blockTileEstimate) block-tile pairs vs \(incidences) "
+                          + "block-tile bound ≥ \(table.blockTileEstimate) vs \(incidences) "
                           + "incidences; walking the tile list")
                 }
                 groupHeaderBuf = liveEmptyGroupHeader!

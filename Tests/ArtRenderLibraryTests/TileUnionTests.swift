@@ -393,6 +393,32 @@ final class SegmentPaddingTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(Double(SegmentPadding.pad(radiusMax: 1, isMarker: true)),
                                     Double(4 * 1 + 0.44))
     }
+
+    /// The exact pad is the composite's own prune reach plus a device margin. It must
+    /// never be smaller than `reach + aaDeviceMargin` (that is where coverage is already
+    /// zero), and for the radii the documents actually use it is tighter than the
+    /// radius-only constant — that difference is the tile incidences Round 10 removes.
+    func testExactPadIsReachPlusDeviceMargin() {
+        XCTAssertEqual(Double(SegmentPadding.pad(reach: 4.5)), 5.5, accuracy: 1e-6)
+        XCTAssertGreaterThanOrEqual(SegmentPadding.pad(reach: 4.5),
+                                    SegmentPrune.aaDeviceMargin + 4.5)
+        // Hang-proof invariant used by both bin paths: the pad covers the prune disk.
+        for reach in [Float(0), 0.5, 2, 4.5, 12, 40] {
+            XCTAssertGreaterThanOrEqual(SegmentPadding.pad(reach: reach),
+                                        reach + SegmentPrune.aaDeviceMargin)
+        }
+        // Tighter than the historic radius-only constant for plain strokes (r = reach
+        // here; the marker case carries 4·r inside `padding1` already).
+        for r in [Float(1), 2, 4, 8, 16] {
+            XCTAssertLessThan(SegmentPadding.pad(reach: r),
+                              SegmentPadding.pad(radiusMax: r, isMarker: false))
+        }
+        // A noise layer keeps the noise kernel's wider reach (0.375·rMax dominates above
+        // r ≈ 2.7); clean layers use the 1 px constant.
+        XCTAssertEqual(SegmentPrune.noiseDeviceMargin(radius0: 16, radius1: 16), 6, accuracy: 1e-6)
+        XCTAssertEqual(SegmentPrune.noiseDeviceMargin(radius0: 1, radius1: 1), 0.5, accuracy: 1e-6)
+        XCTAssertEqual(SegmentPrune.noiseDeviceMargin(radius0: 0.5, radius1: 0.5), 0.875, accuracy: 1e-6)
+    }
 }
 
 /// Live defaults: per-tile on unless explicitly disabled, live tile size 16 unless

@@ -226,38 +226,67 @@ final class LiveProfileTests: XCTestCase {
         let visibleSet = Set(vis)
 
         // ── Tile counts. The GPU's fused transform+count dispatch does this on macOS; the
-        // formula is copied from `liveBinRangeForSeg` + the layer-box clamp so the table
-        // stages below see the real incidence totals.
-        var counts = [UInt32](repeating: 0, count: boxTiles)
-        for (sid, s) in strokes.enumerated() {
-            let visible = visibleSet.contains(sid)
-            for seg in s.segments {
-                guard visible else { continue }
-                let r0 = seg.radius0 * radiusFactor, r1 = seg.radius1 * radiusFactor
-                let pad = 1.4 * max(r0, r1) + 1
-                let x1 = ca * seg.p1.x + cc * seg.p1.y + ctx
-                let y1 = cb * seg.p1.x + cd * seg.p1.y + cty
-                let x2 = ca * seg.p2.x + cc * seg.p2.y + ctx
-                let y2 = cb * seg.p2.x + cd * seg.p2.y + cty
-                let minX = min(x1, x2) - pad, maxX = max(x1, x2) + pad
-                let minY = min(y1, y2) - pad, maxY = max(y1, y2) + pad
-                if maxX < 0 || minX > texW || maxY < 0 || minY > texH { continue }
-                let loX = max(0, min(tilesX - 1, Int(minX * invTile)))
-                let hiX = max(0, min(tilesX - 1, Int(maxX * invTile)))
-                let loY = max(0, min(tilesY - 1, Int(minY * invTile)))
-                let hiY = max(0, min(tilesY - 1, Int(maxY * invTile)))
-                let cx0 = max(loX, b.minX), cx1 = min(hiX, b.maxX)
-                let cy0 = max(loY, b.minY), cy1 = min(hiY, b.maxY)
-                if cx0 > cx1 || cy0 > cy1 { continue }
-                var ty = cy0
-                while ty <= cy1 {
-                    var t = (ty - b.minY) * boxW + (cx0 - b.minX)
-                    for _ in cx0...cx1 { counts[t] += 1; t += 1 }
-                    ty += 1
+        // formula is copied from `liveBinRangeForSeg` + `binPad` + the layer-box clamp so
+        // the table stages below see the real incidence totals. `counts` is what ships (the
+        // exact `padding1 + margin` pad); the other two are the comparison that predicts
+        // Round 10's win: the pre-Round-10 radius-only constant and pad 0 (the tiles whose
+        // AABB alone holds the chord — a strict lower bound on the inked tile set).
+        let binNoiseLayer = strokes.contains { $0.segments.contains { $0.noiseSeed != 0 } }
+        func incidences(_ padFor: (GPUSplineSegment, Float, Float) -> Float) -> [UInt32] {
+            var c = [UInt32](repeating: 0, count: boxTiles)
+            for (sid, s) in strokes.enumerated() {
+                guard visibleSet.contains(sid) else { continue }
+                for seg in s.segments {
+                    let r0 = seg.radius0 * radiusFactor, r1 = seg.radius1 * radiusFactor
+                    let pad = padFor(seg, r0, r1)
+                    let x1 = ca * seg.p1.x + cc * seg.p1.y + ctx
+                    let y1 = cb * seg.p1.x + cd * seg.p1.y + cty
+                    let x2 = ca * seg.p2.x + cc * seg.p2.y + ctx
+                    let y2 = cb * seg.p2.x + cd * seg.p2.y + cty
+                    let minX = min(x1, x2) - pad, maxX = max(x1, x2) + pad
+                    let minY = min(y1, y2) - pad, maxY = max(y1, y2) + pad
+                    if maxX < 0 || minX > texW || maxY < 0 || minY > texH { continue }
+                    let loX = max(0, min(tilesX - 1, Int(minX * invTile)))
+                    let hiX = max(0, min(tilesX - 1, Int(maxX * invTile)))
+                    let loY = max(0, min(tilesY - 1, Int(minY * invTile)))
+                    let hiY = max(0, min(tilesY - 1, Int(maxY * invTile)))
+                    let cx0 = max(loX, b.minX), cx1 = min(hiX, b.maxX)
+                    let cy0 = max(loY, b.minY), cy1 = min(hiY, b.maxY)
+                    if cx0 > cx1 || cy0 > cy1 { continue }
+                    var ty = cy0
+                    while ty <= cy1 {
+                        var t = (ty - b.minY) * boxW + (cx0 - b.minX)
+                        for _ in cx0...cx1 { c[t] += 1; t += 1 }
+                        ty += 1
+                    }
                 }
             }
+            return c
         }
+        let padRadiusOnly: (GPUSplineSegment, Float, Float) -> Float = { _, r0, r1 in
+            1.4 * max(r0, r1) + 1
+        }
+        let padExact: (GPUSplineSegment, Float, Float) -> Float = { seg, r0, r1 in
+            guard seg.padding1 != 0 else { return 1.4 * max(r0, r1) + 1 }
+            let margin = binNoiseLayer
+                ? max(SegmentPadding.binDeviceMargin,
+                      SegmentPrune.noiseDeviceMargin(radius0: r0, radius1: r1))
+                : SegmentPadding.binDeviceMargin
+            return SegmentPadding.pad(reach: Float(bitPattern: seg.padding1) * radiusFactor,
+                                      margin: margin)
+        }
+        let counts = incidences(padExact)
         let total = counts.reduce(0) { $0 + Int($1) }
+        let totalRadiusOnly = incidences(padRadiusOnly).reduce(0) { $0 + Int($1) }
+        let totalChordOnly = incidences { _, _, _ in 0 }.reduce(0) { $0 + Int($1) }
+        print(String(format: """
+              bin incidences: exact %d | radius-only %d (%+.1f%%) | pad 0 %d | \
+              segs %d | box tiles %d | %@
+              """,
+                     total, totalRadiusOnly,
+                     100.0 * Double(total - totalRadiusOnly) / Double(max(totalRadiusOnly, 1)),
+                     totalChordOnly, segTotal, boxTiles,
+                     binNoiseLayer ? "noise layer (wider margin)" : "clean layer"))
 
         // ── The stages `bin` actually owns.
         let combineMs = Self.measure { _ = GpuBinSpec.combine(counts: counts) }

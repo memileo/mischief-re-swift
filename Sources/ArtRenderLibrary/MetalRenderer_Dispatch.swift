@@ -891,13 +891,31 @@ extension MetalRenderer {
         let hasTransform = transform != nil
 
         var ranges = [SegTileRange](repeating: .empty, count: segments.count)
+        // Exact bin pad (see `SegmentPadding.pad(reach:margin:)`): the composite kernels
+        // prune each pixel at `padding1 + margin`, so the tiles a segment can paint are
+        // exactly AABB(chord) ⊕ (padding1 + margin). The noise-capable kernel prunes with
+        // the wider noise margin for *every* segment of its layer, clean ones included, so
+        // a noisy layer is binned with that margin. `transform == nil` ⇒ these segments are
+        // already camera-mapped (device space), which is what `padding1` is scaled for.
+        let binNoiseLayer = segments.contains { $0.noiseSeed != 0 }
         segments.withUnsafeBufferPointer { segs in
             ranges.withUnsafeMutableBufferPointer { rp in
                 for i in segs.indices {
                     let seg = segs[i]
                     let marker = markerFlags.map { i < $0.count && $0[i] } ?? isMarker
-                    let padding = SegmentPadding.pad(radiusMax: max(seg.radius0, seg.radius1),
+                    let padding: Float
+                    if !hasTransform, seg.padding1 != 0 {
+                        let margin = binNoiseLayer
+                            ? max(SegmentPadding.binDeviceMargin,
+                                  SegmentPrune.noiseDeviceMargin(radius0: seg.radius0,
+                                                                 radius1: seg.radius1))
+                            : SegmentPadding.binDeviceMargin
+                        padding = SegmentPadding.pad(reach: Float(bitPattern: seg.padding1),
+                                                     margin: margin)
+                    } else {
+                        padding = SegmentPadding.pad(radiusMax: max(seg.radius0, seg.radius1),
                                                      isMarker: marker)
+                    }
                     var minX = min(seg.p1.x, seg.p2.x) - padding
                     var maxX = max(seg.p1.x, seg.p2.x) + padding
                     var minY = min(seg.p1.y, seg.p2.y) - padding

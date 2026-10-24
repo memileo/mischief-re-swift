@@ -1851,6 +1851,7 @@ struct LiveBinTransformParams {
     float camD;
     float camTX;
     float camTY;
+    uint  noiseLayer;   // 1 = this layer runs the noise-capable composite (wider prune)
 };
 
 // `LiveBinBoxParams` — must match the Swift struct field for field (scalars only).
@@ -1869,11 +1870,33 @@ struct LiveBinBoxParams {
 // stroke's bit2 flag), strict-inequality off-canvas cull, truncation-toward-zero int
 // conversion, clamp to the grid. Returns the `SegTileRange.empty` sentinel (1,0,0,0) when
 // off-canvas or degenerate. Used by the fused transform+count kernel.
-inline int4 liveBinRangeForSeg(constant LiveBinTransformParams &p,
-                               float2 p1, float2 p2, float r0, float r1,
-                               bool isMarker) {
+// `pad` is the segment's *exact* ink reach from the chord plus the composite kernels'
+// device-pixel prune margin (`prune + margin`, see `binPad`) — the same quantity the
+// per-tile kernels test each pixel against, so a binned tile set is exactly "every tile
+// that can contain a painted pixel". The old radius-only guess (1.4·r + 1, 4·r + 2 for
+// markers) ignored both the Bézier deviation folded into `padding1` and the difference
+// between 1.4 and 1.0, and binned 15–35 % more incidences than can paint.
+//
+// Margin: 0.5 px is the AA kernels' own prune margin (`aaCutoff` 0.44 + rounding), +0.5 px
+// absorbs the tile-range truncation and float rounding. A noise layer is binned with the
+// noise kernel's wider reach (`liveNoisePruneMargin`), because that kernel prunes with it
+// for every segment of the layer — including its clean strokes, whose AA falloff is the
+// floor of that margin.
+//
+// `padding1 == 0` is the "unset" sentinel (never prune): fall back to the historic
+// radius-only constants, which stay conservative.
+inline float binPad(constant LiveBinTransformParams &p, float r0, float r1,
+                    float prune, bool isMarker) {
+    if (prune > 0.0f) {
+        float margin = (p.noiseLayer != 0u) ? max(1.0f, liveNoisePruneMargin(r0, r1)) : 1.0f;
+        return prune + margin;
+    }
     float rMax = max(r0, r1);
-    float pad = isMarker ? (4.0f * rMax + 2.0f) : (1.4f * rMax + 1.0f);
+    return isMarker ? (4.0f * rMax + 2.0f) : (1.4f * rMax + 1.0f);
+}
+
+inline int4 liveBinRangeForSeg(constant LiveBinTransformParams &p,
+                               float2 p1, float2 p2, float pad) {
     float minX = min(p1.x, p2.x) - pad;
     float maxX = max(p1.x, p2.x) + pad;
     float minY = min(p1.y, p2.y) - pad;
@@ -1947,7 +1970,8 @@ kernel void liveBinTransformCountKernel(
     o.padding1 = as_type<uint>(prune); o.padding2 = s.padding2;
     outSegs[gid] = o;
 
-    int4 r = liveBinRangeForSeg(p, p1, p2, r0, r1, (strokeFlags[sId] & 4u) != 0u);
+    int4 r = liveBinRangeForSeg(p, p1, p2, binPad(p, r0, r1, prune,
+                                                (strokeFlags[sId] & 4u) != 0u));
     outRanges[gid] = r;
     if (r.x > r.z || r.y > r.w) return;   // empty sentinel — nothing to count
     // Clamp to the layer box: stroke-bounds boxes don't carry the full 1.4r+1 binning

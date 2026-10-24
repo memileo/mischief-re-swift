@@ -946,3 +946,137 @@ per tile is a dependent 64 B load.
    histogram.
 4. **Bin pad** — still much larger than the prune radius.
 5. **SDF math** — only with an accepted tolerance.
+
+## Round 10 — the bin pad was 1.4·r while the prune was r: 18–26 % of all incidences
+
+Round 9 landed: complex @zoom 10 `render+comp` 20.97 + 3.02 → **9.98 + 1.86 ms**, total
+45 → **27 ms**; kaos unchanged (19.14 vs 19.57, duplicate-run noise); every identity A/B
+byte-equal. So the saturation skip is real, and it is worth what the model said: the frames
+where a pixel sits inside *many segments of the same stroke* are exactly the ones that
+shrank.
+
+### First: the Round 9 ablation numbers are confounded, use `ART_LIVE_SATURATE=0`
+
+With the skip on, bits 1 and 16 *also* remove the skip, so they are not "one stage off":
+
+* bit 1 (no SDF) leaves `signedDist = 1e6` ⇒ `cov = 0` ⇒ `curMax` never reaches 1 ⇒ no
+  saturation ⇒ **more** visits than the baseline. That is why 13.32 > 9.77.
+* bit 16 (constant segment address) gives every entry the same coverage: either the first
+  entry saturates the stroke (near-free) or none ever does.
+
+So for attribution, run the ablation with the skip disabled — that reproduces Round 7's
+meaning (kaos, skip off: 18.87 baseline / 15.41 / 12.91 / 18.98 / 19.56 / 12.61). With the
+skip on, `ART_LIVE_ABLATE=0` vs `ART_LIVE_SATURATE=0` is the honest measure of the skip
+itself: **20.97 → 9.98 ms** on the zoom-10 layer.
+
+### Where the remaining zoom-10 frame goes (warm)
+
+```
+layer 0  render+comp 9.98 | sort 2.98 | scatter 0.92 | xform 0.76
+layer 1  render+comp 1.86 | sort 0.41 | scatter 0.41 | xform 0.36
+total 27 ms = gpu 18 + bin 6 + paper 1
+```
+
+`render+comp` is now walk-bound (the SDF part was mostly saturated away), and the next
+largest item is `bin` — 6 ms of CPU. Both are fed by the same quantity: **the number of
+(segment, tile) incidences**.
+
+### The change: bin to the prune radius, not to a radius guess
+
+The composite kernels test each pixel with `padding1 + margin` (`margin` = 0.5 px AA for
+the AA kernel, `liveNoisePruneMargin` for the noise kernel). `padding1` is the segment's
+**shape reach from its chord** — the Bézier/hull deviation folded with the radius, and 4·r
+rather than r for a chisel marker. A pixel can only be painted if `chordDist ≤ padding1 +
+margin`, so the tiles a segment can touch are **exactly** `AABB(chord) ⊕ (padding1 + margin)`.
+
+The bin, however, used `1.4·r + 1` (`4·r + 2` for markers) — a radius-only guess that
+ignored the deviation term entirely and over-padded by 40 % of the radius. It was
+conservative, so nothing clipped; it just binned tiles that no pixel of the segment could
+ever paint, and every one of those costs a tile-list read, a 64-byte segment load and a
+prune test in the walk, plus a slot in the scatter, the sort and the counts.
+
+All three binning stages now use the same reach as the kernel:
+
+* fused GPU transform kernel: `binPad()` = `padding1·radiusFactor + margin`, with
+  `margin = max(1, liveNoisePruneMargin(r0, r1))` when the layer runs the noise kernel
+  (that kernel prunes with the noise reach for *every* segment of the layer, clean ones
+  included, or the soft falloff would clip) and `1.0` px otherwise (0.5 px AA + 0.5 px
+  tile/float rounding). `LiveBinTransformParams` gained `noiseLayer`; `liveBinRangeForSeg`
+  now takes the pad instead of computing one.
+* CPU per-tile plan (`buildSegmentTileIndicesBoxed`, device space): the same expression,
+  with `SegmentPadding.pad(reach:margin:)`.
+* `padding1 == 0` (the "never prune" sentinel) keeps the historic radius constants in both.
+
+The stroke-block table keeps its own looser pad: it is a *skip* structure, so a too-large
+block box only costs a box test, never a visit.
+
+Measured incidences (Linux probe, `ART_LIVE_PROFILE_BIN=… swift test --filter
+testProfileBinPlan`, which now prints exact vs radius-only vs pad 0):
+
+| document | radius-only | exact | Δ | pad 0 (lower bound) |
+|---|---|---|---|---|
+| kaos @zoom 1 | 1 454 923 | 1 185 719 | **−18.5 %** | 516 091 |
+| qwerty @zoom 1 | 377 490 | 279 577 | **−25.9 %** | 82 591 |
+
+The walk is linear in incidences and the SDF part is not (it only drops the entries that
+could not paint anyway), so expect roughly half of the delta off `render+comp` — ~1.5 ms on
+kaos, ~1 ms on qwerty, ~1.5–2 ms on the zoom-10 layer — plus the same ~20 % off `scatter`,
+`xform` and the sort's element count.
+
+Also in this round: the block table's usability gate can now **abandon pass 1** as soon as
+both upper bounds (block-box area, blocks × dense tiles) exceed half the incidences — it
+can only decline from there, and `blockTileEstimate` is monotone. Both bounds are computed
+before the pass. Pixels are unaffected (a declined table is the plain walk); it only saves
+the camera transform over blocks whose table gets thrown away. The `livebin` skip line now
+prints that number as `bound ≥ N`.
+
+### Files
+
+* `ArtQuickLook/ArtRenderShaders/segmentKernels.metal` — `LiveBinTransformParams.noiseLayer`,
+  `binPad()`, `liveBinRangeForSeg(p, p1, p2, pad)`.
+* `Sources/ArtRenderLibrary/MetalRenderer_LiveCompositing.swift` — param field + `noiseLayer`,
+  gate-line wording.
+* `Sources/ArtRenderLibrary/RendererTypes.swift` — `SegmentPadding.pad(reach:margin:)` +
+  `binDeviceMargin`, the gate's hoisted bounds and early exit.
+* `Sources/ArtRenderLibrary/MetalRenderer_Dispatch.swift` — exact pad in the boxed plan.
+* `Tests/ArtRenderLibraryTests/TileUnionTests.swift` — exact-pad invariants.
+* `Tests/ArtRenderLibraryTests/LiveProfileTests.swift` — the probe's three-pad comparison.
+* `SPLAT-DESIGN.md` — this section.
+
+### Run this (metallib rebuild IS needed: `LiveBinTransformParams` grew to 60 bytes)
+
+```
+sh Scripts/build-metallib.sh
+swift build -c release
+
+# the real gates (the pad change is not optional — no knob: it produces the same pixels)
+sh Scripts/stroke-splat-ab.sh --all
+sh Scripts/stroke-prune-ab.sh --modes 0,1,2 art/kaos.art
+# kaos zoom-1 pixel gate vs art/kaos.png, and qwerty (markers) vs its static render
+
+sh Scripts/composite-ablate.sh --zoom 10 --pan 500,-400 art/complex.art   # with the skip ON
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/kaos.art
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/qwerty.art
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 --zoom 10 --pan 500,-400 art/complex.art
+```
+
+The `livebin` line should show **fewer `chunks` and a lower `render+comp`** for the same
+document, with `tiles` unchanged (that is the layer box). If a pixel gate fails, the pad
+lost ink — but the pad is the kernel's own prune reach, so that would mean `padding1`
+under-reports the shape.
+
+### Still open, in order
+
+1. **`bin` (6 ms at zoom 10, 2–3 ms at zoom 1)** — now the second-largest term on the
+   zoomed frame. Its parts are CPU: cull, `combine`, the block-table build, the sort chunk
+   plan. Run `ART_LIVE_STROKE_PRUNE=0` on the zoom-10 view to price the table directly; if
+   it is most of `bin`, the table needs to be built incrementally (only for the tiles whose
+   list actually got long) or dropped there.
+2. **Jump the list, not just the segment** — a saturated stroke still reads 4 bytes per
+   entry to discover it is saturated. A per-block `jStart` would let it skip to the next
+   stroke's first block.
+3. **Stage the tile's segments in threadgroup memory** — one threadgroup is already one
+   16×16 tile; a preload turns 256 dependent 64-byte loads per entry into one coalesced one.
+4. **`xform` 4.3–4.9 ms on kaos** — global atomics into 7800 counters → threadgroup-local
+   histogram.
+5. **SDF math** — only with an accepted tolerance.

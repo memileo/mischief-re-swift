@@ -286,13 +286,31 @@ public enum SegmentPrune {
 /// its chord p1→p2, expanded to whole tiles. Must contain the kernel's paint, or tiles
 /// get dropped and strokes clip.
 ///
-/// * plain strokes sweep radius r → 1.4·r + 1 (matches the historic binning constant;
-///   covers r + the 0.44 px AA tail + tile rounding).
-/// * markers sweep a 45° chisel reaching 4·r from the chord (3r along the axis + r
-///   capsule radius) → 4·r + 2 (the +2 covers the AA tail + tile rounding). The old
-///   constant (1 + 2·√2 ≈ 3.83)·r + 1 clipped large markers by ~0.17·r per side — the
-///   "clipped thickness + aliased edges" bug.
+/// Two variants:
+/// * `pad(reach:margin:)` — the **exact** pad from the segment's own shape reach
+///   (`GPUSplineSegment.padding1`: the Bézier/hull deviation from the chord folded with
+///   the radius, and 4·r instead of r for a chisel marker) plus the same device-pixel
+///   margin the composite kernel's prune adds. This is what the live binning uses where a
+///   segment is at hand: the binned set is then exactly the tiles that can hold a painted
+///   pixel.
+/// * `pad(radiusMax:isMarker:)` — the historic radius-only constants, kept for callers
+///   that only have stroke bounds (layer box, cull) and as the `padding1 == 0` fallback.
+///   `1.4·r + 1` covers `r` + the 0.44 px AA tail + tile rounding; markers sweep a 45°
+///   chisel reaching 4·r from the chord (3r along the axis + r capsule radius) →
+///   `4·r + 2` (the +2 covers the AA tail + tile rounding; the older `(1 + 2·√2)·r + 1`
+///   clipped large markers by ~0.17·r per side).
 public enum SegmentPadding {
+    /// Device-pixel slack the live bin adds on top of the composite prune's own margin:
+    /// 0.5 px for the AA cutoff + projection, 0.5 px for tile-range truncation/rounding.
+    /// Mirrored as the literal `1.0f` in `binPad` in `segmentKernels.metal`.
+    public static let binDeviceMargin: Float = 1.0
+
+    /// Exact device-space pad for one segment: `padding1` is already camera-scaled by
+    /// `LiveRenderCache.remap` (and by the GPU transform kernel), so this is a plain add.
+    public static func pad(reach: Float, margin: Float = binDeviceMargin) -> Float {
+        reach + margin
+    }
+
     public static func pad(radiusMax: Float, isMarker: Bool) -> Float {
         if isMarker {
             return 4.0 * radiusMax + 2.0
@@ -892,9 +910,23 @@ public enum GpuBinSpec {
         var devRanges: [(minX: Int, minY: Int, maxX: Int, maxY: Int)] = []
         devRanges.reserveCapacity(blockRects.count)
         var perTile = [Int](repeating: 0, count: boxTiles)
-        // Upper bound on the finished table's size, accumulated in this same pass (the
-        // clamped area of every block's tile box). The usability gate below needs it
-        // BEFORE the O(entries) work, which is the expensive part.
+        // Usability gate (inputs hoisted above pass 1 so the estimate can be abandoned the
+        // moment it can no longer pass): `bound` is an upper bound on the entries, so a
+        // decline is always safe.
+        let incidences = tileCounts.reduce(0) { $0 + Int($1) }
+        let denseTiles = tileCounts.reduce(0) { $0 + (Int($1) >= minEntries ? 1 : 0) }
+        var visibleBlockCount = 0
+        for sid in visibleStrokes where sid >= 0 && sid < blockCount.count {
+            visibleBlockCount += blockCount[sid]
+        }
+        // Second bound: no block can own more than one entry per dense tile.
+        let secondBound = visibleBlockCount * denseTiles
+        // Once both upper bounds are known to exceed half the incidences, the gate can only
+        // decline — and `blockTileEstimate` grows monotonically, so pass 1 can stop early
+        // instead of transforming the camera over every remaining block (kaos: the estimate
+        // crosses the threshold about halfway through, and the table is discarded anyway).
+        let gateDoomed = !force && secondBound * 2 > incidences
+
         var blockTileEstimate = 0
 
         for sid in visibleStrokes {
@@ -950,6 +982,10 @@ public enum GpuBinSpec {
                 if loX <= hiX && loY <= hiY {
                     blockTileEstimate += (hiX - loX + 1) * (hiY - loY + 1)
                 }
+                // Both bounds now exceed half the incidences → the gate can only decline.
+                if gateDoomed && blockTileEstimate * 2 > incidences {
+                    return (header, [], 0, blockTileEstimate)
+                }
             }
         }
 
@@ -967,9 +1003,7 @@ public enum GpuBinSpec {
         // block can own more entries than its box area, and none can own more than one per
         // dense tile. The second bound is what keeps sparse views from being rejected on a
         // box area that is mostly below the density gate.
-        let incidences = tileCounts.reduce(0) { $0 + Int($1) }
-        let denseTiles = tileCounts.reduce(0) { $0 + (Int($1) >= minEntries ? 1 : 0) }
-        let bound = min(blockTileEstimate, devRanges.count * denseTiles)
+        let bound = min(blockTileEstimate, secondBound)
         if !force && bound * 2 > incidences {
             return (header, [], 0, bound)
         }
