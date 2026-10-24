@@ -1230,8 +1230,8 @@ extension MetalRenderer {
         let groupsReady = ensureEmptyGroupBuffers(device: device, tileCount: boxTiles)
         allocWindow += Self.milliseconds(since: aGroups)
         guard groupsReady else { return false }
+        let aTable = DispatchTime.now().uptimeNanoseconds
         if LiveConfig.strokePruneEnabled() {
-            let aTable = DispatchTime.now().uptimeNanoseconds
             let table = GpuBinSpec.strokeBlockTable(
                 visibleStrokes: visStrokeIDs,
                 blockFirst: ref.strokeBlockFirst, blockCount: ref.strokeBlockCount,

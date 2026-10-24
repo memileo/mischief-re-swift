@@ -1277,7 +1277,7 @@ kernel void livePerTileAACompositeKernel(
     const device LiveStrokeGroupBlock *strokeGroups [[buffer(8)]], // flat block table
     texture2d<float, access::read_write> target [[texture(0)]],
     uint2 gid [[thread_position_in_grid]],
-    uint3 tpg [[threads_per_threadgroup]],
+    uint2 tpg [[threads_per_threadgroup]],
     uint2 tid [[thread_position_in_threadgroup]])
 {
     threadgroup uint  tgSeg[LIVE_STAGE];
@@ -1336,9 +1336,10 @@ kernel void livePerTileAACompositeKernel(
     float curMax = 0.0f;
 
     // Tile-list stage (see LIVE_STAGE).
-    const uint stageSize = tpg.x * tpg.y * tpg.z;
-    const uint stageIndex = tid.x + tid.y * tpg.x + tid.z * tpg.x * tpg.y;
-
+    // FIX: 2D threadgroup (z == 1) — flatten x-major without the z terms.
+    const uint stageSize  = tpg.x * tpg.y;
+    const uint stageIndex = tid.x + tid.y * tpg.x;
+    
     for (uint base = 0; base < tc.count; base += LIVE_STAGE) {
         const uint n = min(LIVE_STAGE, tc.count - base);
         for (uint t = stageIndex; t < n; t += stageSize) {
@@ -1470,7 +1471,7 @@ kernel void livePerTileNoiseCompositeKernel(
     texture2d<float, access::sample> noiseTex [[texture(1)]],
     sampler noiseSampler [[sampler(0)]],
     uint2 gid [[thread_position_in_grid]],
-    uint3 tpg [[threads_per_threadgroup]],
+    uint2 tpg [[threads_per_threadgroup]],
     uint2 tid [[thread_position_in_threadgroup]])
 {
     threadgroup uint  tgSeg[LIVE_STAGE];
@@ -1516,8 +1517,8 @@ kernel void livePerTileNoiseCompositeKernel(
     const float satCeil = PT_SAT_CEIL(params);
 
     // Tile-list stage (see LIVE_STAGE); the noise kernel's prune reach is the noise one.
-    const uint stageSize = tpg.x * tpg.y * tpg.z;
-    const uint stageIndex = tid.x + tid.y * tpg.x + tid.z * tpg.x * tpg.y;
+    const uint stageSize = tpg.x * tpg.y;
+    const uint stageIndex = tid.x + tid.y * tpg.x;
 
     for (uint base = 0; base < tc.count; base += LIVE_STAGE) {
         const uint n = min(LIVE_STAGE, tc.count - base);

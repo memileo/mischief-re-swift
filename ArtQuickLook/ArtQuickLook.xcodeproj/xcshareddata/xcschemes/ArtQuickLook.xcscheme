@@ -59,6 +59,11 @@
             isEnabled = "YES">
          </EnvironmentVariable>
          <EnvironmentVariable
+            key = "ART_LIVE_STROKE_PRUNE"
+            value = "0"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+         <EnvironmentVariable
             key = "ART_LIVE_TILE_SIZE"
             value = "8"
             isEnabled = "NO">
