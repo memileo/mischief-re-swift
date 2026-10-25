@@ -1335,11 +1335,11 @@ kernel void livePerTileAACompositeKernel(
     uint curFlags = 0u;                 // per-stroke flags (bit2 = marker)
     float curMax = 0.0f;
 
-    // Tile-list stage (see LIVE_STAGE).
-    // FIX: 2D threadgroup (z == 1) — flatten x-major without the z terms.
-    const uint stageSize  = tpg.x * tpg.y;
+    // Tile-list stage (see LIVE_STAGE). The group is 2D (16×16, depth 1), so the flat
+    // thread index needs no z term — `stageSize` is exactly the group's thread count.
+    const uint stageSize = tpg.x * tpg.y;
     const uint stageIndex = tid.x + tid.y * tpg.x;
-    
+
     for (uint base = 0; base < tc.count; base += LIVE_STAGE) {
         const uint n = min(LIVE_STAGE, tc.count - base);
         for (uint t = stageIndex; t < n; t += stageSize) {

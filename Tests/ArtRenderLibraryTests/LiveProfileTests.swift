@@ -350,9 +350,10 @@ final class LiveProfileTests: XCTestCase {
         print("\n=== bin plan: \(url.lastPathComponent) (1920×1080, zoom 1) ===")
         print(String(format: "  strokes %d visible %d | segments %d | box %d×%d = %d tiles",
                      strokes.count, vis.count, segTotal, boxW, boxH, boxTiles))
-        print(String(format: "  incidences %d (%d/tile max-ish) | chunks %d passes %d | blocks %d entries %d",
+        print(String(format: "  incidences %d (%d/tile max-ish) | chunks %d passes %d | blocks %d entries %d bound %d",
                      total, boxTiles > 0 ? total / boxTiles : 0,
-                     sortChunks.count, mergePasses, table.totalBlocks, table.entries.count))
+                     sortChunks.count, mergePasses, table.totalBlocks, table.entries.count,
+                     table.blockTileEstimate))
         print(String(format: "  cull        %7.2f ms", cullMs))
         print(String(format: "  combine     %7.2f ms", combineMs))
         print(String(format: "  blockTable  %7.2f ms", tableMs))

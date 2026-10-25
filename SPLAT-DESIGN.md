@@ -1235,13 +1235,143 @@ default run is the block-table build's price on each. If it is most of `bin`, th
 to be built only for tiles whose list actually got long (or dropped where the saturation skip
 already covers the tile).
 
+### Result (Mac, warm; committed as `15537ca` + compile fixes in `4f3bfe1`)
+
+| view | before | after |
+|---|---|---|
+| complex @10 L0 `render+comp` | 6.76 | **5.61** |
+| complex @10 L1 | 1.55 | **1.39** |
+| complex @10 total | 21 | **19** |
+| kaos `render+comp` | 17.76 | **14.29** |
+| kaos total | 27 | **23** |
+| qwerty `render+comp` / total | 5.18 / 12 | **4.89 / 12** |
+
+`tiles`, `chunks`, `sdf` and all pixel gates unchanged, as required.
+
+The ablation is the interesting part: **6.94 → 5.59 / 6.00 / 3.02 / 4.80 / 5.05 / 15.16** (bits
+0/1/2/4/8/16). Bit 2 has fallen from 6.94 to **3.02**, so the walk floor really was the
+dependent-load chain — it halved. What is left of the 5.6 ms is roughly 1.2 SDF + 0.8 blend
++ 0.5 write, so a third of the frame is now real shading work rather than stalls.
+
+Two ablation bits are now *invalid measurements*, not just noisy ones: bit 1 (no SDF) and bit
+16 (constant segment) both change `curMax`, which changes when the Round 9 saturation skip
+fires, so they run *longer* than the baseline (bit 16 = 15.16). Only bits 2/4/8 are additive.
+Bit 16 in particular can no longer isolate the 64 B fetch: with the prune reading the staged
+chord, the fetch only happens for entries that are about to run the SDF anyway.
+
+The round missed the 17–18 ms target by ~1 ms, and the `cpu` line that landed with it says
+exactly where: `bin` is 5 ms at zoom 10, of which `table` is 3.33 ms.
+
+### Still open, in order (as of Round 12)
+
+1. **`bin`** — done in Round 12: the block-table build was the whole cost and it has been
+   retired (see the next section).
+2. **`xform` 1.0–1.1 ms per layer** (4.4 ms on kaos) — global atomics into a per-tile counter
+   array; a threadgroup-local histogram first would cut most of the atomic traffic.
+3. **kaos' `render+comp` (14.3 ms)** — 1.19M incidences and 303M SDF evals; the walk floor is
+   small now, so this is shading-bound. Either fewer incidences (the pad is already exact) or
+   SDF math, which needs an accepted tolerance.
+4. **SDF math** — only with an accepted tolerance.
+
+## Round 12 — retire the stroke-block table: the stage made it a net loss
+
+### What the `cpu` line said
+
+Round 11's per-stage `bin` timing paid for itself immediately. At zoom 10 the frame was
+
+```
+livebin layer 0: cpu cull 0.20 prep 0.00 counts 0.05 table 3.33 plan+upload 0.20 ms
+```
+
+`table` — the `strokeBlockTable` build — is **3.33 ms of a 5 ms `bin`**, i.e. ~17 % of the
+whole 19 ms frame, spent on the CPU to build a pruning table for the GPU. qwerty says the same
+(1.86 ms of 3 ms). The block table was Round 5's answer to an expensive segment walk, and
+Round 11 removed that problem.
+
+The `ART_LIVE_STROKE_PRUNE=0` runs price what the table buys on the other side:
+
+| view | `render+comp` with table | without | `bin` with | without |
+|---|---|---|---|---|
+| complex @10 | 5.61 (5.19 cold) | **4.71** | 5 | **1** |
+| qwerty | 4.89 | **4.63** | 3 | **1** |
+
+So the table does not even break even on the GPU any more: the block cursor (one 24 B global
+load + a `segStart` compare per entry, plus the `do/while`) costs about as much as the staged
+prune it skips, and at complex@10 it is *slower* with the table than without. The staged prune
+is four threadgroup loads and ~10 flops; the only way a block skip wins is by covering a long
+run of entries at once, and a `pruneBlockSize`-segment block padded by `1.4·r·radiusFactor`
+rarely misses a zoomed-in pixel completely.
+
+The two views the usability gate admitted, and how far off the gate's `bound × 2 ≤ incidences`
+rule was (Linux profile, zoom 1):
+
+| view | incidences | `bound` | ratio |
+|---|---|---|---|
+| kaos | 1 185 719 | 592 883 | 0.50 → gate declines |
+| qwerty | 279 577 | 92 328 | 0.33 → built, net loss |
+| complex @1 | 153 247 | 35 370 | 0.23 → built, net loss |
+
+Halving the candidate count is nowhere near enough once the per-entry prune is free: the table
+would have to skip the large majority of entries *and* be nearly free to build.
+
+### The change
+
+`LiveConfig.strokePruneEnabled()` is **off by default**. `ART_LIVE_STROKE_PRUNE=1` re-enables the
+gated build, `=2` forces it past the gate (unchanged). The kernels, buffers and dispatch are
+untouched: with no table the per-tile kernels see `gCount == 0` and take the direct-walk branch
+that `ART_LIVE_STROKE_PRUNE=0` has always exercised, which is why the pixel identity argument is
+the existing A/B rather than a new one.
+
+Nothing else in the frame changes: the per-block arrays (`blockRects`, `blockMaxRadius`, …) are
+built once per document in `BinRefState`, not per frame, and the empty header/entry stubs still
+have to be bound, so the disabled path costs a `memcpy` of nothing.
+
+The `livebin … prune table skipped` line is now printed only when the table was actually asked
+for, so the default log stays quiet.
+
+Also in this round (comment/hygiene only):
+
+* the Round 11 staging kernels declare `threads_per_threadgroup` / `thread_position_in_threadgroup`
+  as `uint2` and drop the `z` terms — the live group is 16×16 with `depth: 1`, so `z` is always 1
+  and the flatten `tid.x + tid.y * tpg.x` is exact. (The compile error was `tid.z` on a `uint2`;
+  there is no `uint3` requirement and no optimisation that needs `z`.)
+* `LiveProfileTests` prints the gate's `bound` next to the block/entry counts.
+
+### Expected numbers
+
+| view | before (Round 11) | expected |
+|---|---|---|
+| complex @10 `bin` / `render+comp` / total | 5 / 5.61 / 19 | **~1.7 / ~5 / ~15** |
+| qwerty `bin` / total | 3 / 12 | **~1.1 / ~10** |
+| kaos | 2 / 23 (table already declined) | unchanged |
+
+The frame target (~16 ms at zoom 10) is reached by this round alone if the estimate holds.
+
+### Run this (no kernel change; metallib rebuild only to keep the binary in step with the comment edit)
+
+```
+sh Scripts/build-metallib.sh
+swift build -c release
+
+sh Scripts/stroke-prune-ab.sh --modes 0,1,2 art/kaos.art   # still byte-equal, all three
+# kaos zoom-1 pixel gate vs art/kaos.png; qwerty marker gate vs its static render
+
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/kaos.art
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/qwerty.art
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 --zoom 10 --pan 500,-400 art/complex.art
+```
+
+Decision rule: `bin` must drop by ~3.3 ms (complex @10) and ~1.9 ms (qwerty), `render+comp` must
+not rise, and `tiles`/`chunks`/`sdf` must be identical. If `render+comp` moves *up* while the
+pixel gates pass, the table was doing real work somewhere the three views do not cover — re-run
+`--modes 0,2` on that view before keeping the new default.
+
 ### Still open, in order
 
-1. **`bin`** — price it with the two lines above; then either an on-demand block table or
-   moving the count/prefix work fully to the GPU.
-2. **`xform` 1.0–1.1 ms per layer** — global atomics into a per-tile counter array; a
-   threadgroup-local histogram first would cut most of the atomic traffic.
-3. **The walk floor** — if staging lands where expected, the floor becomes the 4 B stride
-   itself; the next lever is the per-entry 8×8 sub-cell mask (skip entries whose ink cannot
-   touch the pixel's 2×2 px cell) or run-length stroke groups per tile.
-4. **SDF math** — only with an accepted tolerance.
+1. **`xform`** — 1.0 ms per layer at zoom 10, **4.4 ms on kaos** (321k segments): each segment
+   scatters atomically into every tile it touches. A threadgroup-local histogram over the tile
+   range, flushed once per group, removes all but a fraction of the global atomics.
+2. **kaos `render+comp` 14.3 ms** — 1.19M incidences, 303M SDF evals, walk floor now small. This
+   is shading-bound: either fewer incidences or SDF math, and the latter needs an accepted
+   tolerance.
+3. **`scatter` / `sort`** — 0.65 / 0.45 ms per layer; only worth it after the two above.

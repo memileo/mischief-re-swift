@@ -2,8 +2,8 @@
 # Pixel-identity A/B for the composite stroke-block table (ART_LIVE_STROKE_PRUNE).
 #
 # Modes:
-#   0  table disabled          (the plain segment walk)
-#   1  default                 (built only when it can pay for itself — the usability gate)
+#   0  table disabled          (the plain segment walk — also the default now)
+#   1  table enabled           (built only when it can pay for itself — the usability gate)
 #   2  table forced            (built regardless of the gate; measurement escape hatch)
 #
 # All modes must produce byte-identical PNGs: the table only decides which provably-empty

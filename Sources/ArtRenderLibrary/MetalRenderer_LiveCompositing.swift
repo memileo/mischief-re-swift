@@ -1222,8 +1222,11 @@ extension MetalRenderer {
         // `pruneBlockSize` consecutive segments in document order with their padded
         // device boxes, so the composite kernels can skip whole segment runs whose
         // box misses a pixel (refines the earlier whole-stroke boxes: mega-strokes
-        // skip per block too). Dense tiles only; a dropped table (budget exceeded)
-        // or ART_LIVE_STROKE_PRUNE=0 leaves behaviour identical, just slower.
+        // skip per block too). Dense tiles only, and **off by default** since Round 12:
+        // once the tile list is staged in threadgroup memory the per-entry prune is
+        // cheaper than the block cursor, and this build costs 2–3 ms of `bin` on the
+        // Mac. `ART_LIVE_STROKE_PRUNE=1` re-enables it (gate applies), `=2` forces it
+        // past the gate; every mode is pixel-identical.
         var groupHeaderBuf: MTLBuffer
         var groupEntryBuf: MTLBuffer
         let aGroups = DispatchTime.now().uptimeNanoseconds
@@ -1288,8 +1291,10 @@ extension MetalRenderer {
             } else {
                 // No dense tiles, or a table that could not pay for itself (see the
                 // usability gate in `strokeBlockTable`): an empty header makes the kernels
-                // walk segments directly (identical output, no per-block box tests).
-                if LiveConfig.binStageTimingEnabled() {
+                // walk segments directly (identical output, no per-block box tests). The
+                // default configuration is this path, so it only reports when the table
+                // was actually asked for.
+                if LiveConfig.binStageTimingEnabled() && LiveConfig.strokePruneEnabled() {
                     let incidences = countsArr.reduce(0) { $0 + Int($1) }
                     print("livebin layer \(position): prune table skipped — "
                           + "block-tile bound ≥ \(table.blockTileEstimate) vs \(incidences) "

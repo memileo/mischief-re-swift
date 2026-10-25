@@ -466,8 +466,8 @@ final class LiveConfigTests: XCTestCase {
     }
 
     func testStrokePruneForcedOnlyForTwo() {
-        // `2` is the A/B escape hatch around the block table's usability gate; `0` still
-        // disables the table entirely, and everything else is the gated default.
+        // `2` is the A/B escape hatch around the block table's usability gate; `0` and
+        // unset disable the table entirely, `1` is the gated build.
         XCTAssertFalse(LiveConfig.strokePruneForced(environment: [:]))
         XCTAssertFalse(LiveConfig.strokePruneForced(environment: ["ART_LIVE_STROKE_PRUNE": "1"]))
         XCTAssertTrue(LiveConfig.strokePruneForced(environment: ["ART_LIVE_STROKE_PRUNE": "2"]))
@@ -499,9 +499,12 @@ final class LiveConfigTests: XCTestCase {
         XCTAssertEqual(LiveConfig.mergeUnitSize(environment: ["ART_LIVE_MERGE_UNIT": "abc"]), 64)
     }
 
-    func testStrokePruneDefaultsOn() {
-        XCTAssertTrue(LiveConfig.strokePruneEnabled(environment: [:]))
+    func testStrokePruneDefaultsOff() {
+        // Round 12: the table lost to the staged prune on every measured view, so it is
+        // opt-in. `1` still honours the usability gate; `2` forces the build past it.
+        XCTAssertFalse(LiveConfig.strokePruneEnabled(environment: [:]))
         XCTAssertTrue(LiveConfig.strokePruneEnabled(environment: ["ART_LIVE_STROKE_PRUNE": "1"]))
+        XCTAssertTrue(LiveConfig.strokePruneEnabled(environment: ["ART_LIVE_STROKE_PRUNE": "2"]))
         XCTAssertFalse(LiveConfig.strokePruneEnabled(environment: ["ART_LIVE_STROKE_PRUNE": "0"]))
     }
 

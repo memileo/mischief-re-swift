@@ -369,14 +369,21 @@ public enum LiveConfig {
         return GpuBinSpec.mergeUnitSize
     }
 
-    /// Stroke-box pruning in the per-tile composite kernels (default on; set
-    /// `ART_LIVE_STROKE_PRUNE=0` to A/B against the direct segment walk). Only dense
-    /// tiles participate (see `GpuBinSpec.strokePruneMinTileEntries`), the table is
-    /// dropped when it cannot pay for itself (see `strokeBlockTable`'s usability gate)
-    /// and a dropped table keeps the exact behaviour, just with the plain segment walk.
+    /// Stroke-block pruning in the per-tile composite kernels (`ART_LIVE_STROKE_PRUNE`;
+    /// **default off**). Only dense tiles participate (see
+    /// `GpuBinSpec.strokePruneMinTileEntries`), and the table is still dropped when it
+    /// cannot pay for itself (see `strokeBlockTable`'s usability gate).
+    ///
+    /// Round 12 turned the default off, because the Round 11 threadgroup stage made the
+    /// per-entry prune nearly free and the table became a net loss on every measured view
+    /// (see `SPLAT-DESIGN.md`): the block cursor costs more per entry than the staged
+    /// prune it skips, and the CPU build costs 2–3 ms of `bin` per frame. It stays
+    /// available by request — `=0` off, `=1` enabled (gate still applies), `=2` forced
+    /// past the gate — and every mode is pixel-identical, so the A/B stays valid.
     public static func strokePruneEnabled(environment: [String: String]? = nil) -> Bool {
         let env = environment ?? ProcessInfo.processInfo.environment
-        return env["ART_LIVE_STROKE_PRUNE"] != "0"
+        guard let v = env["ART_LIVE_STROKE_PRUNE"] else { return false }
+        return v == "1" || v == "2"
     }
 
     /// Build the stroke-block table even when the usability gate says its block boxes are
