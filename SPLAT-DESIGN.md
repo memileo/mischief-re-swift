@@ -1375,3 +1375,158 @@ pixel gates pass, the table was doing real work somewhere the three views do not
    is shading-bound: either fewer incidences or SDF math, and the latter needs an accepted
    tolerance.
 3. **`scatter` / `sort`** — 0.65 / 0.45 ms per layer; only worth it after the two above.
+
+## Round 13 — the 4.4 ms `xform` was 20 MB of system-memory reads, not atomics
+
+### The number that did not fit
+
+Round 12 queued a threadgroup-local histogram for `xform`, on the theory that kaos'
+4.4 ms was atomic contention: 321 611 segments scatter 1.19 M increments into 7800 tile
+counters. The ablation says otherwise. Each variant below is a temporary kernel patch on
+kaos @zoom 1, warm, `ART_LIVE_BINTIME=1`; "gpu" is the whole frame because with the counts
+zeroed the frame early-returns after the transform.
+
+| variant | time |
+|---|---|
+| empty kernel (`return` right after the bounds check) | **0 ms** |
+| no counting atomics (transform + stores kept) | **4.0 ms** |
+| no `outSegs`/range stores (rare store keeps the math alive) | **4.0 ms** |
+| `refSegs[0]` instead of `refSegs[gid]` (math + stores kept) | **0 ms** |
+| shipping | 4.36 ms |
+
+So the atomics are worth ≈0.3 ms and everything is worth 0 except one NULL pointer:
+the per-thread 64 B `GPUSplineSegment` read. 321 611 × 64 B = **20.6 MB**, and 4 ms for
+20 MB is 5 GB/s — PCIe speed, not VRAM speed.
+
+The reason: `ensureBinRefState` uploaded the read-only reference arrays with
+`.storageModeShared`. On a **discrete** GPU that is system memory; the GPU reads it
+across the bus every frame. (On Apple Silicon / integrated GPUs `.shared` is the same
+memory, so the bug is invisible there — which is why it survived every earlier round.)
+The comment on `LiveBinRefLayer` even said "reference space (.shared)" as if the storage
+mode were part of the design.
+
+### The change
+
+`ensureBinRefState.upload` now writes the array into a one-off `.shared` staging buffer
+and blits it into a `.private` destination, then waits once. It runs once per
+document/layer (`ensureBinRefState` is cached by document identity), so the extra command
+buffer is a load-time cost, not a frame cost. Four arrays move to VRAM:
+
+* `refSegments` — 64 B × N (kaos: 20.6 MB) — read in full by the transform kernel;
+* `segStroke` — 4 B × N — read per incidence in the composite's stage loop;
+* `strokeFlags` — 4 B × S — read per stroke/block in the walk;
+* `strokeColors` — 16 B × S — read per stroke in the walk and the splat composite.
+
+`strokeVisible` stays `.shared`: the CPU rewrites it every frame by design.
+
+No kernel, binding, dispatch, struct or metallib symbol changed. `frameSegments` and
+`ranges` were already `.private`; this makes the *input* to the transform match its
+output.
+
+### Result (Mac, warm, `ART_LIVE_BINTIME=1`; before = Round 12 data)
+
+| view | stage | before | after |
+|---|---|---|---|
+| kaos | `xform` | 4.37 | **0.71** |
+| kaos | `scatter` / `sort` | 0.63 / 0.54 | 0.41 / 0.44 |
+| kaos | `render+comp` | 14.29 | 14.05 |
+| kaos | total (gpu) | 23 (20) | **18–19 (16)** |
+| qwerty | `xform` / total | 1.14 / 10 | **0.64 / 9** |
+| complex @10 L0 | `xform` | 0.99 | **0.79** |
+| complex @10 L1 | `xform` | 0.59 | **0.52** |
+| complex @10 | total | 15 | **14–15** |
+
+`render+comp` is unchanged within noise, as it must be — this round moves memory, not
+work. The 0.7 ms left in kaos' `xform` is ~45 MB of read+write at ~60 GB/s plus the
+dispatch, i.e. the array traffic is now cheap.
+
+Pixel gates: `stroke-splat-ab.sh --all` 10/10 identical; `stroke-prune-ab.sh --modes
+0,1,2 art/kaos.art` byte-equal; kaos @zoom 1 vs the static render unchanged (peak error
+1 LSB, the long-standing live-vs-static rounding difference); **live-vs-live** hashes of
+kaos, qwerty and complex @10 before/after the change are identical (the pre-change binary
+was rebuilt from `git stash`). `swift test`: 106 tests, 4 skipped, 0 failures.
+
+### Why the histogram would have been wasted work
+
+The proposed threadgroup-local histogram targets the one part of this kernel that is
+cheap. Priced against the measurements: if the 1.19 M atomics cost ~0.3 ms, even a
+perfect aggregation can only save that fraction, and it would add ~9 KB of
+threadgroup memory (plus a flush pass) to a kernel that is already latency-bound on a
+20 MB read. The right first question was "where do the 4.4 ms go", and the answer was a
+buffer storage mode.
+
+### Tile size 8: exact, and only worth it for kaos (measured, not adopted)
+
+While the SDF was under the microscope, the obvious exact lever was tried: `tileThreads`
+was generalized so a per-tile dispatch uses an 8×8 group for an 8 px tile (the tile-size
+knob already existed for 16…64, but tile 8 previously made groups straddle tiles). All
+three views are **byte-identical at tile 8 vs 16**, as expected: tiles partition pixels
+and the bin pad is exact.
+
+| view | `render+comp` 16 → 8 | `scatter` | `sort` | total |
+|---|---|---|---|---|
+| kaos | 14.04 → **11.45** (`sdf` 303.5 M → 168.3 M) | 0.42 → 1.02 | 0.45 → 0.87 | 19 → **17** |
+| qwerty | 4.47 → 3.7–4.4 | 0.24 → 0.37 | 0.89 → **2.34** | 9 → 10–11 |
+| complex @10 | 5.11/1.38 → 4.31/0.97 | 0.67 → **2.25** | 0.45 → 1.07 | 15 → 17–18 |
+
+Incidences grow 2.2× (kaos 1.19 M → 2.63 M) because a segment touches ≈(1+(L+2R)/tile)²
+tiles. Half the pixels per incidence is a real win for `render+comp`, but the scatter,
+sort and transform-count costs scale with incidences, so it only pays when `render+comp`
+is nearly the whole frame (kaos). It is not a default; the tile-8 plumbing was reverted so
+the measured default stays 16.
+
+Two numbers from the same session that bound what is left:
+
+* **The walk floor is prune math, not staging.** `ART_LIVE_ABLATE=2` at tile 16 vs 32:
+  3.44 vs 6.66 ms while pixel-entry pairs go 303 M → 697 M and staged bytes *halve*.
+  Fitting `a·pairs + b·incidences` gives ≈2.7 ms of per-pixel prune + ≈0.7 ms of stage
+  loads at tile 16.
+* **The SDF is one function.** Temporarily widening the ablation mask (it clamps at 31)
+  and skipping one segment type at a time: type 0 (capsule) ≈ 0.7 ms, type 1
+  (`sdSplineSegment`) ≈ **4.1 ms**, type 2 (soft envelope) ≈ 1.1 ms of the 7.0 ms SDF
+  total. Only ~11 % of the 303 M pixel-entry pairs survive the prune, so the SDF is
+  already evaluating close to the ink area; a tighter prune has little to win.
+
+### Files
+
+* `Sources/ArtRenderLibrary/MetalRenderer_LiveCompositing.swift` — private staging blit in
+  `ensureBinRefState.upload`; no other logic.
+* `Sources/ArtRenderLibrary/MetalRenderer.swift` — `LiveBinRefLayer` storage-mode
+  comments (`.shared` → `.private`).
+* `SPLAT-DESIGN.md` — this section.
+
+### Run this (no kernel change; metallib rebuild only to keep the checked-in binary in step)
+
+```
+sh Scripts/build-metallib.sh
+swift build -c release
+swift test
+
+sh Scripts/stroke-splat-ab.sh --all                      # 10/10 identical
+sh Scripts/stroke-prune-ab.sh --modes 0,1,2 art/kaos.art # byte-equal
+# kaos zoom-1 vs the static render; qwerty marker visual check
+
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/kaos.art
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 art/qwerty.art
+ART_LIVE_BINTIME=1 .build/release/art2png --live-view --warmup 1 --viewport 1920x1080 --zoom 10 --pan 500,-400 art/complex.art
+```
+
+Decision rule: `xform` must collapse on kaos/qwerty (≈4.4 → ≈0.7, ≈1.1 → ≈0.6) and
+`render+comp` must not move. `tiles`/`chunks`/`sdf` must be identical. If `xform` does not
+move on a discrete GPU, the upload did not reach the new `upload` (check that
+`ensureBinRefState` rebuilt — it is cached per document identity).
+
+### Still open, in order
+
+1. **kaos `render+comp` 14.0 ms** — now the whole frame. ~2.7 ms walk (prune per pixel),
+   ~4.1 ms `sdSplineSegment`, ~1.1 ms soft envelope, ~0.9 ms blend, ~0.3 ms write. The
+   exact levers are incidence count (tile 8: wins kaos by 2 ms, loses qwerty/complex) or
+   cheaper spline math; the latter changes pixels and needs an accepted tolerance.
+2. **`bin` ~2 ms** — `cpu cull` is 1.0 ms on kaos for 2214 strokes (~450 ns each), and the
+   corner transform is computed twice per visible stroke (`intersects` + the AABB). The
+   segment-level tile range already culls exactly on the GPU; dropping the CPU stroke cull
+   (and binning against the full canvas grid) would remove the loop, at the cost of a
+   full-grid prefix.
+3. **`scatter` / `sort`** — 0.4 / 0.45 ms (kaos), 0.25 / 0.9 ms (qwerty, two merge passes).
+4. **SDF approximations** — only with an accepted tolerance.
+

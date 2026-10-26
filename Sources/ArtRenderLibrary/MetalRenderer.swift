@@ -114,10 +114,10 @@ internal final class LiveBinRefLayer {
     var segCount: Int
     var strokeCount: Int
     // Static per document/layer (uploaded once):
-    var refSegments: MTLBuffer       // N × GPUSplineSegment, reference space (.shared)
-    var segStroke: MTLBuffer         // N × UInt32: global segIdx → stroke idx (.shared)
-    var strokeColors: MTLBuffer      // S × SIMD4<Float> (.shared)
-    var strokeFlags: MTLBuffer       // S × UInt32, bit0 = eraser, bit1 = hasNoise (.shared)
+    var refSegments: MTLBuffer       // N × GPUSplineSegment, reference space (.private)
+    var segStroke: MTLBuffer         // N × UInt32: global segIdx → stroke idx (.private)
+    var strokeColors: MTLBuffer      // S × SIMD4<Float> (.private)
+    var strokeFlags: MTLBuffer       // S × UInt32, bit0 = eraser, bit1 = hasNoise (.private)
     var strokeVisible: MTLBuffer     // S × UInt8, rewritten per frame (.shared)
     var strokeBounds: [CGRect]       // S, CPU side for culling
     var strokeIsMarker: [Bool]       // S

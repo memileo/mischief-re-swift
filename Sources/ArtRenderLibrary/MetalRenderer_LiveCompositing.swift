@@ -1746,15 +1746,32 @@ extension MetalRenderer {
             blockCount.append(nBlocks)
         }
         guard !segments.isEmpty else { throw MetalRendererError.bufferCreationFailed }
+        // Reference geometry is read by the GPU every frame (the transform kernel reads
+        // the whole segment array), so it must live in VRAM: a `.shared` buffer is
+        // system memory on a discrete GPU and every per-frame read crosses the bus.
+        // Upload through a one-time `.shared` staging copy + blit into `.private` —
+        // measured at 4.4 ms/frame for kaos' 20 MB segment array when left `.shared`.
         func upload<T>(_ array: [T], _ stride: Int) throws -> MTLBuffer {
-            guard let buf = device.makeBuffer(length: max(stride * array.count, 1),
-                                              options: .storageModeShared) else {
+            let bytes = max(stride * array.count, 1)
+            guard let dst = device.makeBuffer(length: bytes, options: .storageModePrivate),
+                  let src = device.makeBuffer(length: bytes, options: .storageModeShared),
+                  let cb = commandQueue?.makeCommandBuffer() else {
                 throw MetalRendererError.bufferCreationFailed
             }
             array.withUnsafeBytes { raw in
-                if let src = raw.baseAddress { memcpy(buf.contents(), src, raw.count) }
+                if let p = raw.baseAddress {
+                    memcpy(src.contents(), p, min(raw.count, bytes))
+                }
             }
-            return buf
+            guard let blit = cb.makeBlitCommandEncoder() else {
+                throw MetalRendererError.bufferCreationFailed
+            }
+            blit.copy(from: src, sourceOffset: 0, to: dst, destinationOffset: 0, size: bytes)
+            blit.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+            if let err = cb.error { throw err }
+            return dst
         }
         guard let visible = device.makeBuffer(length: max(colors.count, 1),
                                               options: .storageModeShared) else {
