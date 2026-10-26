@@ -124,6 +124,41 @@ public struct LiveCachedLayer {
     public let ops: [LiveCachedOp]
     /// Contains paste/merge actions: rebuilt every frame instead of replayed from cache.
     public let needsRebuild: Bool
+    /// Per-stroke reference-space ink bounds / marker flags, flat and in stroke order, and
+    /// whether any cut op is present. Derived here so the per-frame cull can walk two
+    /// plain arrays: iterating `ops` instead means pattern-matching an enum whose `.stroke`
+    /// payload carries a segment array, and scanning it twice (cut test + cull) cost
+    /// ~1.0 ms per frame on kaos' 2214 strokes. Exact by construction — same `bounds`.
+    public let strokeBounds: [CGRect]
+    public let strokeIsMarker: [Bool]
+    public let hasCut: Bool
+
+    init(layerIndex: Int, opacity: Float, layerTransform: CGAffineTransform,
+         ops: [LiveCachedOp], needsRebuild: Bool) {
+        self.layerIndex = layerIndex
+        self.opacity = opacity
+        self.layerTransform = layerTransform
+        self.ops = ops
+        self.needsRebuild = needsRebuild
+        var bounds: [CGRect] = []
+        var markers: [Bool] = []
+        var cut = false
+        bounds.reserveCapacity(ops.count)
+        markers.reserveCapacity(ops.count)
+        for op in ops {
+            switch op {
+                case .stroke(let s):
+                    bounds.append(s.bounds)
+                    markers.append(s.isMarker)
+                case .cut:
+                    cut = true
+            }
+        }
+        self.strokeBounds = bounds
+        self.strokeIsMarker = markers
+        self.hasCut = cut
+    }
+
     public var cachedSegmentCount: Int {
         ops.reduce(0) { total, op in
             if case .stroke(let s) = op { return total + s.segments.count }
@@ -375,10 +410,9 @@ extension LiveRenderCache {
     /// How many strokes layer `index` holds (for the "everything was culled" report).
     public func strokeCount(at index: Int) -> Int {
         guard index < layers.count else { return 0 }
-        return layers[index].ops.reduce(0) { total, op in
-            if case .stroke = op { return total + 1 }
-            return total
-        }
+        // Precomputed at cache build; the reduce over `ops` ran every frame just to
+        // report the culled count.
+        return layers[index].strokeBounds.count
     }
     
     /// Applies a similarity transform to a flattened segment list.

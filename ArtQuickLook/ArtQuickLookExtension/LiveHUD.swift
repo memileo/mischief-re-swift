@@ -146,7 +146,10 @@ final class LiveHUDController {
         if let first = frameTimes.first, frameTimes.count > 1 {
             let span = timestamp - first
             if span > 0.0001 {
-                fps = Double(frameTimes.count - 1) / span
+                // Whole numbers: the HUD prints "%.0f fps", and an unrounded value changes
+                // every frame, so the state comparison below never matched and the HUD
+                // view re-drew at frame rate inside the present path.
+                fps = (Double(frameTimes.count - 1) / span).rounded()
             }
         }
 

@@ -95,7 +95,16 @@ final class LiveDocumentSession {
     private var latestRequest: Request?
     private var rendering = false
     private let throttle: LiveFrameThrottle
-    private var lastFrameFinishedAt: CFTimeInterval = CACurrentMediaTime()
+    /// Start of the last render — the throttle paces start-to-start.
+    private var lastFrameStartedAt: CFTimeInterval = CACurrentMediaTime()
+    /// A deferred kick is already queued for the current slot (input can arrive at 120 Hz;
+    /// without this every event in the wait window would queue another timer).
+    private var kickScheduled = false
+    /// Last time the status line was posted. Posting it on every frame makes SwiftUI
+    /// re-lay-out a text view inside the present path at frame rate; 5 Hz reads the same
+    /// and keeps the main thread free for the drawable handoff.
+    private var lastStatusAt: CFTimeInterval = 0
+    private static let statusInterval: CFTimeInterval = 0.2
 
     struct Request {
         let transform: LiveViewTransform
@@ -136,8 +145,26 @@ final class LiveDocumentSession {
 
     private func kick() {
         guard !rendering, let request = latestRequest else { return }
+        // Same cap the Quick Look preview honours (0 = uncapped). Paced start-to-start:
+        // timing the gap from the *end* of the previous render added the whole render time
+        // to the interval, so a 60 fps cap produced a 37 fps cycle with an idle gap —
+        // visible judder. This window used to ignore the setting entirely.
+        let wait = throttle.waitTime(now: CACurrentMediaTime(),
+                                     lastStarted: lastFrameStartedAt)
+        if wait > 0 {
+            guard !kickScheduled else { return }
+            kickScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
+                guard let self else { return }
+                self.kickScheduled = false
+                guard !self.rendering else { return }
+                self.kick()
+            }
+            return
+        }
         latestRequest = nil                 // coalesce: only the newest state survives
         rendering = true
+        lastFrameStartedAt = CACurrentMediaTime()
         run(request)
     }
 
@@ -189,15 +216,19 @@ final class LiveDocumentSession {
                         timing: LiveFrameTiming?) {
         let renderer = self.renderer
         DispatchQueue.main.async {
+            // Present first: the drawable handoff should not wait on text layout.
             if let canvas { self.onCanvas?(canvas, transform, renderer) }
             if let timing {
-                self.onStatus?(String(format: "%.0f ms  (bin %.0f · encode %.0f · gpu %.0f)"
-                                      + "   %d strokes · %d segments · %d culled",
-                                      timing.totalMilliseconds, timing.binMilliseconds,
-                                      timing.encodeMilliseconds, timing.gpuMilliseconds,
-                                      timing.strokes, timing.segments, timing.culledStrokes))
+                let now = CACurrentMediaTime()
+                if now - self.lastStatusAt >= Self.statusInterval {
+                    self.lastStatusAt = now
+                    self.onStatus?(String(format: "%.0f ms  (bin %.0f · encode %.0f · gpu %.0f)"
+                                          + "   %d strokes · %d segments · %d culled",
+                                          timing.totalMilliseconds, timing.binMilliseconds,
+                                          timing.encodeMilliseconds, timing.gpuMilliseconds,
+                                          timing.strokes, timing.segments, timing.culledStrokes))
+                }
             }
-            self.lastFrameFinishedAt = CACurrentMediaTime()
             self.rendering = false
             if self.latestRequest != nil { self.kick() }
         }

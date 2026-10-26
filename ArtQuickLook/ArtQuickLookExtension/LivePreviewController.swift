@@ -71,8 +71,11 @@ final class LivePreviewSession {
     // ── Main thread only ──
     private var latestRequest: LiveRenderRequest?
     private var rendering = false
-    /// When the last render finished — the rate limiter measures against this.
-    private var lastFrameFinishedAt: CFTimeInterval = CACurrentMediaTime()
+    /// When the last render *started* — the rate limiter paces start-to-start (see
+    /// `LiveFrameThrottle.waitTime`).
+    private var lastFrameStartedAt: CFTimeInterval = CACurrentMediaTime()
+    /// A deferred kick is already queued for the current slot.
+    private var kickScheduled = false
     private var didShowStatus = false
     private var didAnnounceFallback = false
     /// Published from `finish(...)` so the present closure (main thread) never has to
@@ -142,10 +145,14 @@ final class LivePreviewSession {
         // starting a render the screen cannot show anyway. The pending request is kept, so
         // the deferred kick renders the *newest* state rather than a stale one.
         let wait = throttle.waitTime(now: CACurrentMediaTime(),
-                                     lastFinished: lastFrameFinishedAt)
+                                     lastStarted: lastFrameStartedAt)
         if wait > 0 {
+            guard !kickScheduled else { return }
+            kickScheduled = true
             DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
-                guard let self, !self.rendering else { return }
+                guard let self else { return }
+                self.kickScheduled = false
+                guard !self.rendering else { return }
                 self.kick()
             }
             return
@@ -153,6 +160,7 @@ final class LivePreviewSession {
 
         latestRequest = nil                 // coalesce: only the newest state survives
         rendering = true
+        lastFrameStartedAt = CACurrentMediaTime()
         run(request)
     }
 
@@ -178,8 +186,9 @@ final class LivePreviewSession {
             // A nil canvas with one already on screen is a transient failure: keep the
             // current mode so the next change retries the same way.
             self.rendering = false
-            self.lastFrameFinishedAt = CACurrentMediaTime()
-            // A newer request arrived while we were busy: keep going, but only once.
+            // A newer request arrived while we were busy: keep going, but only once. The
+            // throttle paces from `lastFrameStartedAt`, so this waits out the rest of the
+            // slot rather than a whole fresh interval.
             if self.latestRequest != nil { self.kick() }
         }
     }

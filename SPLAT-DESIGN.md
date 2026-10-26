@@ -1530,3 +1530,127 @@ move on a discrete GPU, the upload did not reach the new `upload` (check that
 3. **`scatter` / `sort`** — 0.4 / 0.45 ms (kaos), 0.25 / 0.9 ms (qwerty, two merge passes).
 4. **SDF approximations** — only with an accepted tolerance.
 
+
+## Round 14 — `bin`'s CPU cull, and why the view stutters under a 16 ms budget
+
+### `cpu cull`: 1.0 ms → 0.4 ms, no pixel change
+
+The per-frame cull in `renderCachedLayerGPUThrowing` walked `layer.ops` — an enum whose
+`.stroke` payload carries a `[GPUSplineSegment]` — twice (a cut scan, then the cull), and
+transformed the same four bounds corners twice per stroke (`LiveRenderCache.intersects`
+plus the tile AABB). Three changes:
+
+* `LiveCachedLayer` now precomputes `strokeBounds: [CGRect]`, `strokeIsMarker: [Bool]` and
+  `hasCut` once at cache build; the cut scan is gone and the cull walks flat arrays.
+  `LiveRenderCache.strokeCount(at:)` uses it too (it ran a `reduce` over `ops` every frame
+  just to report the culled count).
+* The four corners are transformed once, inline, in Double — exactly CGAffineTransform's
+  `x·a + y·c + tx`, `x·b + y·d + ty` — and both the visibility test and the AABB read the
+  result. Same strict inequalities; no `CGPoint.applying` calls.
+* The layer box is the tile AABB of the *union* of the visible strokes' ink boxes instead
+  of a per-stroke union of tile boxes. `floor`/`ceil` are monotone, so
+  `⋃ᵢ boxᵢ == box(⋃ᵢ aabbᵢ)`: the same tiles from one conversion for the layer.
+
+Measured on Mac (warm, `ART_LIVE_BINTIME=1`, 5 runs):
+
+| view | `cpu cull` before | after |
+|---|---|---|
+| kaos (2214 strokes) | 1.01 | **0.40–0.45** |
+| qwerty (1141) | 0.54 | **0.21–0.25** |
+| complex @10 L0 / L1 | 0.19 / 0.12 | **0.13 / 0.08** |
+
+`bin` reports 2 → 1 ms on kaos; `render+comp`/`xform`/`tiles`/`chunks`/`sdf` are unchanged,
+as they must be. Warm live-view hashes for kaos, qwerty and complex @10 are byte-identical
+to Round 13's (`d807df…`, `36e9b1…`, `55c188…`). Gates: `stroke-splat-ab.sh --all` 10/10,
+`stroke-prune-ab.sh --modes 0,1,2` byte-equal, `swift test` 107 tests / 4 skipped / 0
+failures, and the Xcode app + extension build.
+
+### The stutter: the frame cap was pacing from the wrong end of the frame
+
+`LiveFrameThrottle` measured the gap from when the previous render **finished**. On a 60 fps
+cap a 10 ms render therefore waited another 16.7 ms *after* finishing: a 26.7 ms cycle
+(37 fps) with a 16.7 ms idle gap between every pair of frames. The display then shows
+frames at 16.7/33.3 ms intervals in an irregular pattern — stutter while "staying way below
+16 ms". It is now start-to-start: a 10 ms frame waits 6.7 ms and the cadence is a steady
+16.7 ms. A unit test pins the cadence (`testFrameThrottleDoesNotAddRenderTimeToTheInterval`).
+
+Two related bugs found on the way:
+
+* The **app window never applied the cap at all** — `LiveDocumentSession` built a throttle
+  and never consulted it, so the FPS setting only worked in the Quick Look extension.
+* The app posted its timing string through `@Published` on **every** frame, making SwiftUI
+  re-lay-out a text view inside the present path at frame rate. Now 5 Hz. The extension's
+  HUD had the same shape (an unrounded `fps` in `LiveHUDState` changed every frame, so the
+  equality check never matched and the HUD view re-drew per frame); the value is rounded to
+  whole fps now, which is what it prints anyway.
+
+### Why there is still ~1–2 frames of input lag (analysis, not yet changed)
+
+The chain per gesture frame is:
+
+```
+mouse event → main thread → session hop → CPU bin (~1.5 ms)
+            → cb1 (xform) waitUntilCompleted
+            → cb2 (scatter/sort/render, 7–14 ms) waitUntilCompleted
+            → main thread → display() → present pass → drawable.present() → next vsync
+```
+
+Two structural costs:
+
+1. **The render starts when the event arrives, not when the display flips.** Whatever phase
+   of the refresh that is, the present can only land on the following vsync, so the frame
+   waits up to a full refresh (16.7 ms) before it is shown. A render that starts late in a
+   refresh misses the next flip entirely.
+2. **Both GPU stages are CPU-synchronised** (`waitUntilCompleted`), after which the main
+   thread is hopped to and only then is the present encoded. The physics of the flip do not
+   change — the canvas must be complete first — but the CPU cannot begin the next frame's
+   binning during the previous frame's GPU work.
+
+`MTKView` itself does not add a frame here: `presentsWithTransaction` is left at its default
+(false), nothing waits on the drawable, and `present()` schedules the flip at the next
+vsync. The lag is the on-demand start phase plus the render duration, not MTKView.
+
+The fix that removes both the phase and the cap's vsync drift is to drive the render start
+from a display link (render right after a flip, present at the next flip: a constant one
+frame), with the pending request coalesced exactly as it is now. It is deferred because it
+needs interactive A/B (it changes how the gesture feels) and the targets ship for macOS
+12, where `NSView.displayLink(target:selector:)` (macOS 14) is unavailable — it has to be a
+`CVDisplayLink` (deprecated in 15 but functional). The 60 fps cap now behaves, but with an
+app-side timer whose period is nominally the same as the panel's, phase drifts slowly and
+periodically costs one extra refresh; the display link also removes that.
+
+### SDF / spline math: what is GPU work and what the "table" would be
+
+`sdSplineSegment` is the 4.1 ms item, and it runs **per pixel-entry on the GPU**, not on the
+CPU. Each call currently rebuilds the four Catmull-Rom coefficient vectors from `p0…p3`
+inside `getSplinePos`, and does that **ten times per pixel** (7 pre-samples + 2 Newton steps
++ the final position) plus two tangents. The per-tile walk already stages the segment into
+threadgroup memory, so the same coefficients can be staged once per (tile, segment) and
+every evaluation becomes three multiply-adds per component. That is the exact lever: no
+changed sample count, no changed iteration count, gated by byte-identical PNGs. Expect
+~1–2 ms of the 4.1 ms; worth an A/B before adopting.
+
+The "table" (what I meant by fitting into it) is the *approximate* alternative: at cache
+build, sample each spline segment into an arc-length table (say 8–16 positions + radii) and
+have the kernel measure distance to that polyline instead of re-solving the cubic. It
+removes the per-pixel cubic work entirely, but it changes the distance field: the reported
+deviation would be a fraction of a pixel near the curve and up to one sample spacing in
+high-curvature spots, i.e. different AA edges (a few 1-LSB pixels per segment), not a visual
+change. I would implement it only with a stated tolerance and report `compare -metric
+AE/PAE` plus the max error against the exact render for review.
+
+CPU-side splines (building `GPUSplineSegment`s, `remap`, cache build) are **one-time work**
+— "cache built in 25 ms" on complex, paid at open. Multi-threading it would only shorten
+time-to-first-frame; it cannot move the frame time, because the per-frame CPU path is the
+bin/cull/prefix above and never touches spline math.
+
+### Still open, in order
+
+1. **Display-link frame pacing** (above) — the remaining stutter/latency item; needs an
+   interactive A/B and a `CVDisplayLink` shim for the macOS 12 target.
+2. **Spline coefficients in the stage** — exact, ~1–2 ms of kaos' 14 ms; byte-gated.
+3. **Heavier real documents** — `LiveRenderCache` declines any layer with cut/paste
+   (`needsRebuild`/`hasCut`), which is what pushes real artwork onto the slow path. That is
+   the next real bench, and it needs the cache to replay cut/copy ops.
+4. `scatter` / `sort` — 0.4 / 0.45 ms (kaos), 0.25 / 0.9 ms (qwerty).
+5. SDF approximations — only with an accepted tolerance.

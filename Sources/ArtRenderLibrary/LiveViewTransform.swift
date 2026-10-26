@@ -127,11 +127,17 @@ public struct LiveFrameThrottle {
 
     public var isUncapped: Bool { interval <= 0 }
 
-    /// How long `now` must wait before a render may start, given the last one finished at
-    /// `lastFinished`. 0 means "go now".
-    public func waitTime(now: TimeInterval, lastFinished: TimeInterval) -> TimeInterval {
+    /// How long `now` must wait before the next render may start, given that the previous
+    /// one started at `lastStarted`. 0 means "go now".
+    ///
+    /// Pacing is start-to-start, not finish-to-start. Timing the gap from the *end* of the
+    /// previous render adds the render time on top of the interval: a 10 ms frame on a
+    /// 60 fps cap then waited another 16.7 ms after finishing, i.e. a 26.7 ms cycle (37 fps)
+    /// with a visible idle gap between every pair of frames — the stutter a cap is supposed
+    /// to prevent. Start-to-start keeps a steady 60 Hz cadence whenever a frame fits.
+    public func waitTime(now: TimeInterval, lastStarted: TimeInterval) -> TimeInterval {
         guard !isUncapped else { return 0 }
-        let remaining = interval - (now - lastFinished)
+        let remaining = interval - (now - lastStarted)
         return remaining > 0 ? remaining : 0
     }
 }

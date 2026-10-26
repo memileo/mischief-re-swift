@@ -158,24 +158,42 @@ final class LiveViewTransformTests: XCTestCase {
 
     // MARK: - Frame throttle
 
+    /// Pacing is start-to-start. The old finish-to-start form added the render time to every
+    /// interval, so a 60 fps cap with 10 ms frames ran at 37 fps with an idle gap per frame.
     func testFrameThrottleCapsRate() {
         let sixtyFps = LiveFrameThrottle(maxFPS: 60)
         XCTAssertEqual(sixtyFps.interval, 1.0 / 60.0, accuracy: 1e-9)
-        // Right after a frame: wait out the rest of the interval.
-        XCTAssertEqual(sixtyFps.waitTime(now: 10.000, lastFinished: 10.000),
+        // Right after a frame started: wait out the rest of the interval.
+        XCTAssertEqual(sixtyFps.waitTime(now: 10.000, lastStarted: 10.000),
                        1.0 / 60.0, accuracy: 1e-9)
         // Halfway through: half of it.
         XCTAssertEqual(sixtyFps.waitTime(now: 10.000 + 1.0 / 120.0,
-                                         lastFinished: 10.000),
+                                         lastStarted: 10.000),
                        1.0 / 120.0, accuracy: 1e-9)
         // Longer than the interval: go now, never a negative wait.
-        XCTAssertEqual(sixtyFps.waitTime(now: 11.0, lastFinished: 10.0), 0, accuracy: 1e-9)
+        XCTAssertEqual(sixtyFps.waitTime(now: 11.0, lastStarted: 10.0), 0, accuracy: 1e-9)
+    }
+
+    /// A 10 ms render on a 60 fps cap must still start every 16.7 ms — the wait covers only
+    /// the remainder of the slot, never a whole extra interval after the render finished.
+    func testFrameThrottleDoesNotAddRenderTimeToTheInterval() {
+        let cap = LiveFrameThrottle(maxFPS: 60)
+        var started = 0.0
+        var starts: [Double] = []
+        for _ in 0..<4 {
+            starts.append(started)
+            let finished = started + 0.010                 // 10 ms render
+            let wait = cap.waitTime(now: finished, lastStarted: started)
+            XCTAssertEqual(wait, 1.0 / 60.0 - 0.010, accuracy: 1e-9)
+            started = finished + wait
+        }
+        XCTAssertEqual(starts.map { ($0 * 1000).rounded() }, [0, 17, 33, 50])
     }
 
     func testFrameThrottleUncapped() {
         let uncapped = LiveFrameThrottle(maxFPS: 0)
         XCTAssertTrue(uncapped.isUncapped)
-        XCTAssertEqual(uncapped.waitTime(now: 10.0, lastFinished: 10.0), 0)
+        XCTAssertEqual(uncapped.waitTime(now: 10.0, lastStarted: 10.0), 0)
 
         let negative = LiveFrameThrottle(maxFPS: -30)
         XCTAssertTrue(negative.isUncapped)

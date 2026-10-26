@@ -866,10 +866,8 @@ extension MetalRenderer {
         let layer = cache.layers[position]
         guard !layer.needsRebuild else { return false }
         // Any cut op forces the CPU path: cut metas are remapped per frame on the CPU and
-        // must interleave with strokes in document order.
-        for op in layer.ops {
-            if case .cut = op { return false }
-        }
+        // must interleave with strokes in document order. Precomputed at cache build.
+        guard !layer.hasCut else { return false }
         let liveTile = liveTileSize
         guard liveTile >= 8, width > 0, height > 0 else { return false }
         let (tilesX, tilesY) = GpuBinSpec.tileGrid(viewportWidth: width, viewportHeight: height,
@@ -898,37 +896,57 @@ extension MetalRenderer {
         let cpuStageTiming = LiveConfig.binStageTimingEnabled()
         var tCull = 0.0, tPrep = 0.0, tPrefix = 0.0, tTable = 0.0, tPlan = 0.0
         var visStrokeIDs: [Int] = []
-        visStrokeIDs.reserveCapacity(layer.ops.count)
-        var layerBox: (minX: Int, minY: Int, maxX: Int, maxY: Int)? = nil
+        let strokeBounds = layer.strokeBounds
+        let strokeIsMarker = layer.strokeIsMarker
+        visStrokeIDs.reserveCapacity(strokeBounds.count)
         var hasVisibleMarker = false
-        // The prune table's per-stroke boxes are built later from the ref state's block
-        // records; the cull loop only collects visible stroke ids + the layer box.
-        var strokeID = -1
-        for op in layer.ops {
-            guard case .stroke(let s) = op else { continue }
-            strokeID += 1
-            guard LiveRenderCache.intersects(s.bounds, camera: camera, viewport: viewport) else {
-                continue
-            }
-            if s.isMarker { hasVisibleMarker = true }
+        // Cull + layer box in one corner pass. This used to call `LiveRenderCache.intersects`
+        // (four `CGPoint.applying` C calls) and then transform the same four corners again
+        // for the tile AABB — ~1.0 ms per frame on kaos' 2214 strokes. The math below is
+        // exactly CGAffineTransform's (`x·a + y·c + tx`, `x·b + y·d + ty`), so the test and
+        // the resulting tile box are identical, including the strict inequalities.
+        //
+        // The box is the tile AABB of the *union* of the visible strokes' ink boxes, not a
+        // per-stroke union of tile boxes: floor/ceil are monotone, so for any tile size
+        // `⋃_i box_i == box(⋃_i aabb_i)` — the same tiles from one `floor`/`ceil` pair for
+        // the whole layer instead of one per stroke.
+        let viewportEmpty = viewport.isEmpty
+        let vMinX = Double(viewport.minX), vMaxX = Double(viewport.maxX)
+        let vMinY = Double(viewport.minY), vMaxY = Double(viewport.maxY)
+        let mA = Double(camera.a), mB = Double(camera.b)
+        let mC = Double(camera.c), mD = Double(camera.d)
+        let mTX = Double(camera.tx), mTY = Double(camera.ty)
+        var inkMinX = Double.greatestFiniteMagnitude, inkMaxX = -Double.greatestFiniteMagnitude
+        var inkMinY = Double.greatestFiniteMagnitude, inkMaxY = -Double.greatestFiniteMagnitude
+        for strokeID in strokeBounds.indices {
+            let bounds = strokeBounds[strokeID]
+            let ax0 = Double(bounds.minX) * mA, ax1 = Double(bounds.maxX) * mA
+            let cy0 = Double(bounds.minY) * mC, cy1 = Double(bounds.maxY) * mC
+            let bx0 = Double(bounds.minX) * mB, bx1 = Double(bounds.maxX) * mB
+            let dy0 = Double(bounds.minY) * mD, dy1 = Double(bounds.maxY) * mD
+            let x00 = ax0 + cy0 + mTX, x10 = ax1 + cy0 + mTX
+            let x11 = ax1 + cy1 + mTX, x01 = ax0 + cy1 + mTX
+            let y00 = bx0 + dy0 + mTY, y10 = bx1 + dy0 + mTY
+            let y11 = bx1 + dy1 + mTY, y01 = bx0 + dy1 + mTY
+            let minX = min(min(x00, x10), min(x11, x01))
+            let maxX = max(max(x00, x10), max(x11, x01))
+            let minY = min(min(y00, y10), min(y11, y01))
+            let maxY = max(max(y00, y10), max(y11, y01))
+            // Empty boxes are visible unconditionally — the contract `intersects` had.
+            let visible = bounds.isEmpty || viewportEmpty
+                || (maxX >= vMinX && minX <= vMaxX && maxY >= vMinY && minY <= vMaxY)
+            guard visible else { continue }
+            if strokeIsMarker[strokeID] { hasVisibleMarker = true }
             visStrokeIDs.append(strokeID)
-            // Transformed-bounds AABB (mirrors `intersects`' corner mapping).
-            let p0 = CGPoint(x: s.bounds.minX, y: s.bounds.minY).applying(camera)
-            let p1 = CGPoint(x: s.bounds.maxX, y: s.bounds.minY).applying(camera)
-            let p2 = CGPoint(x: s.bounds.maxX, y: s.bounds.maxY).applying(camera)
-            let p3 = CGPoint(x: s.bounds.minX, y: s.bounds.maxY).applying(camera)
-            let minX = Float(min(min(p0.x, p1.x), min(p2.x, p3.x)))
-            let maxX = Float(max(max(p0.x, p1.x), max(p2.x, p3.x)))
-            let minY = Float(min(min(p0.y, p1.y), min(p2.y, p3.y)))
-            let maxY = Float(max(max(p0.y, p1.y), max(p2.y, p3.y)))
-            guard let tb = GpuBinSpec.tileBoxForAABB(minX: minX, minY: minY, maxX: maxX, maxY: maxY,
-                                                     texW: texW, texH: texH,
-                                                     tilesX: tilesX, tilesY: tilesY,
-                                                     invTile: invTile) else {
-                return false    // inconsistent with the cull above — stay exact via CPU
-            }
-            layerBox = GpuBinSpec.unionTileBox(layerBox, with: tb)
+            inkMinX = min(inkMinX, minX); inkMaxX = max(inkMaxX, maxX)
+            inkMinY = min(inkMinY, minY); inkMaxY = max(inkMaxY, maxY)
         }
+        let layerBox = GpuBinSpec.tileBoxForAABB(minX: Float(inkMinX), minY: Float(inkMinY),
+                                                 maxX: Float(inkMaxX), maxY: Float(inkMaxY),
+                                                 texW: texW, texH: texH,
+                                                 tilesX: tilesX, tilesY: tilesY,
+                                                 invTile: invTile)
+        if !visStrokeIDs.isEmpty && layerBox == nil { return false }
         if visStrokeIDs.isEmpty {
             liveTiming.culledStrokes += cache.strokeCount(at: position)
             liveTiming.binMilliseconds += Self.milliseconds(since: cpuStart)
