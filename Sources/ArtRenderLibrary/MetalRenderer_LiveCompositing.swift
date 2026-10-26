@@ -484,6 +484,31 @@ extension MetalRenderer {
         case stroke(Int)          // index into the bins array
         case cut(CutMeta)
     }
+
+    /// One paste/merge op's slice of the arena, plus its destination tile box.
+    private struct LivePasteBin {
+        var segmentOffset = 0, segmentCount = 0
+        var tileIndexOffset = 0, tileBoxCount = 0
+        var tileListOffset = 0, tileListCount = 0
+        var maskOffset = 0, maskCount = 0
+        var color = SIMD4<Float>(0, 0, 0, 1)
+        var isEraser = false
+        var isMarker = false
+        var hasNoise = false
+        var isMerge = false
+        var mergeID: UInt64 = 0
+        var meta = PasteLayerMeta(invAffine: .identity, maskCount: 0)
+        var minTileX = 0, minTileY = 0, boxWidth = 0, boxHeight = 0
+    }
+
+    /// One encoded unit of a mixed layer, in document order:
+    /// a per-tile stroke run, a per-stroke fallback, a cut, or a paste.
+    private enum LiveMixedStep {
+        case perTile(PerTilePlan)
+        case stroke(Int)
+        case cut(CutMeta)
+        case paste(Int)
+    }
     
     /// Rasterises a **cached** layer for the current camera and stacks it onto the
     /// canvas.
@@ -521,6 +546,7 @@ extension MetalRenderer {
         // stroke) — the only way cuts stay exact, and the fallback for a layer that holds
         // both a marker and a noisy segment (the noise kernel has no marker SDF).
         var clock = DispatchTime.now().uptimeNanoseconds
+        liveStagingUsed = 0                    // planning appends from here
         var perTilePlan: PerTilePlan?
         if Self.perTileEnabled, isPerTileEligible(layerOps) {
             let needsNoise = layerOps.contains {
@@ -585,6 +611,322 @@ extension MetalRenderer {
         if let err = commandBuffer.error { throw err }
     }
     
+    /// Rasterises a cached layer that mixes strokes with cuts and/or pastes.
+    ///
+    /// Everything is encoded into **one** command buffer, in document order:
+    /// maximal runs of strokes go through the per-tile plan (or the per-stroke
+    /// fallback), cuts erase in place, pastes dispatch only their destination tile box,
+    /// and merge groups render into the shared fragment texture and flatten once.
+    /// The layer is stacked onto the canvas at the end, so a frame costs a single GPU
+    /// round trip even for documents with thousands of cut/paste actions.
+    func renderCachedLayerMixedIntoLiveCanvas(layerOps: [LiveDeviceOp],
+                                              width: Int, height: Int,
+                                              opacity: Float) throws {
+        guard let compositePipeline = liveCompositeLayerPipeline else {
+            throw MetalRendererError.pipelineMissing("liveCompositeLayerKernel")
+        }
+        guard !layerOps.isEmpty else { return }
+        try ensureRenderTargets(width: width, height: height)
+        guard let target = gpuRenderTarget else {
+            throw MetalRendererError.textureCreationFailed
+        }
+
+        var clock = DispatchTime.now().uptimeNanoseconds
+        liveStagingUsed = 0
+        var steps: [LiveMixedStep] = []
+        var bins: [LiveStrokeBin] = []
+        var pastes: [LivePasteBin] = []
+        steps.reserveCapacity(layerOps.count)
+
+        var index = 0
+        while index < layerOps.count {
+            switch layerOps[index] {
+                case .stroke:
+                    // Maximal stroke run: one per-tile dispatch instead of one per stroke.
+                    var end = index
+                    while end < layerOps.count, case .stroke = layerOps[end] { end += 1 }
+                    let run = Array(layerOps[index..<end])
+                    var handled = false
+                    if Self.perTileEnabled, isPerTileEligible(run) {
+                        let needsNoise = run.contains {
+                            if case .stroke(let segs, _, _, _) = $0 {
+                                return segs.contains { $0.noiseSeed != 0 }
+                            }
+                            return false
+                        }
+                        let pipelineAvailable = needsNoise
+                            ? livePerTileNoiseCompositePipeline != nil
+                            : livePerTileAACompositePipeline != nil
+                        if pipelineAvailable, !(needsNoise && noiseTexture == nil) {
+                            let plan = try buildPerTilePlan(layerOps: run,
+                                                            width: width, height: height)
+                            if !plan.empty { steps.append(.perTile(plan)) }
+                            handled = true
+                        }
+                    }
+                    if !handled {
+                        let (runSteps, runBins) = try bin(layerOps: run,
+                                                          width: width, height: height)
+                        let base = bins.count
+                        bins.append(contentsOf: runBins)
+                        for step in runSteps {
+                            switch step {
+                                case .stroke(let i): steps.append(.stroke(base + i))
+                                case .cut(let meta): steps.append(.cut(meta))
+                            }
+                        }
+                    }
+                    index = end
+
+                case .cut(let meta):
+                    steps.append(.cut(meta))
+                    index += 1
+
+                case .paste(let segments, let color, let isEraser, let isMarker,
+                            let meta, let masks, let sourceToDestination,
+                            let isMerge, let mergeID):
+                    if let bin = try plan(paste: segments, color: color,
+                                          isEraser: isEraser, isMarker: isMarker,
+                                          meta: meta, masks: masks,
+                                          sourceToDestination: sourceToDestination,
+                                          isMerge: isMerge, mergeID: mergeID,
+                                          width: width, height: height) {
+                        steps.append(.paste(pastes.count))
+                        pastes.append(bin)
+                    }
+                    index += 1
+            }
+        }
+        liveTiming.binMilliseconds += Self.milliseconds(since: clock)
+
+        try uploadArena(byteCount: liveStagingUsed)
+
+        guard let queue = commandQueue,
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw MetalRendererError.textureCreationFailed
+        }
+        clock = DispatchTime.now().uptimeNanoseconds
+
+        encodeClear(target, encoder: encoder)
+        var openMergeID: UInt64?
+        var openMergeOpacity: Float = 1
+
+        func flushOpenMerge() throws {
+            guard openMergeID != nil else { return }
+            openMergeID = nil
+            try encodeMergeFlush(opacity: openMergeOpacity, encoder: encoder)
+        }
+
+        for step in steps {
+            switch step {
+                case .perTile(let plan):
+                    try flushOpenMerge()
+                    try encodePerTile(plan: plan, encoder: encoder)
+
+                case .stroke(let i):
+                    try flushOpenMerge()
+                    try encode(stroke: bins[i], width: width, height: height, encoder: encoder)
+
+                case .cut(let meta):
+                    try flushOpenMerge()
+                    try dispatchLiveCut(meta: meta, width: width, height: height, encoder: encoder)
+
+                case .paste(let i):
+                    let paste = pastes[i]
+                    if paste.isMerge {
+                        if let open = openMergeID, open != paste.mergeID {
+                            try flushOpenMerge()
+                        }
+                        if openMergeID == nil {
+                            guard let fragment = mergeFragmentTexture else {
+                                throw MetalRendererError.textureCreationFailed
+                            }
+                            encodeClear(fragment, encoder: encoder)
+                            openMergeID = paste.mergeID
+                            openMergeOpacity = paste.color.w
+                        }
+                        guard let fragment = mergeFragmentTexture else {
+                            throw MetalRendererError.textureCreationFailed
+                        }
+                        try encode(paste: paste, width: width, height: height,
+                                   target: fragment, alphaOverride: 1.0, encoder: encoder)
+                    } else {
+                        try flushOpenMerge()
+                        try encode(paste: paste, width: width, height: height,
+                                   target: target, alphaOverride: nil, encoder: encoder)
+                    }
+            }
+        }
+        try flushOpenMerge()
+        liveTiming.encodeMilliseconds += Self.milliseconds(since: clock)
+
+        // Stack the finished layer onto the canvas in the same command buffer.
+        guard let canvas = liveCanvasTexture else {
+            throw MetalRendererError.textureCreationFailed
+        }
+        var layerOpacity = opacity
+        encoder.setComputePipelineState(compositePipeline)
+        encoder.setTexture(target, index: 0)
+        encoder.setTexture(canvas, index: 1)
+        encoder.setBytes(&layerOpacity, length: MemoryLayout<Float>.stride, index: 0)
+        encoder.dispatchThreadgroups(Self.liveGroups(width: width, height: height),
+                                     threadsPerThreadgroup: Self.liveThreads)
+        encoder.endEncoding()
+
+        clock = DispatchTime.now().uptimeNanoseconds
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        liveTiming.gpuMilliseconds += Self.milliseconds(since: clock)
+        if let err = commandBuffer.error { throw err }
+    }
+
+    /// Stages one paste op into the arena and bins it into its destination tile box.
+    /// Returns nil when nothing lands on the canvas.
+    private func plan(paste segments: [GPUSplineSegment],
+                      color: SIMD4<Float>, isEraser: Bool, isMarker: Bool,
+                      meta: PasteLayerMeta, masks: [PasteMask],
+                      sourceToDestination: CGAffineTransform,
+                      isMerge: Bool, mergeID: UInt64,
+                      width: Int, height: Int) throws -> LivePasteBin? {
+        guard !segments.isEmpty else { return nil }
+        let boxed = buildSegmentTileIndicesBoxed(segments: segments,
+                                                 textureWidth: width, textureHeight: height,
+                                                 tileSize: tileSize,
+                                                 isMarker: isMarker,
+                                                 transform: sourceToDestination)
+        guard !boxed.tileList.isEmpty else { return nil }
+
+        var bin = LivePasteBin()
+        bin.segmentCount = segments.count
+        bin.color = color
+        bin.isEraser = isEraser
+        bin.isMarker = isMarker
+        bin.hasNoise = segments.contains { $0.noiseSeed != 0 }
+        bin.isMerge = isMerge
+        bin.mergeID = mergeID
+        bin.meta = meta
+        bin.minTileX = boxed.minTileX
+        bin.minTileY = boxed.minTileY
+        bin.boxWidth = boxed.boxWidth
+        bin.boxHeight = boxed.boxHeight
+        bin.tileBoxCount = boxed.tileIndices.count
+        bin.tileListCount = boxed.tileList.count
+        bin.maskCount = masks.count
+
+        func place(_ byteCount: Int) -> Int {
+            liveStagingUsed = Self.alignUp(liveStagingUsed, Self.liveArenaAlignment)
+            let offset = liveStagingUsed
+            liveStagingUsed += byteCount
+            return offset
+        }
+        bin.segmentOffset = place(MemoryLayout<GPUSplineSegment>.stride * segments.count)
+        bin.tileIndexOffset = place(MemoryLayout<TileIndex>.stride * boxed.tileIndices.count)
+        bin.tileListOffset = place(MemoryLayout<UInt32>.stride * boxed.tileList.count)
+        // The kernel only dereferences `maskCount` slots; bind one zeroed stand-in
+        // when there are none (mirrors the static path's max(1, count) buffer).
+        bin.maskOffset = place(MemoryLayout<PasteMask>.stride * max(masks.count, 1))
+
+        guard let base = staging(needed: liveStagingUsed) else {
+            throw MetalRendererError.bufferCreationFailed
+        }
+        func write<T>(_ array: [T], at offset: Int) {
+            array.withUnsafeBytes { raw in
+                if let src = raw.baseAddress {
+                    (base + offset).copyMemory(from: src, byteCount: raw.count)
+                }
+            }
+        }
+        write(segments, at: bin.segmentOffset)
+        write(boxed.tileIndices, at: bin.tileIndexOffset)
+        write(boxed.tileList, at: bin.tileListOffset)
+        write(masks, at: bin.maskOffset)
+
+        liveTiming.dispatchedTiles += boxed.boxWidth * boxed.boxHeight
+        liveTiming.inkedTiles += boxed.tileIndices.reduce(0) { $0 + ($1.count > 0 ? 1 : 0) }
+        liveTiming.sdfEvaluations += boxed.tileList.count * (tileSize * tileSize)
+        liveTiming.segments += segments.count
+        return bin
+    }
+
+    /// Clears `texture` inside the caller's encoder (same kernel/thread shape as
+    /// `clearTexture`, no separate command buffer or wait).
+    private func encodeClear(_ texture: MTLTexture, encoder: MTLComputeCommandEncoder) {
+        guard let clearPipeline else { return }
+        encoder.setComputePipelineState(clearPipeline)
+        encoder.setTexture(texture, index: 0)
+        let tg = MTLSize(width: 8, height: 8, depth: 1)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (texture.width + 7) / 8, height: (texture.height + 7) / 8, depth: 1),
+            threadsPerThreadgroup: tg)
+    }
+
+    /// Composites the open merge fragment over the layer target, in-encoder.
+    private func encodeMergeFlush(opacity: Float, encoder: MTLComputeCommandEncoder) throws {
+        guard let fragment = mergeFragmentTexture,
+              let target = gpuRenderTarget,
+              let pipeline = mergeFlattenPipeline else { return }
+        var alpha = opacity
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(fragment, index: 0)
+        encoder.setTexture(target, index: 1)
+        encoder.setBytes(&alpha, length: MemoryLayout<Float>.stride, index: 0)
+        let tg = MTLSize(width: 8, height: 8, depth: 1)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (target.width + 7) / 8, height: (target.height + 7) / 8, depth: 1),
+            threadsPerThreadgroup: tg)
+    }
+
+    /// Encodes one boxed paste dispatch.
+    private func encode(paste bin: LivePasteBin, width: Int, height: Int,
+                        target: MTLTexture, alphaOverride: Float?,
+                        encoder: MTLComputeCommandEncoder) throws {
+        guard let arena = liveArena else { throw MetalRendererError.bufferCreationFailed }
+
+        var params = Params(
+            textureWidth: UInt32(width),
+            textureHeight: UInt32(height),
+            tileSize: UInt32(tileSize),
+            tilesPerRow: (UInt32(width) + UInt32(tileSize) - 1) / UInt32(tileSize),
+            stampCount: UInt32(bin.segmentCount),
+            penColor: bin.color,
+            noiseScale: 0.4,
+            isEraser: bin.isEraser,
+            isMarker: bin.isMarker)
+        if let alphaOverride { params.penColor.w = alphaOverride }
+
+        if bin.hasNoise, let pipeline = segmentPasteLayerNoiseCompositePipeline,
+           let noise = noiseTexture {
+            encoder.setComputePipelineState(pipeline)
+            encoder.setTexture(noise, index: 1)
+            if let sampler = linearSampler { encoder.setSamplerState(sampler, index: 0) }
+        } else if let pipeline = segmentPasteLayerAACompositePipeline {
+            encoder.setComputePipelineState(pipeline)
+        } else {
+            throw MetalRendererError.pipelineMissing("segmentPasteLayerAACompositeKernel")
+        }
+
+        var meta = bin.meta
+        var box = PasteBoxParams(originTileX: UInt32(bin.minTileX),
+                                 originTileY: UInt32(bin.minTileY),
+                                 boxTilesPerRow: UInt32(bin.boxWidth))
+        encoder.setBytes(&params, length: MemoryLayout<Params>.stride, index: 0)
+        encoder.setBuffer(arena, offset: bin.segmentOffset, index: 1)
+        encoder.setBuffer(arena, offset: bin.tileIndexOffset, index: 2)
+        encoder.setBuffer(arena, offset: bin.tileListOffset, index: 3)
+        encoder.setBytes(&meta, length: MemoryLayout<PasteLayerMeta>.stride, index: 4)
+        encoder.setBuffer(arena, offset: bin.maskOffset, index: 5)
+        encoder.setBytes(&box, length: MemoryLayout<PasteBoxParams>.stride, index: 6)
+        encoder.setTexture(target, index: 0)
+
+        let tg = MTLSize(width: 8, height: 8, depth: 1)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (bin.boxWidth * tileSize + 7) / 8,
+                    height: (bin.boxHeight * tileSize + 7) / 8,
+                    depth: 1),
+            threadsPerThreadgroup: tg)
+    }
+
     /// A layer is per-tile-able unless it has cut ops (ordering) or a marker stroke together
     /// with a noisy segment (the noise-capable per-tile kernel has no chisel SDF). Noise
     /// alone is allowed: such layers use the noise per-tile kernel, clean ones the AA one.
@@ -641,7 +983,6 @@ extension MetalRenderer {
 
         if boxed.tileList.isEmpty {
             plan.empty = true
-            liveStagingUsed = 0
             return plan
         }
         plan.empty = false
@@ -649,7 +990,8 @@ extension MetalRenderer {
         if liveStagingUsed > 0, staging(needed: liveStagingUsed) == nil {
             throw MetalRendererError.bufferCreationFailed
         }
-        var cursor = 0
+        // Append to the arena: a mixed layer plans several stroke runs into one buffer.
+        var cursor = liveStagingUsed
         func place(_ byteCount: Int) -> Int {
             cursor = Self.alignUp(cursor, Self.liveArenaAlignment)
             let offset = cursor
@@ -868,6 +1210,9 @@ extension MetalRenderer {
         // Any cut op forces the CPU path: cut metas are remapped per frame on the CPU and
         // must interleave with strokes in document order. Precomputed at cache build.
         guard !layer.hasCut else { return false }
+        // Pastes need the mixed path too (order + masks); the GPU binner only knows
+        // plain strokes.
+        guard !layer.hasPaste else { return false }
         let liveTile = liveTileSize
         guard liveTile >= 8, width > 0, height > 0 else { return false }
         let (tilesX, tilesY) = GpuBinSpec.tileGrid(viewportWidth: width, viewportHeight: height,
@@ -1937,7 +2282,8 @@ extension MetalRenderer {
     /// Bins every stroke into `liveStaging` and returns the ordered op list.
     private func bin(layerOps: [LiveDeviceOp],
                      width: Int, height: Int) throws -> ([LiveLayerStep], [LiveStrokeBin]) {
-        var cursor = 0
+        // Append to the arena so a mixed layer can run several stroke runs.
+        var cursor = liveStagingUsed
         var bins: [LiveStrokeBin] = []
         var steps: [LiveLayerStep] = []
         steps.reserveCapacity(layerOps.count)
@@ -1953,6 +2299,9 @@ extension MetalRenderer {
             switch op {
                 case .cut(let meta):
                     steps.append(.cut(meta))
+                case .paste:
+                    // Pastes are planned by the mixed renderer; this path never gets them.
+                    continue
                 case .stroke(let segments, let color, let isEraser, let isMarker):
                     guard !segments.isEmpty else { continue }
                     liveTiming.strokes += 1

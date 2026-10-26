@@ -173,8 +173,10 @@ final class LiveRenderCacheTests: XCTestCase {
         XCTAssertEqual(actual.y, expected.y, accuracy: 1e-6)
     }
 
-    /// The cut must still erase the region it erased in the static path: what the kernel
-    /// gets back is `liveBase⁻¹ ∘ m1`, which has to invert to `m1` exactly.
+    /// A cut's `inverseAffine` maps **device** pixels into the selection frame — the same
+    /// thing the static path stores (`base⁻¹ ∘ m1`, `Renderer.swift`). A canvas point
+    /// pushed through the live base and then through the cut has to land exactly where the
+    /// selection frame puts it, at any camera.
     func testCutRecomposesAgainstAnyCamera() {
         let base = CGAffineTransform(a: 1.5, b: 0.1, c: -0.2, d: 0.9, tx: 30, ty: -8)
         let selectionFrame = CGAffineTransform(a: 0.8, b: 0.4, c: -0.1, d: 1.2, tx: 7, ty: 11)
@@ -187,12 +189,13 @@ final class LiveRenderCacheTests: XCTestCase {
                   case .cut(let meta)? = ops.first else {
                 return XCTFail("expected a cut op")
             }
-            // liveBase ∘ (liveBase⁻¹ ∘ m1) == m1
-            let round = CGPoint(x: 5, y: 5).applying(meta.inverseAffine)
-                .applying(cache.liveBaseTransform(camera: cam))
-            let expected = CGPoint(x: 5, y: 5).applying(selectionFrame)
-            XCTAssertEqual(round.x, expected.x, accuracy: 1e-4)
-            XCTAssertEqual(round.y, expected.y, accuracy: 1e-4)
+            let liveBase = cache.liveBaseTransform(camera: cam)
+            for p in [CGPoint(x: 5, y: 5), CGPoint(x: -3, y: 17)] {
+                let mapped = p.applying(liveBase).applying(meta.inverseAffine)
+                let expected = p.applying(selectionFrame)
+                XCTAssertEqual(mapped.x, expected.x, accuracy: 1e-4)
+                XCTAssertEqual(mapped.y, expected.y, accuracy: 1e-4)
+            }
         }
     }
 

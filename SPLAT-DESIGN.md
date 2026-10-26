@@ -1654,3 +1654,137 @@ bin/cull/prefix above and never touches spline math.
    the next real bench, and it needs the cache to replay cut/copy ops.
 4. `scatter` / `sort` — 0.4 / 0.45 ms (kaos), 0.25 / 0.9 ms (qwerty).
 5. SDF approximations — only with an accepted tolerance.
+
+## Round 15 — cut / copy / paste / merge go into the cache
+
+Round 14 ended with the open item that mattered most: `LiveRenderCache` declined any layer
+holding a cut or paste, so real artwork (and anything that had been pasted, merged or
+erased as a shape) was re-walked through the action list on **every** frame. This round
+caches those ops at a reference camera and replays them, remapped per frame.
+
+### The cache model
+
+`LiveCachedOp` grows `.cut(rect:selectionFrame:)` and `.paste(...)`; `LiveDeviceOp`
+mirrors them. At cache build the ops are stored exactly as the static path would build them
+at the reference camera (zoom 1, centred, the cache's `baseTransform`). Per frame they are
+mapped by the camera delta `C = camera ∘ ref⁻¹`:
+
+| op | per-frame remap |
+|---|---|
+| stroke | segments move by `C`; radii and `padding1` scale by `sqrt\|det C\|` |
+| cut | `inverse = liveBase⁻¹ ∘ m1` (device → selection frame) |
+| paste / merge | segments move by `C`; `invAffine` → `mask.inv ∘ C⁻¹`; `sourceToDestination` → `C⁻¹ ∘ ref ∘ C` |
+
+`a.concatenating(b)` applies `a` first, which is where the one **real bug** of the round
+was: the cut meta was stored as `selectionFrame.concatenating(inverse)` — the camera on the
+wrong side, correct only when it was identity. The symptom was a cut-paste document that
+looked right at zoom 1 and fell apart away from it: cached-vs-rebuild at zoom 2 was 113 136
+pixels with errors up to 255 LSB. With `inverse.concatenating(selectionFrame)` it is 235
+pixels / 1 LSB at zoom 2 and 17 pixels / 1 LSB at 0.5. The unit test that pinned the old
+order (`testCutRecomposesAgainstAnyCamera`) now states the invariant the kernel actually
+needs: a canvas point through the live base and then the cut lands where the selection
+frame puts it, at any camera.
+
+### One command buffer, in document order
+
+`renderCachedLayerMixedIntoLiveCanvas` splits a cached layer into maximal stroke runs and
+the cut/paste/merge ops between them. Every step is encoded into one compute command buffer
+and committed once: clear → stroke runs (per-tile plan, or per-stroke bin when ineligible) →
+for each paste, a boxed dispatch → merges grouped by `mergeID` around the stroke runs that
+sit inside them. One `waitUntilCompleted` per layer, so a mixed layer costs three textures
+committed in order, not one wait per op.
+
+Two things this exposed:
+
+* The per-tile AA/noise kernels assumed they owned the target and *wrote* their pixels.
+  That is true for the pure path (the canvas was just cleared) but not after a cut or a
+  merge, which leave pixels inside the same tile. They now start from
+  `acc = active ? target.read(pixel) : 0` and only write pixels a stroke actually touched.
+  On `doodle` (57 strokes, 7 merges, then 951 strokes on top) the wrong-pixel count fell
+  from 252 589 to 26 935, all 1 LSB.
+* Paste dispatch was a full-canvas grid: every paste paid for every tile. `PasteBoxParams`
+  (buffer 6) carries the origin and box size, so one dispatch covers exactly the paste's
+  own tile box. The static path passes `(0,0)` and the full grid — unchanged.
+
+### Exact paste binning: `padding1`, not `1.4·r`
+
+Pastes were binned with the historic radius pad (`1.4·r + 1`), which on a radius-188 stamp
+is ~76 px of slack on every side. They are now binned from the same exact reach the
+composite kernel prunes with (`padding1`, which already folds the Bézier hull and the
+marker sweep), plus the same 1 px device margin, and — because a paste's segments are
+source-space while the box is transformed into destination space — divided by the map's
+uniform scale `sqrt|det|` before the transform. On `cutpaste` (2047 pastes): box tiles
+942 890 → 539 781, GPU 195 → 127 ms, byte-identical PNG.
+
+The paste kernels also got the per-pixel prune the stroke kernels have had since Round 7
+(`liveSegPruned`, with the segment's padding1 shrunk by the similarity scale; the noise
+margin for noisy segments). Byte-identical on `doodle` and `cutpaste`, ~5 % of paste GPU.
+
+### The expensive thing was printing: per-op environment reads
+
+After the changes above `cutpaste` still took 497 ms, and the mixed plan alone was 415 ms
+for 2047 pastes — 200 µs per paste. The cause was not the binning: it was
+`ProcessInfo.processInfo.environment["ART_…"]` sitting inside the per-paste loop (two A/B
+hooks, plus a debug print check). Each read bridges the whole environment dictionary, so it
+costs ~0.1–0.2 ms. Hoisted to static `let`s read once, and the hooks removed:
+
+| document (1920×1080, zoom 1, warm) | before | after |
+|---|---|---|
+| cutpaste — 36 821 segs, 11 cuts, 2 047 pastes | 497 ms (bin 282, gpu 195) | **177 ms** (bin 34, gpu 127) |
+| doodle — 90 916 segs, 7 merges | 42 ms (bin 19, gpu 10) | **29 ms** (bin 14, gpu 8) |
+| kaos — 321 611 segs, no cuts/pastes | — | 64 ms (bin 1, gpu 19) |
+
+The lesson is a rule now: never read the environment per op. `LiveConfig` has one reader per
+knob, called once per frame or once per process.
+
+### Exactness
+
+At zoom 1 the cached path and the static render agree to 1 LSB — the same envelope as the
+stroke-only cache (AA edge rounding from device-space remap, no structural difference):
+
+| view | live vs static AE | max channel error |
+|---|---|---|
+| kaos | 42 px | 1 LSB |
+| doodle | 26 935 px | 1 LSB |
+| cutpaste | 9 070 px | 1 LSB |
+
+Away from zoom 1 the cache is approximate by construction: it replays ops from the
+reference camera instead of re-deriving them, so AA edges move by float rounding, and a
+cached layer commits three textures in order where the rebuild path re-flattens after every
+op. Cached vs the rebuild path (`ART_LIVE_REBUILD_ALL=1`):
+
+| view | @2 | @0.5 |
+|---|---|---|
+| kaos (stroke-only) | 324 px / 28 LSB | — |
+| doodle | 5 459 px / 26 LSB | 1 590 px / 7 LSB |
+| cutpaste | 235 px / 1 LSB | 17 px / 1 LSB |
+
+`kaos` is the control: a stroke-only document that never touched a cut/paste still shows
+324 px / 28 LSB at zoom 2, so the amplitude is the reference-camera remap, not the new ops.
+`ART_LIVE_REBUILD_PASTE=1` / `ART_LIVE_REBUILD_ALL=1` remain as documented A/B knobs for
+this comparison (off by default; they are the reference semantics the cache is checked
+against).
+
+Gates: kaos static byte-identical to `art/kaos.png`; live-vs-static 1 LSB on kaos, doodle
+and cutpaste; `stroke-splat-ab.sh --all` 10/10 identical; `stroke-prune-ab.sh --modes 0,1,2`
+byte-equal on kaos, doodle and cutpaste; `swift test` 107 tests / 4 skipped / 0 failures;
+Xcode app + extension build; `build-metallib.sh` verifies all 31 kernels and the installed
+metallib matches a fresh build of the sources.
+
+### What is left, in order
+
+1. **The mixed path still bins strokes on the CPU.** `doodle`'s 14 ms of `bin` is 90 916
+   segments through `buildSegmentTileIndicesBoxed` + `SegmentBinner.bin` (8 stroke runs
+   around 7 merges); the pure path does the same job on the GPU in ~1 ms. Reusing the GPU
+   binner for stroke runs inside the mixed command buffer is the next ~11 ms on that
+   document (29 → ~18 ms) and it is the structural fix, not a micro-optimisation. A
+   pointer-based rewrite of `SegmentBinner.bin` measured no difference, so the win has to
+   come from moving the work to the GPU.
+2. **`cutpaste` is now GPU-bound at 127 ms** for 2 047 pastes × ~264 tiles each, with 1–11
+   masks per paste. That is overdraw of the canvas, not per-op overhead: reducing it means
+   merging non-overlapping pastes into one dispatch or pruning the mask loop by rect AABB,
+   and it is a synthetic stress document — the real-art target is the stroke + merge case.
+3. **Spline coefficients in the stage** (Round 14, item 2) — the exact lever for the pure
+   path, still byte-gated.
+4. Display-link pacing (Round 14, item 1) — unchanged, still needs an interactive A/B.
+

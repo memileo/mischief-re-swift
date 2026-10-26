@@ -349,6 +349,25 @@ public enum LiveConfig {
         return env["ART_LIVE_BINTIME"] == "1"
     }
 
+    /// Force the cache back onto the per-frame action walk (`ART_LIVE_REBUILD_ALL=1`, every
+    /// layer; `ART_LIVE_REBUILD_PASTE=1`, only layers holding a cut/paste/merge). The walk
+    /// is the reference semantics the cached op stream is verified against: at the cache's
+    /// reference camera the two agree to 1 LSB, and away from it they differ by remap
+    /// rounding plus the per-op flattening a cached layer cannot replay (it commits three
+    /// textures in order while the walk re-flattens after every op). A/B knob, off by
+    /// default.
+    public static func forceRebuildEnabled(environment: [String: String]? = nil) -> Bool {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        return env["ART_LIVE_REBUILD_ALL"] == "1" || env["ART_LIVE_REBUILD_PASTE"] == "1"
+    }
+
+    /// Restrict `forceRebuildEnabled` to layers with a cut/paste/merge
+    /// (`ART_LIVE_REBUILD_PASTE=1`, not overridden by `ART_LIVE_REBUILD_ALL=1`).
+    public static func forceRebuildPasteOnly(environment: [String: String]? = nil) -> Bool {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        return env["ART_LIVE_REBUILD_ALL"] != "1" && env["ART_LIVE_REBUILD_PASTE"] == "1"
+    }
+
     /// Tile-list integrity check for the binned path (`ART_LIVE_BINCHECK=1`): forces
     /// the split-CB form and reads the tile list back after every stage (scatter,
     /// chunk sort, each merge pass), verifying every index is in bounds and every

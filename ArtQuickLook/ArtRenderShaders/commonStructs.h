@@ -41,6 +41,17 @@ struct PasteLayerMeta {
     uint   pad1;
 };
 
+// Destination tile box a paste dispatch covers (buffer index 6). The static path
+// passes (0, 0, tilesPerRow) and dispatches the whole canvas, so its pixels and
+// tile indexing are unchanged. The live path dispatches only the paste's box:
+// `gid` is then box-local and gets offset by originTile * tileSize.
+struct PasteBoxParams {
+    uint originTileX;
+    uint originTileY;
+    uint boxTilesPerRow;
+    uint pad;
+};
+
 struct CutMeta {
     // Destination GPU/device -> selection frame.
     float4 row0;

@@ -106,6 +106,34 @@ public struct LiveCachedStroke {
     }
 }
 
+/// One mask of a cached paste, captured at the reference camera.
+public struct LiveCachedPasteMask {
+    /// Source device → selection frame (reference camera).
+    public var inv: CGAffineTransform
+    public var rect: SIMD4<Float>       // x, y, w, h in the selection frame
+    public var erase: Bool
+}
+
+/// One paste/merge op captured at the reference camera.
+///
+/// The camera change is a similarity applied on the *outside* of every map, so each
+/// field remaps with a single conjugation (see `deviceOps`):
+///   - segments move by `camera` (radius scales with it),
+///   - `invAffine` (dst → src) becomes `C ∘ D_ref ∘ C⁻¹`,
+///   - `sourceToDestination` becomes `C ∘ D_ref ∘ C⁻¹`,
+///   - a mask's `inv` (src → selection) becomes `inv_ref ∘ C⁻¹`.
+public struct LiveCachedPaste {
+    public var segments: [GPUSplineSegment]
+    public var color: SIMD4<Float>
+    public var isEraser: Bool
+    public var isMarker: Bool
+    public var invAffine: CGAffineTransform         // dst device → src device
+    public var masks: [LiveCachedPasteMask]
+    public var sourceToDestination: CGAffineTransform
+    public var isMerge: Bool
+    public var mergeID: UInt64
+}
+
 /// One cached op, in document space (nothing here depends on the current view).
 public enum LiveCachedOp {
     case stroke(LiveCachedStroke)
@@ -113,6 +141,8 @@ public enum LiveCachedOp {
     /// frame (`m1` in `Renderer.buildLayerOperations`). Recomposed into a `CutMeta` per
     /// view change.
     case cut(rect: [Float], selectionFrame: CGAffineTransform)
+    /// A paste/merge, its flattened source geometry captured at the reference camera.
+    case paste(LiveCachedPaste)
 }
 
 /// A visible layer, ready to be re-rasterised for any view.
@@ -132,6 +162,7 @@ public struct LiveCachedLayer {
     public let strokeBounds: [CGRect]
     public let strokeIsMarker: [Bool]
     public let hasCut: Bool
+    public let hasPaste: Bool
 
     init(layerIndex: Int, opacity: Float, layerTransform: CGAffineTransform,
          ops: [LiveCachedOp], needsRebuild: Bool) {
@@ -143,6 +174,7 @@ public struct LiveCachedLayer {
         var bounds: [CGRect] = []
         var markers: [Bool] = []
         var cut = false
+        var paste = false
         bounds.reserveCapacity(ops.count)
         markers.reserveCapacity(ops.count)
         for op in ops {
@@ -152,17 +184,23 @@ public struct LiveCachedLayer {
                     markers.append(s.isMarker)
                 case .cut:
                     cut = true
+                case .paste:
+                    paste = true
             }
         }
         self.strokeBounds = bounds
         self.strokeIsMarker = markers
         self.hasCut = cut
+        self.hasPaste = paste
     }
 
     public var cachedSegmentCount: Int {
         ops.reduce(0) { total, op in
-            if case .stroke(let s) = op { return total + s.segments.count }
-            return total
+            switch op {
+                case .stroke(let s): return total + s.segments.count
+                case .paste(let p): return total + p.segments.count
+                case .cut: return total
+            }
         }
     }
 }
@@ -276,6 +314,11 @@ func invert(_ t: CGAffineTransform) -> CGAffineTransform? {
 public enum LiveDeviceOp {
     case stroke(segments: [GPUSplineSegment], color: SIMD4<Float>, isEraser: Bool, isMarker: Bool)
     case cut(meta: CutMeta)
+    case paste(segments: [GPUSplineSegment], color: SIMD4<Float>,
+               isEraser: Bool, isMarker: Bool,
+               meta: PasteLayerMeta, masks: [PasteMask],
+               sourceToDestinationGPU: CGAffineTransform,
+               isMerge: Bool, mergeID: UInt64)
 }
 
 /// Per-tile eligibility (pure; unit-tested on Linux). The per-tile kernels implement the
@@ -291,7 +334,7 @@ public enum LivePerTileEligibility {
         var hasNoise = false
         for op in ops {
             switch op {
-            case .cut:
+            case .cut, .paste:
                 return false
             case .stroke(let segments, _, _, let isMarker):
                 if isMarker { hasMarker = true }
@@ -343,6 +386,7 @@ extension LiveRenderCache {
         
         var ops: [LiveDeviceOp] = []
         ops.reserveCapacity(layer.ops.count)
+        let cameraInverse = invert(camera)
         
         for cached in layer.ops {
             switch cached {
@@ -362,9 +406,43 @@ extension LiveRenderCache {
                     // (no layer matrix), so the live version uses camera ∘ base.
                     let liveBase = liveBaseTransform(camera: camera)
                     guard let inverse = invert(liveBase) else { continue }
-                    // dest → selection frame = m1 first, then liveBase⁻¹.
-                    ops.append(.cut(meta: CutMeta(inverseAffine: selectionFrame.concatenating(inverse),
+                    // dest device → selection frame = m1 after liveBase⁻¹. With
+                    // `a.concatenating(b)` applying a first, that is
+                    // `inverse.concatenating(selectionFrame)` (the old order put the
+                    // camera on the wrong side and was only correct when it was identity).
+                    ops.append(.cut(meta: CutMeta(inverseAffine: inverse.concatenating(selectionFrame),
                                                   rect: rect, edgeWidth: 0.75)))
+                case .paste(let paste):
+                    // Every paste map is `B ∘ (content) ∘ B⁻¹`, and B_now = C ∘ B_ref,
+                    // so the camera conjugates through unchanged. The segments simply
+                    // move by C (radii included), and each mask map loses one C⁻¹ on
+                    // the output side because `B_now⁻¹ = B_ref⁻¹ ∘ C⁻¹`.
+                    guard let cameraInverse else { return nil }
+                    let masks: [PasteMask] = paste.masks.map { mask in
+                        PasteMask(inv: cameraInverse.concatenating(mask.inv),
+                                  rectXYWH: [mask.rect.x, mask.rect.y,
+                                             mask.rect.z, mask.rect.w],
+                                  erase: mask.erase)
+                    }
+                    let invAffine = cameraInverse
+                        .concatenating(paste.invAffine)
+                        .concatenating(camera)
+                    let srcToDst = cameraInverse
+                        .concatenating(paste.sourceToDestination)
+                        .concatenating(camera)
+                    ops.append(.paste(
+                        segments: Self.remap(paste.segments,
+                                             camera: camera,
+                                             radiusFactor: radiusFactor),
+                        color: paste.color,
+                        isEraser: paste.isEraser,
+                        isMarker: paste.isMarker,
+                        meta: PasteLayerMeta(invAffine: invAffine, edgeWidth: 0.75,
+                                             maskCount: UInt32(masks.count)),
+                        masks: masks,
+                        sourceToDestinationGPU: srcToDst,
+                        isMerge: paste.isMerge,
+                        mergeID: paste.mergeID))
             }
         }
         return ops
@@ -462,6 +540,14 @@ extension LiveRenderCache {
 
 extension Renderer {
 
+    /// Recovers a `CGAffineTransform` from the two row vectors the GPU structs carry:
+    /// row0 = (a, c, tx, _), row1 = (b, d, ty, _).
+    static func affine(row0: SIMD4<Float>, row1: SIMD4<Float>) -> CGAffineTransform {
+        CGAffineTransform(a: CGFloat(row0.x), b: CGFloat(row1.x),
+                          c: CGFloat(row0.y), d: CGFloat(row1.y),
+                          tx: CGFloat(row0.z), ty: CGFloat(row1.z))
+    }
+
     /// Walks `art` once and caches every layer's flattened geometry at the reference
     /// transform.
     ///
@@ -503,7 +589,6 @@ extension Renderer {
             guard !operations.isEmpty else { continue }
 
             var cached: [LiveCachedOp] = []
-            var needsRebuild = false
 
             for op in operations {
                 switch op {
@@ -529,26 +614,44 @@ extension Renderer {
                             rect: [meta.rect.x, meta.rect.y, meta.rect.z, meta.rect.w],
                             selectionFrame: meta.inverseAffine.concatenating(baseTransform)))
 
-                    case .paste:
-                        // Pastes/merges need the full replay/resolve machinery.
-                        needsRebuild = true
+                    case .paste(let segments, let color, let isEraser, let isMarker,
+                                let meta, let masks, let sourceToDestination,
+                                let isMerge, let mergeID):
+                        segmentCount += segments.count
+                        if segmentCount > segmentBudget { overBudget = true; break }
+                        let cachedMasks = masks.map {
+                            LiveCachedPasteMask(inv: Self.affine(row0: $0.inv0, row1: $0.inv1),
+                                                rect: $0.rect,
+                                                erase: $0.flags.x > 0.5)
+                        }
+                        cached.append(.paste(LiveCachedPaste(
+                            segments: segments,
+                            color: color,
+                            isEraser: isEraser,
+                            isMarker: isMarker,
+                            invAffine: Self.affine(row0: meta.row0, row1: meta.row1),
+                            masks: cachedMasks,
+                            sourceToDestination: sourceToDestination,
+                            isMerge: isMerge,
+                            mergeID: mergeID)))
                 }
             }
 
-            if needsRebuild {
-                // Those strokes are rebuilt per frame anyway, so they must not eat the
-                // budget or show up in the reported cache size.
-                segmentCount -= cached.reduce(0) { total, op in
-                    if case .stroke(let s) = op { return total + s.segments.count }
-                    return total
-                }
-                cached.removeAll()
+            if overBudget { break }
+
+            // A/B knob (see `LiveConfig.forceRebuildEnabled`): send layers back through the
+            // per-frame walk, which is the reference the cached ops are verified against.
+            var needsRebuild = false
+            if LiveConfig.forceRebuildEnabled() {
+                needsRebuild = !LiveConfig.forceRebuildPasteOnly()
+                    || cached.contains { if case .paste = $0 { return true }; return false }
             }
+            let storedOps = needsRebuild ? [] : cached
 
             layers.append(LiveCachedLayer(layerIndex: layerIndex,
                                           opacity: layer["opacity"] as? Float ?? 1.0,
                                           layerTransform: layerTransform,
-                                          ops: needsRebuild ? [] : cached,
+                                          ops: storedOps,
                                           needsRebuild: needsRebuild))
         }
 

@@ -252,9 +252,15 @@ extension Renderer {
                     mr.liveTiming.culledStrokes += strokesInLayer
                     continue
                 }
-                try mr.renderCachedLayerIntoLiveCanvas(layerOps: deviceOps,
-                                                       width: width, height: height,
-                                                       opacity: layer.opacity)
+                if layer.hasCut || layer.hasPaste {
+                    try mr.renderCachedLayerMixedIntoLiveCanvas(layerOps: deviceOps,
+                                                                width: width, height: height,
+                                                                opacity: layer.opacity)
+                } else {
+                    try mr.renderCachedLayerIntoLiveCanvas(layerOps: deviceOps,
+                                                           width: width, height: height,
+                                                           opacity: layer.opacity)
+                }
             }
             
             // ── Paper / background. Tiled in *canvas* space (like the CoreGraphics path):

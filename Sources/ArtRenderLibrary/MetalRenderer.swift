@@ -39,6 +39,16 @@ struct Params {
     var isMarker: Bool
 }
 
+/// Destination tile box a paste dispatch covers (matches `PasteBoxParams` in
+/// commonStructs.h). The static path passes (0, 0, tilesPerRow) and still
+/// dispatches the full canvas, so its output is unchanged.
+struct PasteBoxParams {
+    var originTileX: UInt32
+    var originTileY: UInt32
+    var boxTilesPerRow: UInt32
+    var pad: UInt32 = 0
+}
+
 
 /// Tile index structure for spatial indexing
 struct TileIndex {

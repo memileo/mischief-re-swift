@@ -494,6 +494,10 @@ kernel void segmentNoiseCompositeKernel(
 
 // MARK: - Paste Layer and Cut Composite Kernels
 
+// Defined with the live stroke twins below; the paste kernels use the same exact prune.
+static inline bool liveSegPruned(float2 p, float2 a, float2 b, float r2);
+static inline float liveNoisePruneMargin(float r0, float r1);
+
 kernel void segmentPasteLayerAACompositeKernel(
                                                const device Params              &params       [[buffer(0)]],
                                                const device GPUSplineSegment    *segments     [[buffer(1)]],
@@ -501,19 +505,21 @@ kernel void segmentPasteLayerAACompositeKernel(
                                                const device uint32_t            *tileList     [[buffer(3)]],
                                                const device PasteLayerMeta      &meta         [[buffer(4)]],
                                                const device PasteMask           *pasteMasks   [[buffer(5)]],
+                                               const device PasteBoxParams      &box          [[buffer(6)]],
                                                texture2d<float, access::read_write> target    [[texture(0)]],
                                                uint2 gid [[thread_position_in_grid]])
 {
     uint w = target.get_width();
     uint h = target.get_height();
-    if (gid.x >= w || gid.y >= h) return;
+    uint2 px = gid + uint2(box.originTileX, box.originTileY) * params.tileSize;
+    if (px.x >= w || px.y >= h) return;
     
     uint2 tileID     = gid / params.tileSize;
-    uint tileIndex   = tileID.y * params.tilesPerRow + tileID.x;
+    uint tileIndex   = tileID.y * box.boxTilesPerRow + tileID.x;
     TileIndex tIdx   = tileIndices[tileIndex];
     
     // dst GPU → original source GPU (via meta.invAffine = destinationToSourceGPU)
-    float2 dstPos = float2(gid) + float2(0.5f, 0.5f);
+    float2 dstPos = float2(px) + float2(0.5f, 0.5f);
     
     float2 srcPos = float2(
                            meta.row0.x * dstPos.x +
@@ -538,11 +544,11 @@ kernel void segmentPasteLayerAACompositeKernel(
         float  inY = min(selectionPos.y - minP.y, maxP.y - selectionPos.y);
         float  sd  = out - min(inX, inY);
         
-        float4 dbg = target.read(gid);
+        float4 dbg = target.read(px);
         if (sd < -meta.edgeWidth)      dbg = float4(0.0, 0.0, 1.0, 1.0);
         else if (sd < meta.edgeWidth)  dbg = float4(0.0, 1.0, 0.0, 1.0);
         else return;
-        target.write(dbg, gid);
+        target.write(dbg, px);
         return;
     }
 #else
@@ -556,11 +562,27 @@ kernel void segmentPasteLayerAACompositeKernel(
     
     float maxCoverage = 0.0f;
     float t = 0.0f;
-    
+
+    // The AA falloff widens with the destination→source scale, but it is still a
+    // *device-pixel* falloff: coverage is exactly zero past `0.44·shrink` source px
+    // from the shape. `padding1` is the shape's reach from its chord, so one
+    // chord-distance test rejects every segment that cannot paint this pixel — the
+    // same exact prune the stroke kernels run before their SDF.
+    float detInv = meta.row0.x * meta.row1.y - meta.row0.y * meta.row1.x;
+    float shrink = sqrt(abs(detInv));        // source px per device px (geometric-mean approx)
+    float edgeWidth = 0.94f * shrink;
+    float bias = 0.5f * shrink;
+    float pruneMargin = 0.5f + 0.5f * shrink;   // cutoff + float slack
+
     for (uint i = 0; i < tIdx.count; ++i) {
         uint segIdx = tileList[tIdx.start + i];
         GPUSplineSegment seg = segments[segIdx];
-        
+
+        if (seg.padding1 != 0u) {
+            float pr = as_type<float>(seg.padding1) + pruneMargin;
+            if (liveSegPruned(srcPos, seg.p1, seg.p2, pr * pr)) continue;
+        }
+
         float signedDist = 1e6f;
         float segT = 0.0f;
         
@@ -590,10 +612,6 @@ kernel void segmentPasteLayerAACompositeKernel(
         }
         
         float opacity = mix(seg.opacity0, seg.opacity1, segT);
-        float detInv = meta.row0.x * meta.row1.y - meta.row0.y * meta.row1.x;
-        float shrink = sqrt(abs(detInv));        // source px per device px (geometric-mean approx)
-        float edgeWidth = 0.94f * shrink;
-        float bias = 0.5f * shrink;
         float adjustedDist = signedDist + bias;
         float cov = 1.0f - smootherstep(-edgeWidth, edgeWidth, adjustedDist);
         float stamped = cov * opacity;
@@ -603,7 +621,7 @@ kernel void segmentPasteLayerAACompositeKernel(
     if (maxCoverage < 0.001f) return;
     
     float finalAlpha = maxCoverage * params.penColor.a * maskAlpha;
-    float4 dst = target.read(gid);
+    float4 dst = target.read(px);
     float3 srcPremul = params.penColor.rgb * finalAlpha;
     
     if (params.isEraser) {
@@ -613,7 +631,7 @@ kernel void segmentPasteLayerAACompositeKernel(
         dst.rgb = srcPremul + dst.rgb * (1.0f - finalAlpha);
         dst.a   = finalAlpha + dst.a * (1.0f - finalAlpha);
     }
-    target.write(dst, gid);
+    target.write(dst, px);
 }
 
 kernel void segmentPasteLayerNoiseCompositeKernel(
@@ -623,6 +641,7 @@ kernel void segmentPasteLayerNoiseCompositeKernel(
                                                   const device uint32_t            *tileList     [[buffer(3)]],
                                                   const device PasteLayerMeta      &meta         [[buffer(4)]],
                                                   const device PasteMask           *pasteMasks   [[buffer(5)]],
+                                                  const device PasteBoxParams      &box          [[buffer(6)]],
                                                   texture2d<float, access::read_write> target    [[texture(0)]],
                                                   texture2d<float, access::sample>  noiseTex     [[texture(1)]],
                                                   sampler noiseSampler [[sampler(0)]],
@@ -630,14 +649,15 @@ kernel void segmentPasteLayerNoiseCompositeKernel(
 {
     uint w = target.get_width();
     uint h = target.get_height();
-    if (gid.x >= w || gid.y >= h) return;
+    uint2 px = gid + uint2(box.originTileX, box.originTileY) * params.tileSize;
+    if (px.x >= w || px.y >= h) return;
     
     uint2 tileID     = gid / params.tileSize;
-    uint tileIndex   = tileID.y * params.tilesPerRow + tileID.x;
+    uint tileIndex   = tileID.y * box.boxTilesPerRow + tileID.x;
     TileIndex tIdx   = tileIndices[tileIndex];
     
     // dst GPU → original source GPU
-    float2 dstPos = float2(gid) + float2(0.5f, 0.5f);
+    float2 dstPos = float2(px) + float2(0.5f, 0.5f);
     
     float2 srcPos = float2(
                            meta.row0.x * dstPos.x +
@@ -662,11 +682,11 @@ kernel void segmentPasteLayerNoiseCompositeKernel(
         float  inY = min(selectionPos.y - minP.y, maxP.y - selectionPos.y);
         float  sd  = out - min(inX, inY);
         
-        float4 dbg = target.read(gid);
+        float4 dbg = target.read(px);
         if (sd < -meta.edgeWidth)      dbg = float4(0.0, 0.0, 1.0, 1.0);
         else if (sd < meta.edgeWidth)  dbg = float4(0.0, 1.0, 0.0, 1.0);
         else return;
-        target.write(dbg, gid);
+        target.write(dbg, px);
         return;
     }
 #else
@@ -683,11 +703,24 @@ kernel void segmentPasteLayerNoiseCompositeKernel(
 #ifdef DEBUG_SEGMENT_COLORS
     float3 debugColor = float3(0.0);
 #endif
-    
+
+    // Same exact per-pixel prune as the AA paste kernel, but a noisy segment's falloff
+    // reaches `1.375·max(radius, 1)` from the shape (device px), so scale that margin
+    // into source px before testing the chord distance.
+    float detInv = meta.row0.x * meta.row1.y - meta.row0.y * meta.row1.x;
+    float shrink = sqrt(abs(detInv));
+
     for (uint i = 0; i < tIdx.count; ++i) {
         uint segIdx = tileList[tIdx.start + i];
         GPUSplineSegment seg = segments[segIdx];
-        
+
+        if (seg.padding1 != 0u) {
+            float pr = as_type<float>(seg.padding1)
+                     + liveNoisePruneMargin(seg.radius0, seg.radius1) * shrink
+                     + 0.5f;
+            if (liveSegPruned(srcPos, seg.p1, seg.p2, pr * pr)) continue;
+        }
+
         float signedDist = 1e6f;
         float t = 0.0f;
         
@@ -745,7 +778,7 @@ kernel void segmentPasteLayerNoiseCompositeKernel(
     
     float noiseVal = 1.0f;
     if (noiseTex.get_width() > 0) {
-        float2 noiseUV = fract(float2(gid) / (float(noiseTex.get_width()) * params.noiseScale));
+        float2 noiseUV = fract(float2(px) / (float(noiseTex.get_width()) * params.noiseScale));
         noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
     }
     
@@ -755,7 +788,7 @@ kernel void segmentPasteLayerNoiseCompositeKernel(
     finalAlpha *= params.penColor.a;
     
     if (finalAlpha > 0.0001f) {
-        float4 dst = target.read(gid);
+        float4 dst = target.read(px);
         
 #ifdef DEBUG_SEGMENT_COLORS
         float3 srcPremultiplied = debugColor * finalAlpha;
@@ -770,7 +803,7 @@ kernel void segmentPasteLayerNoiseCompositeKernel(
             dst.rgb = srcPremultiplied + dst.rgb * (1.0f - finalAlpha);
             dst.a = finalAlpha + dst.a * (1.0f - finalAlpha);
         }
-        target.write(dst, gid);
+        target.write(dst, px);
     }
 }
 
@@ -1330,7 +1363,12 @@ kernel void livePerTileAACompositeKernel(
     uint nextFirst = (gCount > 0u) ? strokeGroups[gBase].segStart : 0u;
     bool strokeActive = true;
     bool haveCur = false;
-    float4 acc = float4(0.0f);          // canvas is cleared before the layer, so start transparent
+    // Start from whatever the target already holds. A stroke run can follow cuts/pastes
+    // in the same layer (mixed path), so this kernel's box must composite over that
+    // content instead of replacing it. Reading the RGBA8 target also matches the
+    // per-stroke path, which reads/writes the same 8-bit values between strokes.
+    float4 acc = active ? target.read(pixel) : float4(0.0f);
+    bool modified = false;              // did any stroke touch this pixel?
     uint curStroke = 0xFFFFFFFFu;       // no stroke yet
     uint curFlags = 0u;                 // per-stroke flags (bit2 = marker)
     float curMax = 0.0f;
@@ -1366,6 +1404,7 @@ kernel void livePerTileAACompositeKernel(
                             if (curMax >= 0.001f && (ablate & 4u) == 0u) {
                                 float4 col = strokeColor[curStroke];
                                 perTileCompositeStroke(acc, col, curFlags, curMax * col.a);
+                                modified = true;
                             }
                             curMax = 0.0f;
                         }
@@ -1384,6 +1423,7 @@ kernel void livePerTileAACompositeKernel(
                     if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f && (ablate & 4u) == 0u) {
                         float4 col = strokeColor[curStroke];
                         perTileCompositeStroke(acc, col, curFlags, curMax * col.a);
+                        modified = true;
                     }
                     strokeActive = true;
                     curStroke = sId;
@@ -1440,9 +1480,10 @@ kernel void livePerTileAACompositeKernel(
     if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f && (ablate & 4u) == 0u) {
         float4 col = strokeColor[curStroke];
         perTileCompositeStroke(acc, col, curFlags, curMax * col.a);
+        modified = true;
     }
 
-    if (acc.a > 0.0001f && (ablate & 8u) == 0u && active) target.write(acc, pixel);
+    if (modified && (ablate & 8u) == 0u && active) target.write(acc, pixel);
 }
 
 // MARK: - Per-tile noise-capable composite (one dispatch per layer, AA + noise)
@@ -1501,7 +1542,10 @@ kernel void livePerTileNoiseCompositeKernel(
         noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
     }
 
-    float4 acc = float4(0.0f);
+    // Composite over what the target already holds: a stroke run may follow cuts or
+    // pastes in the same layer (mixed path). See livePerTileAACompositeKernel.
+    float4 acc = active ? target.read(pixel) : float4(0.0f);
+    bool modified = false;
     // Block skip table (same contract as livePerTileAACompositeKernel): cursor over
     // this tile's blocks ascending by segStart; count 0 = no table → direct walk.
     uint2 groupsInfo = strokeGroupTiles[localTile];
@@ -1558,6 +1602,7 @@ kernel void livePerTileNoiseCompositeKernel(
                                     // noisy strokes when final alpha clears 0.0001.
                                     if (!curNoisy || a > 0.0001f) {
                                         perTileCompositeStroke(acc, col, strokeFlags[curStroke], a);
+                                        modified = true;
                                     }
                                 }
                             }
@@ -1590,6 +1635,7 @@ kernel void livePerTileNoiseCompositeKernel(
                             // noisy strokes when final alpha clears 0.0001.
                             if (!curNoisy || a > 0.0001f) {
                                 perTileCompositeStroke(acc, col, strokeFlags[curStroke], a);
+                                modified = true;
                             }
                         }
                     }
@@ -1667,13 +1713,15 @@ kernel void livePerTileNoiseCompositeKernel(
             float a = (1.0f - saturate(inverted / noiseAdd)) * col.a;
             if (a > 0.0001f) {
                 perTileCompositeStroke(acc, col, strokeFlags[curStroke], a);
+                modified = true;
             }
         } else {
             perTileCompositeStroke(acc, col, strokeFlags[curStroke], curMax * col.a);
+            modified = true;
         }
     }
 
-    if (acc.a > 0.0001f && active) target.write(acc, pixel);
+    if (modified && active) target.write(acc, pixel);
 }
 
 // MARK: - Splat composite (segment-parallel small-stamp regime)

@@ -588,6 +588,12 @@ extension MetalRenderer {
         encoder.setBuffer(tileListBuffer, offset: 0, index: 3)
         encoder.setBuffer(pasteMetaBuffer, offset: 0, index: 4)
         encoder.setBuffer(pasteMaskBuffer, offset: 0, index: 5)
+        // Whole-canvas box: origin (0,0) and the canvas tile stride. The kernel's
+        // pixels and tile indices are then identical to the pre-box version.
+        var box = PasteBoxParams(
+            originTileX: 0, originTileY: 0,
+            boxTilesPerRow: (UInt32(width) + UInt32(tileSize) - 1) / UInt32(tileSize))
+        encoder.setBytes(&box, length: MemoryLayout<PasteBoxParams>.stride, index: 6)
         encoder.setTexture(renderTarget, index: 0)
         
         let tg = MTLSize(width: 8, height: 8, depth: 1)
@@ -898,20 +904,27 @@ extension MetalRenderer {
         // a noisy layer is binned with that margin. `transform == nil` ⇒ these segments are
         // already camera-mapped (device space), which is what `padding1` is scaled for.
         let binNoiseLayer = segments.contains { $0.noiseSeed != 0 }
+        // `padding1` is a source-space distance. A destination-device margin (AA/noise
+        // cutoff + tile rounding) must be divided by this scale before it is added to that
+        // reach, because the resulting box is transformed into destination space below.
+        // `sqrt|det|` is the uniform scale of the map (the paste maps are similarities).
+        let xScale: Float = hasTransform
+            ? max(1e-6, Float((abs(t.a * t.d - t.b * t.c)).squareRoot()))
+            : 1
         segments.withUnsafeBufferPointer { segs in
             ranges.withUnsafeMutableBufferPointer { rp in
                 for i in segs.indices {
                     let seg = segs[i]
                     let marker = markerFlags.map { i < $0.count && $0[i] } ?? isMarker
                     let padding: Float
-                    if !hasTransform, seg.padding1 != 0 {
+                    if seg.padding1 != 0 {
                         let margin = binNoiseLayer
                             ? max(SegmentPadding.binDeviceMargin,
                                   SegmentPrune.noiseDeviceMargin(radius0: seg.radius0,
                                                                  radius1: seg.radius1))
                             : SegmentPadding.binDeviceMargin
                         padding = SegmentPadding.pad(reach: Float(bitPattern: seg.padding1),
-                                                     margin: margin)
+                                                     margin: margin / xScale)
                     } else {
                         padding = SegmentPadding.pad(radiusMax: max(seg.radius0, seg.radius1),
                                                      isMarker: marker)

@@ -405,7 +405,7 @@ final class LiveProfileTests: XCTestCase {
             }
             if let ops = cache.deviceOps(forLayerAt: position, camera: .identity) {
                 let eligible = LivePerTileEligibility.isEligible(ops)
-                var strokes = 0, segments = 0, markers = 0, cuts = 0, noisy = 0
+                var strokes = 0, segments = 0, markers = 0, cuts = 0, noisy = 0, pastes = 0
                 var dispatchTiles = 0
                 var unionMinX = Int.max, unionMinY = Int.max
                 var unionMaxX = Int.min, unionMaxY = Int.min
@@ -413,6 +413,8 @@ final class LiveProfileTests: XCTestCase {
                     switch op {
                     case .cut:
                         cuts += 1
+                    case .paste:
+                        pastes += 1
                     case .stroke(let s, _, _, let isMarker):
                         strokes += 1
                         segments += s.count
@@ -444,10 +446,11 @@ final class LiveProfileTests: XCTestCase {
                 var reasons: [String] = []
                 if !eligible {
                     if cuts > 0 { reasons.append("\(cuts) cut ops") }
+                    if pastes > 0 { reasons.append("\(pastes) paste ops") }
                     if markers > 0 && noisy > 0 { reasons.append("markers + noise") }
                 }
-                print(String(format: "  layer %d: strokes %d | segments %d | noisy %d | cuts %d | markers %d",
-                             position, strokes, segments, noisy, cuts, markers))
+                print(String(format: "  layer %d: strokes %d | segments %d | noisy %d | cuts %d | pastes %d | markers %d",
+                             position, strokes, segments, noisy, cuts, pastes, markers))
                 print(String(format: "    per-tile %@%@ | per-stroke path: %d dispatches over %d tile-threads vs %d tiles for the whole layer",
                              eligible ? "ELIGIBLE" : "blocked",
                              reasons.isEmpty ? "" : " (" + reasons.joined(separator: ", ") + ")",
