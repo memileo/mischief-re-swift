@@ -5,157 +5,232 @@
 //  Created by memileo on 2025-10-24.
 //
 
-import SwiftUI
 import AppKit
+import SwiftUI
 import UniformTypeIdentifiers
 
+// MARK: - Entry point
+
 @main
-struct ArtQuickLookApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+final class AppMain {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()          // stays alive: main() never returns
+        app.delegate = delegate
+        app.run()
+    }
+}
+
+// MARK: - Application delegate
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
     
-    /// Drives menu validation. Window key-status changes are observed natively
-    /// (DocumentFocusModel) and re-render the scene tree — commands included.
-    @StateObject private var documentFocus = DocumentFocusModel.shared
-    
-    var body: some Scene {
-        // Module-qualified on purpose: this target also declares a config
-        // struct named `Settings`, which shadows SwiftUI's scene. A bare
-        // `Settings { … }` resolves to that struct — not a Scene — and fails
-        // to compile with "Extra trailing closure passed in call" and
-        // "Value of type 'Settings' has no member 'commands'".
-        SwiftUI.Settings {
-            SettingsSceneContent()
-        }
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // Document windows auto-tab (they opt in via configureAsArtDocument:
+        // .preferred + a shared tabbingIdentifier). The system default
+        // ("Prefer tabs: In Full Screen") would otherwise never tab them.
+        NSWindow.allowsAutomaticWindowTabbing = true
         
-        // Restores the full default menu bar (Quit/Hide/Services, Edit,
-        // Window with its tab commands, Help) that a Settings-only scene
-        // does not get. Its auto-created window is a launcher that closes
-        // itself immediately — this app starts windowless by design.
-        WindowGroup("ArtQuickLook") {
-            DocumentHomeView()
-        }
-        .commands {
-            AppMenuBar(documentIsFocused: documentFocus.hasFocusedDocument)
-        }
+        // The menu bar must be in place before the app finishes launching.
+        NSApp.mainMenu = AppMenuBuilder.makeMainMenu()
     }
-}
-
-// MARK: - WindowGroup content (document launcher)
-
-/// The WindowGroup exists primarily to bring back the full default menu bar;
-/// its window doubles as a launcher for documents. Because the app must
-/// start windowless, the auto-created instance closes itself the moment its
-/// content is live (see `HomeWindowCloser`).
-struct DocumentHomeView: View {
-    /// `true` (default): the app starts windowless — the auto-created home
-    /// window closes itself (drag a file onto the Dock icon, or ⌘O, instead).
-    /// `false`: keep the window visible as an "Open…" launcher at start.
-    static var suppressAutoCreatedWindow = false
     
-    var body: some View {
-        VStack(spacing: 14) {
-            Text("ArtQuickLook")
-                .font(.title2.weight(.semibold))
-            Text("Drop a .art file onto the Dock icon, or open one directly.")
-                .foregroundStyle(.secondary)
-            Button("Open .art File…") { AppMenuBar.openArtDocument() }
-        }
-        .padding(40)
-        .frame(minWidth: 420, minHeight: 240)
-        .background(HomeWindowCloser())
-    }
-}
-
-/// Attached to DocumentHomeView; closes the hosting window as soon as the
-/// view lands in it. With no "New Window" command in the menu, every home
-/// window is an auto-created one (launch, state restore, or a stray
-/// SwiftUI-spawned window on a document event), so closing on attach is
-/// always correct while the flag above is set.
-private struct HomeWindowCloser: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView { AutoCloseView() }
-    func updateNSView(_ nsView: NSView, context: Context) {}
+    // MARK: Documents — the one and only document path, unchanged
     
-    final class AutoCloseView: NSView {
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            guard let window = self.window,
-                  DocumentHomeView.suppressAutoCreatedWindow else { return }
-            // Async: never close midway through window setup.
-            DispatchQueue.main.async { window.close() }
-        }
+    /// Open-document Apple events (Finder, Quick Look hand-off, `open`,
+    /// dock drops, Open With…). DocumentWindowCoordinator dedupes by URL.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls { DocumentWindowCoordinator.shared.open(url: url) }
     }
-}
-
-// MARK: - Settings scene content
-
-/// ContentView inside the Settings scene, plus a tag that keeps the settings
-/// window out of every tab group (this used to live in
-/// `AppDelegate.showSettingsWindow()`, which no longer exists).
-struct SettingsSceneContent: View {
-    var body: some View {
-        ContentView()
-            .background(SettingsWindowTagger())
-    }
-}
-
-private struct SettingsWindowTagger: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView { TaggerView() }
-    func updateNSView(_ nsView: NSView, context: Context) {}
     
-    final class TaggerView: NSView {
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            self.window?.tabbingMode = .disallowed
+    // MARK: Reopen (dock icon, `open -a`, Spotlight)
+    
+    /// Plain AppKit: this return value is actually honoured, so a dock click
+    /// with no windows open shows nothing and recreates nothing — no flash.
+    /// A document Apple event that follows (dock drop, Open With…) is
+    /// delivered to application(_:open:) independently of this value.
+    func applicationShouldHandleReopen(_ sender: NSApplication,
+                                       hasVisibleWindows flag: Bool) -> Bool {
+        if flag {
+            return true        // windows exist: default activation is fine
         }
+        return false           // windowless: stay windowless by design
+    }
+    
+    /// Quick Look companion: stay alive with no windows.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 }
 
-// MARK: - Menu commands
+// MARK: - Main menu
 
-struct AppMenuBar: Commands {
-    let documentIsFocused: Bool
+enum AppMenuBuilder {
     
-    var body: some Commands {
-        // File: drop "New", add the document opener.
-        CommandGroup(replacing: .newItem) {
-            Button("Open .art-file…") { Self.openArtDocument() }
-                .keyboardShortcut("o")
-        }
+    /// The full standard menu bar, built in code (no nib needed).
+    ///
+    /// Stock items use a nil target so they dispatch through the responder
+    /// chain to AppKit's own implementations — that is what brings the
+    /// "niceties" back: Services submenu, text-editing commands, ⌘M/Zoom,
+    /// the window list, tab management, help. App-specific items (Open…,
+    /// Settings…, the resets) target AppController.shared and validate
+    /// through it.
+    static func makeMainMenu() -> NSMenu {
+        let mainMenu = NSMenu()
         
-        // View: the live view's resets, for the focused document window.
-        //
-        // Shortcut notes:
-        // - The old ⇧-only equivalents ("⇧P", "⇧Z", "⇧R") were ambiguous: SwiftUI
-        //   matched them without Shift held, so resets fired on bare key presses.
-        //   Every equivalent now includes ⌘, which matches strictly.
-        // - ⌘0 is the convention for "reset zoom" (browsers, image viewers), so
-        //   zoom gets it; "reset everything" moves to ⇧⌘0.
-        CommandGroup(after: .toolbar) {
-            Divider()
-            Button("Reset View") { LiveMTKView.resetFocused(.all) }
-                .keyboardShortcut("0", modifiers: [.command, .shift])
-                .disabled(!documentIsFocused)
-            Button("Reset Pan") { LiveMTKView.resetFocused(.pan) }
-                .keyboardShortcut("p", modifiers: [.command, .shift])
-                .disabled(!documentIsFocused)
-            Button("Reset Zoom") { LiveMTKView.resetFocused(.zoom) }
-                .keyboardShortcut("0", modifiers: .command)
-                .disabled(!documentIsFocused)
-            Button("Reset Rotation") { LiveMTKView.resetFocused(.rotation) }
-                .keyboardShortcut("r", modifiers: [.command, .shift])
-                .disabled(!documentIsFocused)
-        }
+        // MARK: App menu (About / Settings… / Services / Hide / Quit)
+        let appItem = NSMenuItem()
+        mainMenu.addItem(appItem)
+        let appMenu = NSMenu(title: "ArtQuickLook")
+        appItem.submenu = appMenu
         
-        // No custom app-menu group. SwiftUI installs "About ArtQuickLook" and
-        // "Preferences… ⌘," (wired to the Settings scene) automatically; adding
-        // our own Preferences button either duplicates it or, if .appInfo is
-        // replaced, removes the working one.
+        add(appMenu, title: "About ArtQuickLook",
+            action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)))
+        appMenu.addItem(.separator())
+        add(appMenu, title: "Settings…",
+            action: #selector(AppController.showSettingsWindow(_:)),
+            key: ",",  modifiers: .command, target: AppController.shared)
+        appMenu.addItem(.separator())
+        
+        let servicesItem = add(appMenu, title: "Services", action: nil)
+        let servicesMenu = NSMenu(title: "Services")
+        servicesItem.submenu = servicesMenu
+        NSApp.servicesMenu = servicesMenu          // AppKit fills this in
+        
+        appMenu.addItem(.separator())
+        add(appMenu, title: "Hide ArtQuickLook",
+            action: #selector(NSApplication.hide(_:)), key: "h", modifiers: .command)
+        add(appMenu, title: "Hide Others",
+            action: #selector(NSApplication.hideOtherApplications(_:)),
+            key: "h", modifiers: [.command, .option])
+        add(appMenu, title: "Show All",
+            action: #selector(NSApplication.unhideAllApplications(_:)))
+        appMenu.addItem(.separator())
+        add(appMenu, title: "Quit ArtQuickLook",
+            action: #selector(NSApplication.terminate(_:)), key: "q", modifiers: .command)
+        
+        // MARK: File menu (Open… / Close)
+        let fileItem = NSMenuItem()
+        mainMenu.addItem(fileItem)
+        let fileMenu = NSMenu(title: "File")
+        fileItem.submenu = fileMenu
+        
+        add(fileMenu, title: "Open .art File…",
+            action: #selector(AppController.openDocument(_:)),
+            key: "o",  modifiers: .command, target: AppController.shared)
+        fileMenu.addItem(.separator())
+        add(fileMenu, title: "Close",
+            action: #selector(NSWindow.performClose(_:)), key: "w",  modifiers: .command)
+        
+        // MARK: Edit menu (stock text commands via the responder chain)
+        let editItem = NSMenuItem()
+        mainMenu.addItem(editItem)
+        let editMenu = NSMenu(title: "Edit")
+        editItem.submenu = editMenu
+        
+        add(editMenu, title: "Undo", action: Selector(("undo:")), key: "z", modifiers: .command)
+        add(editMenu, title: "Redo", action: Selector(("redo:")), key: "z", modifiers: [.command, .shift])
+        editMenu.addItem(.separator())
+        add(editMenu, title: "Cut", action: #selector(NSText.cut(_:)), key: "x", modifiers: .command)
+        add(editMenu, title: "Copy", action: #selector(NSText.copy(_:)), key: "c", modifiers: .command)
+        add(editMenu, title: "Paste", action: #selector(NSText.paste(_:)), key: "v", modifiers: .command)
+        editMenu.addItem(.separator())
+        add(editMenu, title: "Select All", action: #selector(NSText.selectAll(_:)), key: "a", modifiers: .command)
+        
+        // MARK: View menu (the reset commands, AppKit-validated)
+        let viewItem = NSMenuItem()
+        mainMenu.addItem(viewItem)
+        let viewMenu = NSMenu(title: "View")
+        viewItem.submenu = viewMenu
+        
+        add(viewMenu, title: "Reset View",
+            action: #selector(AppController.resetView(_:)),
+            key: "0", target: AppController.shared)
+        add(viewMenu, title: "Reset Pan",
+            action: #selector(AppController.resetPan(_:)),
+            key: "p", modifiers: [.command, .shift], target: AppController.shared)
+        add(viewMenu, title: "Reset Zoom",
+            action: #selector(AppController.resetZoom(_:)),
+            key: "5", target: AppController.shared)
+        add(viewMenu, title: "Reset Rotation",
+            action: #selector(AppController.resetRotation(_:)),
+            key: "r", modifiers: [.command, .shift], target: AppController.shared)
+        
+        // MARK: Window menu (Minimize / Zoom / Bring All to Front + list)
+        let windowItem = NSMenuItem()
+        mainMenu.addItem(windowItem)
+        let windowMenu = NSMenu(title: "Window")
+        windowItem.submenu = windowMenu
+        
+        add(windowMenu, title: "Minimize",
+            action: #selector(NSWindow.performMiniaturize(_:)), key: "m", modifiers: .command)
+        add(windowMenu, title: "Zoom",
+            action: #selector(NSWindow.performZoom(_:)))
+        windowMenu.addItem(.separator())
+        add(windowMenu, title: "Bring All to Front",
+            action: #selector(NSApplication.arrangeInFront(_:)))
+        NSApp.windowsMenu = windowMenu
+        // AppKit appends the live window list and the tab-management items
+        // (Show Tab Bar / Merge All Windows / …) to this menu automatically.
+        
+        // MARK: Help menu
+        let helpItem = NSMenuItem()
+        mainMenu.addItem(helpItem)
+        let helpMenu = NSMenu(title: "Help")
+        helpItem.submenu = helpMenu
+        
+//        add(helpMenu, title: "ArtQuickLook Help",
+//            action: #selector(NSApplication.showHelp(_:)))
+        NSApp.helpMenu = helpMenu
+        
+        return mainMenu
     }
     
-    /// `NSOpenPanel` rather than SwiftUI's `.fileImporter`, which has no menu-command
-    /// equivalent; documents land in a `DocumentWindowCoordinator` window either way.
-    /// Internal (not private): DocumentHomeView's "Open…" button reuses it.
-    static func openArtDocument() {
+    private static func add(_ menu: NSMenu, title: String, action: Selector?,
+                            key: String = "",
+                            modifiers: NSEvent.ModifierFlags = [],
+                            target: AnyObject? = nil) -> NSMenuItem {
+        let item = menu.addItem(withTitle: title, action: action, keyEquivalent: key)
+        item.keyEquivalentModifierMask = modifiers
+        item.target = target                       // nil = responder chain
+        return item
+    }
+}
+
+// MARK: - App controller (target of the app-specific menu items)
+
+final class AppController: NSObject {
+    
+    static let shared = AppController()
+    
+    // MARK: Settings window — AppKit-owned singleton
+    
+    /// Created on first use, kept alive, reused afterwards. Plain AppKit
+    /// ownership: no Settings scene (no name collision, no private
+    /// selectors, and it never tabs thanks to tabbingMode = .disallowed).
+    private var settingsWindow: NSWindow?
+    
+    @objc func showSettingsWindow(_ sender: Any?) {
+        if settingsWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 360),
+                                  styleMask: [.titled, .closable, .resizable],
+                                  backing: .buffered, defer: false)
+            window.title = "ArtQuickLook Settings"
+            window.tabbingMode = .disallowed          // never joins document tab groups
+            window.isReleasedWhenClosed = false       // reuse on next open
+            window.setFrameAutosaveName("ArtQuickLookSettings")
+            window.contentView = NSHostingView(rootView: ContentView())
+            settingsWindow = window
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+    
+    // MARK: Open…
+    
+    /// `NSOpenPanel` rather than SwiftUI's `.fileImporter`; documents land in
+    /// a DocumentWindowCoordinator window, same as Finder/dock opens.
+    @objc func openDocument(_ sender: Any?) {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
@@ -166,59 +241,29 @@ struct AppMenuBar: Commands {
             DocumentWindowCoordinator.shared.open(url: url)
         }
     }
+    
+    // MARK: View-menu resets
+    
+    @objc func resetView(_ sender: NSMenuItem?)     { LiveMTKView.resetFocused(.all) }
+    @objc func resetPan(_ sender: NSMenuItem?)      { LiveMTKView.resetFocused(.pan) }
+    @objc func resetZoom(_ sender: NSMenuItem?)     { LiveMTKView.resetFocused(.zoom) }
+    @objc func resetRotation(_ sender: NSMenuItem?) { LiveMTKView.resetFocused(.rotation) }
 }
 
-// MARK: - App delegate
-
-final class AppDelegate: NSObject, NSApplicationDelegate {
+extension AppController: NSMenuItemValidation {
     
-    // MARK: Documents — the one and only document path, restored verbatim
-    
-    /// Open-document Apple events (Finder, Quick Look hand-off, `open`, dock
-    /// drops, Open With…). This was working and is back to being the primary
-    /// path — no Apple-event interception. `DocumentWindowCoordinator` dedupes
-    /// by URL. (Any `.onOpenURL` in ContentView is now redundant; it can no
-    /// longer trigger window creation since there is no WindowGroup, but
-    /// removing it keeps the pipeline single-sourced.)
-    func application(_ application: NSApplication, open urls: [URL]) {
-        for url in urls { DocumentWindowCoordinator.shared.open(url: url) }
-    }
-    
-    // MARK: Reopen (dock icon, `open -a`, Spotlight)
-    
-    /// Desired behaviour: clicking the Dock icon while no windows are open
-    /// shows nothing — no settings window, no home window. Returning false
-    /// owns the windowless reopen and blocks both AppKit's and SwiftUI's
-    /// default "create/reopen a WindowGroup window" path.
-    ///
-    /// A document Apple event that follows (drag onto the Dock icon, Open
-    /// With…) is delivered to application(_:open:) independently of this
-    /// return value, so document opens are unaffected.
-    func applicationShouldHandleReopen(_ sender: NSApplication,
-                                       hasVisibleWindows flag: Bool) -> Bool {
-        if flag {
-            return true        // windows exist: default activation is fine
+    /// AppKit menu validation (items auto-enable only if the target allows).
+    /// Same state source as the SwiftUI era: DocumentFocusModel, driven by
+    /// NSWindow key notifications — but read directly, no Observable dance.
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+            case #selector(resetView(_:)),
+                #selector(resetPan(_:)),
+                #selector(resetZoom(_:)),
+                #selector(resetRotation(_:)):
+                return DocumentFocusModel.shared.hasFocusedDocument
+            default:
+                return true
         }
-        return false           // windowless: stay windowless by design
     }
-    
-    // MARK: Lifecycle
-    
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        // Document windows auto-tab (they opt in with `.preferred` plus a shared
-        // tabbingIdentifier). Without this, the system default ("Prefer tabs:
-        // In Full Screen") keeps document windows from ever tabbing. The
-        // Settings window is tagged .disallowed by SettingsWindowTagger.
-        NSWindow.allowsAutomaticWindowTabbing = true
-        
-        // Nothing else: no settings window at launch, and the WindowGroup's
-        // auto-created home window closes itself (DocumentHomeView), so the
-        // app starts windowless — matching the requested behaviour.
-    }
-    
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        false                              // Quick Look companion: stay alive
-    }
-    
 }
-
