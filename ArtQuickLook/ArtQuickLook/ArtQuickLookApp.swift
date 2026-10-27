@@ -186,6 +186,7 @@ enum AppMenuBuilder {
         return mainMenu
     }
     
+    @discardableResult
     private static func add(_ menu: NSMenu, title: String, action: Selector?,
                             key: String = "",
                             modifiers: NSEvent.ModifierFlags = [],

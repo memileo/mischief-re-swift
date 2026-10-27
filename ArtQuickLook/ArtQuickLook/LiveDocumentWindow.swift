@@ -626,6 +626,10 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 800),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered, defer: false)
+        
+        // Call the configuration helper on the window
+        window.configureAsArtDocument(url: url)
+        
         super.init(window: window)
         
         // was .frame(minWidth: 480, minHeight: 360)
@@ -643,5 +647,9 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         // Defer so the controller isn't torn down mid-close.
         DispatchQueue.main.async(execute: onClose)
+    }
+    
+    @objc override func newWindowForTab(_ sender: Any?) {
+        AppController.shared.openDocument(sender)
     }
 }
