@@ -272,8 +272,13 @@ extension Renderer {
             let documentUnits = scale != 0 ? 1 / scale : 1
             let documentFromCanvas: CGAffineTransform
             if cameraTransform.isInvertible {
-                documentFromCanvas = CGAffineTransform(scaleX: documentUnits, y: documentUnits)
-                    .concatenating(cameraTransform.inverted())
+                // viewport px → canvas px via the inverse camera, then ÷ scale → canvas
+                // points (`a.concatenating(b)` applies a first). The ÷scale must come
+                // *after* the camera inverse: `cameraTransform` works in reference
+                // canvas pixels, and dividing before it would bake the raster scale
+                // into the camera, making the paper shift `scale`-times per pan pixel.
+                documentFromCanvas = cameraTransform.inverted()
+                    .concatenating(CGAffineTransform(scaleX: documentUnits, y: documentUnits))
             } else {
                 documentFromCanvas = .identity
             }
