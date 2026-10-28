@@ -789,9 +789,11 @@ extension Renderer {
     
     // MARK: - Cut Application
     internal func applyCutRectCPU(context: CGContext, action: [String: Any], art: ArtParser,
-                                  actionIndex: Int, baseTransform: CGAffineTransform) {
+                                  actionIndex: Int, baseTransform: CGAffineTransform,
+                                  penAffine: CGAffineTransform? = nil) {
         guard let corners = cutRectDeviceCorners(action: action, art: art,
-                                                 actionIndex: actionIndex, baseTransform: baseTransform) else { return }
+                                                 actionIndex: actionIndex, baseTransform: baseTransform,
+                                                 penAffine: penAffine) else { return }
         context.saveGState()
         context.setBlendMode(.clear)
         context.beginPath()

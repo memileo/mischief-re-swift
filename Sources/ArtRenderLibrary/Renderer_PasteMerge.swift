@@ -49,8 +49,9 @@ extension Renderer {
             selectionToDevice = matrix1.inverted().concatenating(pen).concatenating(Ldst).concatenating(B)
         } else if pasteFollowsCut(art: art, layerIndex: targetLayerIndex,
                                   pasteActionIndex: actionIndex, pasteRect: selectionRect) {
-            pen = .identity
-            selectionToDevice = matrix1.inverted().concatenating(B)
+            pen = dstPenAffine // Ensure flip is applied even if paste follows a cut
+            // SelectionToDevice = Pen ∘ Ldst ∘ B
+            selectionToDevice = pen.concatenating(Ldst).concatenating(B)
         } else {
             pen = dstPenAffine
             // Matches actionPasteLayerOps — the layer matrix MUST be included.
@@ -341,10 +342,9 @@ extension Renderer {
                 .concatenating(pen).concatenating(Ldst).concatenating(B)
         } else if pasteFollowsCut(art: art, layerIndex: targetLayerIndex,
                                   pasteActionIndex: actionIndex, pasteRect: selectionRect) {
-            pen = .identity
-            // Free transform: full conjugation through the action-time view.
-            // rotOnlyInverse was only valid at zoom_1 == 1 (where it equals m1⁻¹).
-            selectionToDevice = matrix1.inverted().concatenating(B)
+            pen = dstPenAffine // Ensure flip is applied even if paste follows a cut
+            // SelectionToDevice = Pen ∘ Ldst ∘ B
+            selectionToDevice = pen.concatenating(Ldst).concatenating(B)
         } else {
             pen = dstPenAffine                                    // new-layer paste: sel px ARE layer px,
             // NOTE: actionPasteLayerOps keeps Ldst in this branch — the GPU paste shader
@@ -367,6 +367,13 @@ extension Renderer {
         - sourceToDestinationGPU.b * sourceToDestinationGPU.c
         //        print("CUT/PASTE v7 dstLayer=\(targetLayerIndex) Ldst=\(Ldst)")
         //        print("CUT/PASTE v7 D=\(sourceToDestinationGPU) det=\(detD)")
+        if ProcessInfo.processInfo.environment["ART_TRACE"] == "1" {
+            let s1 = CGPoint(x: 782, y: 388), s2 = CGPoint(x: 950, y: 625)
+            let seg1 = s1.applying(dstPenAffine).applying(Ldst).applying(B)
+            let seg2 = s2.applying(dstPenAffine).applying(Ldst).applying(B)
+            print("TRACE paste: m1=\(matrix1) m2=\(matrix2) pen=\(pen) Ldst=\(Ldst) B=\(B)")
+            print("TRACE paste: D=\(sourceToDestinationGPU) dev(\(s1))=\(seg1.applying(sourceToDestinationGPU)) dev(\(s2))=\(seg2.applying(sourceToDestinationGPU))")
+        }
         guard abs(detD) > 1e-9 else { return [] }
         
         

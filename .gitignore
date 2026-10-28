@@ -55,3 +55,5 @@ art/_ref/ref_b.png
 art/b.art
 art/b-parse.txt
 art/*.png
+art/_ref/ref_y-fliptest-freetransform.png
+art/y-fliptest-freetransform.art

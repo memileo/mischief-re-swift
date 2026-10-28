@@ -382,17 +382,23 @@ public final class Renderer {
                     
                 case "cut":
                     if let rect = parseFloatArray(action["selection_rect"]), rect.count == 4 {
-                        let m1: CGAffineTransform
+                        // selection_rect is recorded in the same action-time frame as
+                        // stroke points (y-up screen at selection time). Map it exactly
+                        // like a point drawn with the current pen: pen affine -> B,
+                        // with the y-flip the device conversion applies. The kernel then
+                        // erases the device pixels whose mapped position falls inside
+                        // the raw rect.
+                        let inverseAffine: CGAffineTransform
                         if let own = parseMatrixRobust(action["matrix_1"]) {
-                            m1 = transformFromMatrix(own.map { $0.map { Float($0) } }, scale: 1.0)
-                        } else if let next = nextPasteViewMatrix(in: art.actions, after: actionIdx) {
-                            m1 = next
+                            inverseAffine = baseTransform.inverted()
+                                .concatenating(transformFromMatrix(own.map { $0.map { Float($0) } }, scale: 1.0))
                         } else {
-                            m1 = .identity  // fallback: treat rect as current device px
-                            print("CUT: no matrix_1 (own or following paste) — rect used as device px")
+                            let penAffine = currentPen.penMatrixAffine ?? .identity
+                            let chain = penAffine.concatenating(baseTransform)
+                            inverseAffine = chain.inverted()
                         }
                         layerOps.append(.cut(meta: CutMeta(
-                            inverseAffine: baseTransform.inverted().concatenating(m1),
+                            inverseAffine: inverseAffine,
                             rect: rect, edgeWidth: 0.75)))
                     }
                     
@@ -560,7 +566,8 @@ public final class Renderer {
                         
                     case "cut":
                         guard let devCorners = cutRectDeviceCorners(
-                            action: action, art: art, actionIndex: actionIdx, baseTransform: artToDevice) else { break }
+                            action: action, art: art, actionIndex: actionIdx, baseTransform: artToDevice,
+                            penAffine: currentPen.penMatrixAffine) else { break }
                         // in-position entry: erases the active record's content drawn before it
                         pendingItems.append(.cut(corners: devCorners))
                         // geometric replication: the cut erases everything below it at
@@ -758,7 +765,8 @@ public final class Renderer {
                     }
                     
                 case "cut":
-                    applyCutRectCPU(context: context, action: action, art: art, actionIndex: actionIdx, baseTransform: artToDevice)
+                    applyCutRectCPU(context: context, action: action, art: art, actionIndex: actionIdx, baseTransform: artToDevice,
+                                    penAffine: currentPen.penMatrixAffine)
                     
                 case "paste_layer":
                     guard let resolved = resolvePasteRender(
@@ -892,7 +900,7 @@ public final class Renderer {
                 case "cut":
                     if !flushRun() { failed = true; break }
                     applyCutRectCPU(context: context, action: action, art: art, actionIndex: actionIdx,
-                                    baseTransform: artToDevice)
+                                    baseTransform: artToDevice, penAffine: currentPen.penMatrixAffine)
                     
                     // flushRun() composite:
                     //                    compositeImageCPU(image: image, erase: r.kind == .erase, into: context)

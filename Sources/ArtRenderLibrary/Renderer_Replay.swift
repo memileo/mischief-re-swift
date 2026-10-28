@@ -304,44 +304,58 @@ extension Renderer {
     
     // MARK: - Action-Time Transform Resolution
     /// Cut rect corners in device y-down space (frame math + y conversion).
+    ///
+    /// A cut without its own `matrix_1` records the rect in the same action-time
+    /// frame as stroke points, so it maps exactly like a point drawn with the
+    /// current pen: pen affine -> baseTransform (-> y-flip conversion).
     internal func cutRectDeviceCorners(action: [String: Any], art: ArtParser,
-                                       actionIndex: Int, baseTransform: CGAffineTransform) -> [CGPoint]? {
+                                       actionIndex: Int, baseTransform: CGAffineTransform,
+                                       penAffine: CGAffineTransform? = nil) -> [CGPoint]? {
         guard let rect = parseFloatArray(action["selection_rect"]), rect.count == 4 else { return nil }
-        let m1: CGAffineTransform
-        if let own = parseMatrixRobust(action["matrix_1"]) {
-            m1 = transformFromMatrix(own.map { $0.map { Float($0) } }, scale: 1.0)
-        } else if let next = nextPasteViewMatrix(in: art.actions, after: actionIndex) {
-            m1 = next
-        } else {
-            m1 = .identity
-            print("CUT: no matrix_1 (own or following paste) — rect used as device px")
-        }
-        let deviceToFrame = baseTransform.inverted().concatenating(m1)
-        let det = deviceToFrame.a * deviceToFrame.d - deviceToFrame.b * deviceToFrame.c
-        guard abs(det) > 1e-12 else { return nil }
-        let frameToDevice = deviceToFrame.inverted()
-        
-        let rectYFlip = verticalFlipTransform(canvasHeight: canvasSize.height * scale)
         let x = CGFloat(rect[0]), y = CGFloat(rect[1]), w = CGFloat(rect[2]), h = CGFloat(rect[3])
-        
-#if os(Linux)
-        if gpExportMode {
-            return [
-                CGPoint(x: x, y: y), CGPoint(x: x + w, y: y),
-                CGPoint(x: x + w, y: y + h), CGPoint(x: x, y: y + h)
-            ].map { $0.applying(frameToDevice).applying(rectYFlip) }
-        } else {
-            return [
-                CGPoint(x: x, y: y), CGPoint(x: x + w, y: y),
-                CGPoint(x: x + w, y: y + h), CGPoint(x: x, y: y + h)
-            ].map { $0.applying(frameToDevice) }
-        }
-#else
-        return [
+        let raw = [
             CGPoint(x: x, y: y), CGPoint(x: x + w, y: y),
             CGPoint(x: x + w, y: y + h), CGPoint(x: x, y: y + h)
-        ].map { $0.applying(frameToDevice).applying(rectYFlip) }
+        ]
+        let rectYFlip = verticalFlipTransform(canvasHeight: canvasSize.height * scale)
+
+        if let own = parseMatrixRobust(action["matrix_1"]) {
+            // Cut carries its own selection-frame matrix: legacy frame math.
+            let m1 = transformFromMatrix(own.map { $0.map { Float($0) } }, scale: 1.0)
+            let deviceToFrame = baseTransform.inverted().concatenating(m1)
+            let det = deviceToFrame.a * deviceToFrame.d - deviceToFrame.b * deviceToFrame.c
+            guard abs(det) > 1e-12 else { return nil }
+            let frameToDevice = deviceToFrame.inverted()
+            return cornersOut(raw.map { $0.applying(frameToDevice) }, actionIndex: actionIndex, raw: raw, m1: m1, rectYFlip: rectYFlip)
+        }
+
+        let pen = penAffine ?? .identity
+        let chain = pen.concatenating(baseTransform)
+        let mapped = raw.map { $0.applying(chain) }
+        // Same device conversion as the legacy branch: the CPU/GP contexts draw
+        // y-down, while the raw rect lives in y-up screen coordinates.
+#if os(Linux)
+        let corners = gpExportMode ? mapped.map { $0.applying(rectYFlip) } : mapped
+#else
+        let corners = mapped.map { $0.applying(rectYFlip) }
 #endif
+        if ProcessInfo.processInfo.environment["ART_TRACE"] == "1" {
+            print("TRACE cut\(actionIndex): pen=\(pen) B=\(baseTransform) raw=\(raw.map { "\($0)" }) corners=\(corners.map { "\($0)" })")
+        }
+        return corners
+    }
+
+    private func cornersOut(_ mapped: [CGPoint], actionIndex: Int, raw: [CGPoint],
+                            m1: CGAffineTransform, rectYFlip: CGAffineTransform) -> [CGPoint] {
+#if os(Linux)
+        let corners = gpExportMode ? mapped.map { $0.applying(rectYFlip) } : mapped
+#else
+        let corners = mapped.map { $0.applying(rectYFlip) }
+#endif
+        if ProcessInfo.processInfo.environment["ART_TRACE"] == "1" {
+            print("TRACE cut\(actionIndex): m1=\(m1) raw=\(raw.map { "\($0)" }) corners=\(corners.map { "\($0)" })")
+        }
+        return corners
     }
     
     /// Paste-mask rect corners in device y-down space (frame math + y conversion + destMap).
