@@ -79,7 +79,7 @@ extension Renderer {
             // Map behaviors for types/subTypes (heuristics)
             if type == 1 {
                 // pencil -> treat as type 2 round shape, full pressure range
-                derivedOpacityMin = 0.16 // 0.44
+                derivedOpacityMin = 0.0 // 0.44 0.16
             } else if type == 0 {
                 // solid
                 if let st = rawSubType {
