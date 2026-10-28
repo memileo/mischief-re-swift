@@ -607,12 +607,16 @@ extension Renderer {
                                                                     isMarker: built.isMarker))))
 
                     case .cut(let meta):
-                        // `buildLayerOperations` stores base⁻¹ ∘ m1; recover m1 so the cut can
-                        // be recomposed against any camera (`a.concatenating(b)` applies a
-                        // first, so m1 = inverseAffine ∘ base).
+                        // Recompose the cut against any camera. `selectionFrame` must be
+                        // the map canvas coords → the rect's frame; the live side appends
+                        // it after `liveBase⁻¹` (= camera⁻¹ ∘ B⁻¹). Both cut flavors satisfy
+                        // that with `B` applied *before* `inverseAffine`
+                        // (`a.concatenating(b)` applies a first):
+                        //   own `matrix_1` cut: `inverseAffine = m1 ∘ B⁻¹` → `B · inverseAffine = m1`;
+                        //   pen-frame cut:      `inverseAffine = pen⁻¹ ∘ B⁻¹` → `B · inverseAffine = pen⁻¹`.
                         cached.append(.cut(
                             rect: [meta.rect.x, meta.rect.y, meta.rect.z, meta.rect.w],
-                            selectionFrame: meta.inverseAffine.concatenating(baseTransform)))
+                            selectionFrame: baseTransform.concatenating(meta.inverseAffine)))
 
                     case .paste(let segments, let color, let isEraser, let isMarker,
                                 let meta, let masks, let sourceToDestination,
