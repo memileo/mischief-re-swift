@@ -17,7 +17,7 @@ final class AppMain {
         let app = NSApplication.shared
         let delegate = AppDelegate()          // stays alive: main() never returns
         app.delegate = delegate
-        app.run()
+        app.run() // Runtime warning: Cannot use Scene methods for URL, NSUserActivity, and other External Events without using SwiftUI Lifecycle. Without SwiftUI Lifecycle, advertising and handling External Events wastes resources, and will have unpredictable results.
     }
 }
 
@@ -30,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // .preferred + a shared tabbingIdentifier). The system default
         // ("Prefer tabs: In Full Screen") would otherwise never tab them.
         NSWindow.allowsAutomaticWindowTabbing = true
+        AppController.shared.showSettingsWindow(nil)
         
         // The menu bar must be in place before the app finishes launching.
         NSApp.mainMenu = AppMenuBuilder.makeMainMenu()
@@ -51,10 +52,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// delivered to application(_:open:) independently of this value.
     func applicationShouldHandleReopen(_ sender: NSApplication,
                                        hasVisibleWindows flag: Bool) -> Bool {
-        if flag {
-            return true        // windows exist: default activation is fine
+        if !flag {
+            // No windows open, show settings window on dock click
+            AppController.shared.showSettingsWindow(nil)
+            return true
+        } else {
+            // Windows are open, default activation behavior is fine
+            return true
         }
-        return false           // windowless: stay windowless by design
     }
     
     /// Quick Look companion: stay alive with no windows.
@@ -220,7 +225,7 @@ final class AppController: NSObject {
             window.tabbingMode = .disallowed          // never joins document tab groups
             window.isReleasedWhenClosed = false       // reuse on next open
             window.setFrameAutosaveName("ArtQuickLookSettings")
-            window.contentView = NSHostingView(rootView: ContentView())
+            window.contentView = NSHostingView(rootView: ContentView()) // Runtime warning: Cannot use Scene methods for URL, NSUserActivity, and other External Events without using SwiftUI Lifecycle. Without SwiftUI Lifecycle, advertising and handling External Events wastes resources, and will have unpredictable results.
             settingsWindow = window
         }
         NSApp.activate(ignoringOtherApps: true)

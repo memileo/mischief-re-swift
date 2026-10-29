@@ -148,7 +148,7 @@ public struct LiveFrameThrottle {
 /// produces a new value, so resets are trivially composable.
 public struct LiveViewTransform: Equatable {
     /// Zoom clamps. 100% == the file's own view matrix (aspect fitted to the view).
-    public static let zoomRange: ClosedRange<CGFloat> = 0.05...64
+    public static let zoomRange: ClosedRange<CGFloat> = 0.001...4096
 
     /// Pan offset in view pixels (y down).
     public private(set) var pan: CGPoint = .zero

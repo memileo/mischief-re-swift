@@ -610,7 +610,7 @@ final class DocumentWindowCoordinator {
         }
         controllers[key] = controller
         NSApp.activate(ignoringOtherApps: true)
-        controller.showWindow(nil)
+        controller.showWindow(nil) // Runtime warning: Cannot use Scene methods for URL, NSUserActivity, and other External Events without using SwiftUI Lifecycle. Without SwiftUI Lifecycle, advertising and handling External Events wastes resources, and will have unpredictable results.
     }
 }
 

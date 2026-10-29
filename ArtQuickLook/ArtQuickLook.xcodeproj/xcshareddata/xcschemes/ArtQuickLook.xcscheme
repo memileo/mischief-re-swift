@@ -56,12 +56,17 @@
          <EnvironmentVariable
             key = "ART_LIVE_BINTIME"
             value = "1"
-            isEnabled = "YES">
+            isEnabled = "NO">
+         </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "ART_LIVE_REBUILD_ALL"
+            value = "1"
+            isEnabled = "NO">
          </EnvironmentVariable>
          <EnvironmentVariable
             key = "ART_LIVE_STROKE_PRUNE"
             value = "0"
-            isEnabled = "YES">
+            isEnabled = "NO">
          </EnvironmentVariable>
          <EnvironmentVariable
             key = "ART_LIVE_TILE_SIZE"
