@@ -161,6 +161,10 @@ public struct LiveCachedLayer {
     /// ~1.0 ms per frame on kaos' 2214 strokes. Exact by construction — same `bounds`.
     public let strokeBounds: [CGRect]
     public let strokeIsMarker: [Bool]
+    /// Segments that belong to `.stroke` ops only (pastes excluded). The GPU binning
+    /// reference buffer holds exactly these, so cache validation must use this count —
+    /// `cachedSegmentCount` includes paste geometry in a mixed layer.
+    public let strokeSegmentCount: Int
     public let hasCut: Bool
     public let hasPaste: Bool
 
@@ -173,6 +177,7 @@ public struct LiveCachedLayer {
         self.needsRebuild = needsRebuild
         var bounds: [CGRect] = []
         var markers: [Bool] = []
+        var strokeSegments = 0
         var cut = false
         var paste = false
         bounds.reserveCapacity(ops.count)
@@ -182,6 +187,7 @@ public struct LiveCachedLayer {
                 case .stroke(let s):
                     bounds.append(s.bounds)
                     markers.append(s.isMarker)
+                    strokeSegments += s.segments.count
                 case .cut:
                     cut = true
                 case .paste:
@@ -190,6 +196,7 @@ public struct LiveCachedLayer {
         }
         self.strokeBounds = bounds
         self.strokeIsMarker = markers
+        self.strokeSegmentCount = strokeSegments
         self.hasCut = cut
         self.hasPaste = paste
     }
@@ -311,8 +318,15 @@ func invert(_ t: CGAffineTransform) -> CGAffineTransform? {
 // MARK: - Per-frame ops
 
 /// A cached op with the camera applied — what the GPU actually rasterises.
+///
+/// `strokeID` is the stroke's index in the layer's reference stroke order (`strokeBounds`
+/// order, which `ensureBinRefState` mirrors). The GPU-binning path bins the whole layer's
+/// strokes in reference space, so a mixed layer needs the range of reference strokes that
+/// each stroke *run* between cuts/pastes covers — the per-tile kernel then renders only
+/// that range over the run's own tile box.
 public enum LiveDeviceOp {
-    case stroke(segments: [GPUSplineSegment], color: SIMD4<Float>, isEraser: Bool, isMarker: Bool)
+    case stroke(segments: [GPUSplineSegment], color: SIMD4<Float>, isEraser: Bool,
+                isMarker: Bool, strokeID: Int)
     case cut(meta: CutMeta)
     case paste(segments: [GPUSplineSegment], color: SIMD4<Float>,
                isEraser: Bool, isMarker: Bool,
@@ -336,7 +350,7 @@ public enum LivePerTileEligibility {
             switch op {
             case .cut, .paste:
                 return false
-            case .stroke(let segments, _, _, let isMarker):
+            case .stroke(let segments, _, _, let isMarker, _):
                 if isMarker { hasMarker = true }
                 if !hasNoise { hasNoise = segments.contains { $0.noiseSeed != 0 } }
             }
@@ -387,10 +401,15 @@ extension LiveRenderCache {
         var ops: [LiveDeviceOp] = []
         ops.reserveCapacity(layer.ops.count)
         let cameraInverse = invert(camera)
+        // Reference stroke ordinal: counts every cached stroke in document order, including
+        // culled ones, so it matches `strokeBounds` / `ensureBinRefState`.
+        var strokeOrdinal = 0
         
         for cached in layer.ops {
             switch cached {
                 case .stroke(let stroke):
+                    let strokeID = strokeOrdinal
+                    strokeOrdinal += 1
                     if let viewport,
                        !Self.intersects(stroke.bounds, camera: camera, viewport: viewport) {
                         continue
@@ -400,7 +419,8 @@ extension LiveRenderCache {
                                                             radiusFactor: radiusFactor),
                                         color: stroke.color,
                                         isEraser: stroke.isEraser,
-                                        isMarker: stroke.isMarker))
+                                        isMarker: stroke.isMarker,
+                                        strokeID: strokeID))
                 case .cut(let rect, let selectionFrame):
                     // `buildLayerOperations` builds cuts against the *base* transform
                     // (no layer matrix), so the live version uses camera ∘ base.

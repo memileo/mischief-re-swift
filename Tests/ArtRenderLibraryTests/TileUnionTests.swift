@@ -454,12 +454,13 @@ final class LiveConfigTests: XCTestCase {
         XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_LIVE_TILE_SIZE": "32"]), 32)
         XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_TILE_SIZE": "32",
                                                               "ART_LIVE_TILE_SIZE": "48"]), 48)
-        // The live composite dispatches whole 16×16 threadgroups per tile, so a tile that
-        // is not a multiple of 16 would read past the per-tile tables (validation: "Invalid
-        // device load" in livePerTileAACompositeKernel). Such values are ignored.
-        XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_LIVE_TILE_SIZE": "8"]), 16)
+        // A tile is a whole number of per-tile threadgroups, so 8 (an 8×8 group, exactly
+        // one tile per group) is valid; anything that is not a whole group — 12, 24, 40 —
+        // would let one group straddle two tiles and corrupt the staged list, so it is
+        // ignored. 8 wins over a larger ART_TILE_SIZE, like any live override.
+        XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_LIVE_TILE_SIZE": "8"]), 8)
         XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_TILE_SIZE": "32",
-                                                              "ART_LIVE_TILE_SIZE": "8"]), 32)
+                                                              "ART_LIVE_TILE_SIZE": "8"]), 8)
         XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_LIVE_TILE_SIZE": "24"]), 16)
         XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_LIVE_TILE_SIZE": "80"]), 16)
         XCTAssertEqual(LiveConfig.liveTileSize(environment: ["ART_LIVE_TILE_SIZE": "16!"]), 16)
@@ -1430,7 +1431,7 @@ final class LivePerTileEligibilityTests: XCTestCase {
                                    opacity0: 1, opacity1: 1,
                                    segmentType: 0, noiseSeed: noise ? 7 : 0)
         return .stroke(segments: [seg], color: SIMD4<Float>(0, 0, 0, 1),
-                       isEraser: false, isMarker: marker)
+                       isEraser: false, isMarker: marker, strokeID: 0)
     }
 
     func testCleanAndNoisyLayersAreEligible() {

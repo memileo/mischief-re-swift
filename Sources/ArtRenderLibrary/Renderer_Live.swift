@@ -254,6 +254,10 @@ extension Renderer {
                 }
                 if layer.hasCut || layer.hasPaste {
                     try mr.renderCachedLayerMixedIntoLiveCanvas(layerOps: deviceOps,
+                                                                cache: cache,
+                                                                position: position,
+                                                                camera: cameraTransform,
+                                                                viewport: viewportRect,
                                                                 width: width, height: height,
                                                                 opacity: layer.opacity)
                 } else {

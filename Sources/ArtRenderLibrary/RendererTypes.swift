@@ -491,17 +491,21 @@ public enum LiveConfig {
     /// `ART_LIVE_TILE_SIZE` → `ART_TILE_SIZE` → 16 (the measured default).
     /// The static path keeps its own default (32); only the live path uses this.
     ///
-    /// Must be a multiple of the 16×16 live threadgroup (16…64). The live composite
-    /// dispatches `ceil(tileSize / 16)` whole threadgroups per tile, but every threadgroup
-    /// is 16×16 pixels: with a tile smaller than the group (8) each group also covers the
-    /// *next* tile, i.e. pixels outside the layer's tile box, and `localTile` then indexes
-    /// past the per-tile tables (`Invalid device load executing kernel function
-    /// "livePerTileAACompositeKernel"`, plus duplicated content next to the box). Values
-    /// that are not a multiple of 16 are ignored (the renderer says so once at launch).
+    /// Must be a whole number of per-tile threadgroups: 8 (one 8×8 group per tile) or a
+    /// multiple of 16 in 16…64, where the group is 16×16 and a tile takes
+    /// `ceil(tileSize / 16)` whole groups per axis. A tile that is not a whole number of
+    /// groups (12, 24, 40) would let one group straddle two tiles: the group stages one
+    /// tile's list into shared memory, so the second tile's pixels would read the first
+    /// tile's list. Values that are not whole groups are ignored (the renderer says so
+    /// once at launch).
     public static func liveTileSize(environment: [String: String]? = nil) -> Int {
         let env = environment ?? ProcessInfo.processInfo.environment
         for key in ["ART_LIVE_TILE_SIZE", "ART_TILE_SIZE"] {
-            if let v = env[key], let n = Int(v), n >= 16, n <= 64, n % 16 == 0 { return n }
+            // The per-tile kernel stages one tile's list per threadgroup, so a tile must
+            // be a whole number of threadgroups: 8 (an 8×8 group) or a multiple of 16 in
+            // 16…64 (one or more 16×16 groups). 24/40/56 are not multiples of 16.
+            if let v = env[key], let n = Int(v),
+               n == 8 || (n % 16 == 0 && n >= 16 && n <= 64) { return n }
         }
         return 16
     }

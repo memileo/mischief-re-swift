@@ -415,7 +415,7 @@ final class LiveProfileTests: XCTestCase {
                         cuts += 1
                     case .paste:
                         pastes += 1
-                    case .stroke(let s, _, _, let isMarker):
+                    case .stroke(let s, _, _, let isMarker, _):
                         strokes += 1
                         segments += s.count
                         if isMarker { markers += 1 }

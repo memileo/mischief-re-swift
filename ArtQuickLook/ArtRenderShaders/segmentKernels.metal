@@ -142,6 +142,7 @@ inline float2 getSplineTangent(float2 p0, float2 p1, float2 p2, float2 p3, float
     return 0.5f * ((-p0 + p2) + 2.0f * (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t + 3.0f * (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t2);
 }
 
+
 // MARK: - Shape 1: Analytical Adaptive Spline
 inline SDFResult sdSplineSegment(float2 p, float2 p0, float2 p1, float2 p2, float2 p3, float ra, float rb) {
     float best_t = 0.0f, min_dist_sq = 1e20f;
@@ -1253,6 +1254,12 @@ struct PerTileParams {
     uint tileSize;
     uint ablate;            // ART_LIVE_ABLATE — counting/time attribution only (0 = normal)
     uint flags;             // bit0 = saturation skip (ART_LIVE_SATURATE=0 turns it off)
+    uint tileGridStride;    // tiles per row of `tileStartCount` (wider than the dispatch
+                            // box when a mixed layer's stroke run renders a sub-box of the
+                            // GPU-binned layer grid; equal to boxTilesPerRow otherwise)
+    uint tileArrayBase;     // this dispatch's box origin inside `tileStartCount`
+    uint strokeLo;          // inclusive reference-stroke range this dispatch composites
+    uint strokeHi;          // (0…UINT_MAX = all strokes: CPU plan and the pure GPU path)
 };
 
 // A stroke's contribution to one pixel is `max` over its segments of `stamped = cov ·
@@ -1330,7 +1337,8 @@ kernel void livePerTileAACompositeKernel(
     uint2 tileID = pixel / params.tileSize;
     tileID.x = min(max(tileID.x, originTile.x), originTile.x + params.boxTilesPerRow - 1u);
     tileID.y = min(max(tileID.y, originTile.y), originTile.y + params.boxTilesPerCol - 1u);
-    uint localTile = (tileID.y - originTile.y) * params.boxTilesPerRow
+    uint localTile = params.tileArrayBase
+                   + (tileID.y - originTile.y) * params.tileGridStride
                    + (tileID.x - originTile.x);
     TileIndex tc = tileStartCount[localTile];
     float2 pos = float2(pixel.x, pixel.y) + float2(0.5f, 0.5f);
@@ -1395,6 +1403,25 @@ kernel void livePerTileAACompositeKernel(
 
         for (uint j = 0; j < n; ++j) {
             uint segIdx = tgSeg[j];              // ascending global index == document order
+            // Mixed-layer GPU-binned runs: a run composites only its own reference-stroke
+            // range. The tile list is ascending by segment index (document order) and
+            // stroke ids are non-decreasing with segment index, so entries below the range
+            // belong to earlier runs (already composited) and are skipped, and the first
+            // entry past it ends this dispatch's work for the pixel.
+            if (gCount == 0u) {
+                uint sId = tgStroke[j];
+                if (sId < params.strokeLo) continue;
+                if (sId > params.strokeHi) {
+                    if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f && (ablate & 4u) == 0u) {
+                        float4 col = strokeColor[curStroke];
+                        perTileCompositeStroke(acc, col, curFlags, curMax * col.a);
+                        modified = true;
+                    }
+                    curStroke = 0xFFFFFFFFu;
+                    curMax = 0.0f;
+                    break;
+                }
+            }
             if (gCount > 0u) {
                 if (segIdx >= nextFirst) {
                     do {
@@ -1530,7 +1557,8 @@ kernel void livePerTileNoiseCompositeKernel(
     uint2 tileID = pixel / params.tileSize;
     tileID.x = min(max(tileID.x, originTile.x), originTile.x + params.boxTilesPerRow - 1u);
     tileID.y = min(max(tileID.y, originTile.y), originTile.y + params.boxTilesPerCol - 1u);
-    uint localTile = (tileID.y - originTile.y) * params.boxTilesPerRow
+    uint localTile = params.tileArrayBase
+                   + (tileID.y - originTile.y) * params.tileGridStride
                    + (tileID.x - originTile.x);
     TileIndex tc = tileStartCount[localTile];
     float2 pos = float2(pixel.x, pixel.y) + float2(0.5f, 0.5f);
@@ -1581,6 +1609,34 @@ kernel void livePerTileNoiseCompositeKernel(
 
         for (uint j = 0; j < n; ++j) {
             uint segIdx = tgSeg[j];
+            // Mixed-layer GPU-binned runs (see the AA kernel): skip earlier runs and stop at
+            // the first entry of a later one, compositing the last stroke of this run.
+            if (gCount == 0u) {
+                uint sId = tgStroke[j];
+                if (sId < params.strokeLo) continue;
+                if (sId > params.strokeHi) {
+                    if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f) {
+                        float4 col = strokeColor[curStroke];
+                        float a;
+                        if (curNoisy) {
+                            float inverted = 1.0f - curMax;
+                            float noiseAdd = (curMax * 0.94f) + noiseVal;
+                            a = (1.0f - saturate(inverted / noiseAdd)) * col.a;
+                        } else {
+                            a = curMax * col.a;
+                        }
+                        if (a > 0.0001f || !curNoisy) {
+                            if (!curNoisy || a > 0.0001f) {
+                                perTileCompositeStroke(acc, col, strokeFlags[curStroke], a);
+                                modified = true;
+                            }
+                        }
+                    }
+                    curStroke = 0xFFFFFFFFu;
+                    curMax = 0.0f;
+                    break;
+                }
+            }
             if (gCount > 0u) {
                 if (segIdx >= nextFirst) {
                     do {

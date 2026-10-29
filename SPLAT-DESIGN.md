@@ -1788,3 +1788,119 @@ metallib matches a fresh build of the sources.
    path, still byte-gated.
 4. Display-link pacing (Round 14, item 1) — unchanged, still needs an interactive A/B.
 
+
+## Round 16 — mixed layers bin on the GPU once; 8×8 tiles
+
+Round 15 ended with two known costs: the mixed path still binned every stroke run on the
+CPU (its open item 1, ~11 ms of `doodle`'s frame), and the per-tile walk was the floor on
+every document. This round removes the first and measures a second, smaller lever.
+
+### One GPU bin per mixed layer, rendered as stroke ranges
+
+`renderCachedLayerMixedIntoLiveCanvas` no longer builds a CPU per-tile plan per stroke run.
+It first splits the layer into `MixedStrokeRun`s — the op range, the reference stroke ids
+it covers, whether it contains noise or chisel-marker strokes — and then, when every run
+can use the same per-tile kernel, calls `prepareMixedGPUBin` **once for the whole layer**:
+the same transform+count → CPU prefix → scatter → chunk sort → merge pipeline the pure
+path uses. Each work item is then encoded in document order into the same command buffer,
+and a run renders as its own sub-rectangle of that layer's tile grid.
+
+Two filters make that exact without re-binning per run:
+
+* `PerTileParams` grew `tileGridStride` and `tileArrayBase`, so a run's dispatch can start
+  inside a wider tile grid than its own box (`localTile = base + y·stride + x`).
+* `strokeLo` / `strokeHi` bound the reference strokes a dispatch may composite. The tile
+  lists are ascending by segment index and stroke ids are non-decreasing with segment
+  index, so a run's strokes are a contiguous slice of every list: entries below the range
+  belong to earlier runs (already composited) and the first entry above it ends the pixel's
+  work for that dispatch, after compositing its last stroke. `LiveDeviceOp.stroke` carries
+  the stroke's reference ordinal (`strokeID`, counting culled strokes, matching
+  `strokeBounds` / `ensureBinRefState`) to derive that range from an op range.
+
+Everything else is unchanged: cuts erase in place, pastes dispatch their destination box,
+merge groups render into the fragment texture and flatten once, and the layer stacks onto
+the canvas at the end — one command buffer, two waits per layer.
+
+A bug this exposed: `ensureBinRefState` validated the reference buffers with
+`cachedSegmentCount`, which includes paste geometry. A mixed layer therefore rebuilt its
+58 k-segment reference buffer **every frame** — ~8 ms hidden inside what the timing calls
+"cull". `LiveCachedLayer.strokeSegmentCount` is the stroke-only count, which is exactly what
+that buffer holds. Cached-vs-rebuild PNGs at zoom 2 and 0.5 are identical for doodle,
+y-flip and cutpaste (the rebuilt path re-derives every op, so a stale reference cannot hide
+there).
+
+Measured warm, 1920×1080, zoom 1:
+
+| document | Round 15 | now |
+|---|---|---|
+| doodle — 1 008 strokes, 90 916 segments, 7 merges | 29 ms (bin 14, gpu 8) | **16–17 ms** (bin 4, gpu 9) |
+| y-fliptest-freetransform | 14–15 ms (bin 6) | **12–13 ms** (bin 4, gpu 7–8) |
+| cutpaste — 2 047 pastes | 177 ms (bin 34, gpu 127) | 179 ms (bin 33, gpu 132) |
+| kaos — no cuts/pastes (control) | 20 ms (bin 1, gpu 19) | 20 ms |
+
+`cutpaste` does not move because it is paste-bound, not stroke-bound: 541 k dispatched tiles
+and 6.9 G per-pixel SDF evaluations come from the paste boxes, not from the two strokes. The
+mixed bin removes the per-run planning; it cannot remove overdraw.
+
+### 8×8 tiles: fewer list entries, four times the lists
+
+A tile must be a whole number of per-tile threadgroups, so the tile size was previously
+16…64. It is now 8 (an 8×8 group, exactly one tile per group) or a multiple of 16 in 16…64
+(one or more 16×16 groups); `perTileThreads` caps the group at 16×16. The staged tile list
+and its barrier still cover exactly one tile, which is the invariant the walk depends on.
+
+The reason to care is the cost model the old comment got wrong. Each pixel walks every
+entry whose *tile* its padded box touches, so the evaluation count scales like
+`(tileSize + pad)²`, not "invariantly": measured on kaos, 32×32 tiles cost 697 M SDF
+evaluations against 303 M at 16×16, and 8×8 costs 168 M. Rendering is byte-identical to the
+16×16 grid on kaos, doodle, cutpaste and y-flip (only the decomposition changes; the walk
+order and prune are untouched).
+
+| document | 16×16 | 8×8 |
+|---|---|---|
+| kaos | 20 ms (gpu 19) | **18 ms** (gpu 16) |
+| doodle | 18 ms (gpu 11) | **16 ms** (gpu 8) |
+| qwerty | 8 ms (gpu 6) | **7 ms** (gpu 5) |
+| logo-sketch_03 — 4 layers | **36 ms** (gpu 30) | 41 ms (gpu 32) |
+
+The multi-layer regression is the sort, not the render: with four times the tiles, layer
+0's chunk count goes 2 834 → 9 936 and its sort 1.7 → 7.7 ms, while `render+comp` *drops*
+11.2 → 9.4 ms. Shrinking the sort chunk (128, 64) and reverting to the heapsort both
+measured worse, because the chunk sort is dispatched per tile slice and small slices are
+all overhead. The default therefore stays 16; `ART_LIVE_TILE_SIZE=8` is a knob for dense
+single-layer views, not a new default.
+
+### Tried and rejected: hoisting the spline coefficients per call
+
+`sdSplineSegment` evaluates the cubic ten times per pixel-entry (7 pre-samples, 2 Newton
+steps, the final point) plus two tangents, and each evaluation rebuilt the four
+Catmull-Rom coefficients. Building them once per call is bit-identical (folding the final
+`0.5f` into the coefficients commutes with rounding, and the association order is
+unchanged), so it was implemented and measured: **no change** on kaos or doodle. The Metal
+compiler already common-subexpressions the control-point combination, so the remaining SDF
+cost is the ten evaluations themselves. Reverted rather than kept as dead complexity; the
+exact way to go faster there is fewer evaluations, which is approximation and off the
+exact list.
+
+### Gates
+
+kaos static byte-identical to `art/kaos.png`; live-vs-static 1 LSB (in practice identical)
+on kaos, doodle, cutpaste, y-flip and b; cached-vs-rebuild identical at zoom 2 and 0.5 for
+doodle, y-flip and cutpaste; `stroke-splat-ab.sh --all` 10/10 identical;
+`stroke-prune-ab.sh --modes 0,1,2` byte-equal on kaos, doodle and cutpaste; the 8×8 grid
+byte-identical to 16×16 on kaos, doodle, cutpaste and y-flip; `swift test` 107 tests /
+4 skipped / 0 failures; Xcode app + extension build; `build-metallib.sh` verifies all 31
+kernels and the installed metallib matches a fresh build of the sources.
+
+### What is left, in order
+
+1. **The chunk sort is O(tiles), not O(entries).** That is what makes 8×8 a loss on
+   multi-layer art (logo layer 0: 1.7 → 7.7 ms) even though it cuts SDF evaluations by
+   45 %. Batching several small chunks per threadgroup, or sorting the concatenated list
+   once, would let 8×8 become the default (logo ≈ 31 → 26 ms of GPU time).
+2. **`cutpaste` paste overdraw** — 541 k dispatched tiles / 6.9 G SDF evaluations for
+   2 047 pastes. Merging non-overlapping pastes per destination box, or tightening the
+   per-dispatch box, is the lever; it is a synthetic stress document.
+3. **Display-link frame pacing** (Round 14, item 1) — unchanged, still needs an
+   interactive A/B and a `CVDisplayLink` shim for the macOS 12 target.
+4. **SDF approximations** — only with an accepted tolerance.

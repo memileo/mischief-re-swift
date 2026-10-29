@@ -78,6 +78,17 @@ struct PerTileParams {
     /// of `cov · opacity`, and both factors are ≤ 1, so once the running max reaches 1 the
     /// rest of that stroke's segments cannot change it (see the kernel's `satCeil`).
     var flags: UInt32
+    /// Tiles per row of the `tileStartCount` grid. Equal to `boxTilesPerRow` for a
+    /// CPU-planned layer box and the pure GPU path; the layer's wider stride when a
+    /// mixed layer renders one stroke run as a sub-box of its GPU-binned layer grid.
+    var tileGridStride: UInt32
+    /// Offset of this dispatch's box inside `tileStartCount`.
+    var tileArrayBase: UInt32
+    /// Inclusive reference-stroke range this dispatch may composite. `0…UInt32.max`
+    /// (all strokes) for the CPU plan and the pure GPU path; a run's stroke range for the
+    /// mixed GPU path, so the shared layer tile list serves every run in document order.
+    var strokeLo: UInt32
+    var strokeHi: UInt32
 }
 
 // Must match `LiveBinTransformParams` in segmentKernels.metal field for field, in order.
@@ -501,14 +512,55 @@ extension MetalRenderer {
         var minTileX = 0, minTileY = 0, boxWidth = 0, boxHeight = 0
     }
 
-    /// One encoded unit of a mixed layer, in document order:
-    /// a per-tile stroke run, a per-stroke fallback, a cut, or a paste.
-    private enum LiveMixedStep {
-        case perTile(PerTilePlan)
-        case stroke(Int)
+    /// One maximal run of stroke ops (a mixed layer's strokes between cuts/pastes), with
+    /// the reference stroke ids it covers. `box*` is filled by `prepareMixedGPUBin` and is
+    /// the tile box this run dispatches over inside the layer's GPU-binned tile grid.
+    private struct MixedStrokeRun {
+        var strokeIDs: [Int] = []
+        var opStart = 0, opEnd = 0
+        var hasNoise = false, hasMarker = false
+        var boxMinX = 0, boxMinY = 0, boxWidth = 0, boxHeight = 0
+        var boxValid = false
+        /// The per-tile kernels can render this run when the chisel marker SDF and the
+        /// noise composite don't collide (same rule as `LivePerTileEligibility`).
+        var perTileEligible: Bool { !(hasMarker && hasNoise) }
+    }
+
+    /// A mixed layer's GPU binning state for one frame: the whole layer is transformed,
+    /// counted, scattered and sorted once; each stroke run then renders its own sub-box of
+    /// that tile grid, restricted to its reference-stroke range (see `PerTileParams`).
+    private struct MixedGPUBin {
+        var ref: LiveBinRefLayer
+        var runs: [MixedStrokeRun]
+        var bp: LiveBinBoxParams
+        var total: Int
+        var boxTiles: Int
+        var boxMinX = 0, boxMinY = 0, boxWidth = 0, boxHeight = 0
+        var finalTileList: MTLBuffer
+        var tileList: MTLBuffer
+        var tileScratch: MTLBuffer
+        var sortChunk = 0
+        var sortChunks: [GpuBinChunk] = []
+        var passUnits: [[GpuBinMergeUnit]] = []
+        var passOffsets: [Int] = []
+        var mergePasses = 0
+    }
+
+    /// A mixed layer's work in document order. Stroke runs and pastes are indices into
+    /// the caller's arrays; cuts carry their metadata.
+    private enum LiveMixedWork {
+        case run(Int)
         case cut(CutMeta)
         case paste(Int)
     }
+
+    /// A stroke run's CPU fallback plan when GPU binning is unavailable.
+    private enum MixedCPURun {
+        case perTile(PerTilePlan)
+        case strokes([Int])
+        case empty
+    }
+
     
     /// Rasterises a **cached** layer for the current camera and stacks it onto the
     /// canvas.
@@ -550,7 +602,7 @@ extension MetalRenderer {
         var perTilePlan: PerTilePlan?
         if Self.perTileEnabled, isPerTileEligible(layerOps) {
             let needsNoise = layerOps.contains {
-                if case .stroke(let segs, _, _, _) = $0 { return segs.contains { $0.noiseSeed != 0 } }
+                if case .stroke(let segs, _, _, _, _) = $0 { return segs.contains { $0.noiseSeed != 0 } }
                 return false
             }
             let pipelineAvailable = needsNoise
@@ -613,13 +665,22 @@ extension MetalRenderer {
     
     /// Rasterises a cached layer that mixes strokes with cuts and/or pastes.
     ///
-    /// Everything is encoded into **one** command buffer, in document order:
-    /// maximal runs of strokes go through the per-tile plan (or the per-stroke
-    /// fallback), cuts erase in place, pastes dispatch only their destination tile box,
-    /// and merge groups render into the shared fragment texture and flatten once.
-    /// The layer is stacked onto the canvas at the end, so a frame costs a single GPU
-    /// round trip even for documents with thousands of cut/paste actions.
+    /// Everything is encoded into **one** command buffer, in document order: maximal runs
+    /// of strokes render through the GPU-binned per-tile path (or the CPU plan / per-stroke
+    /// fallback), cuts erase in place, pastes dispatch only their destination tile box, and
+    /// merge groups render into the shared fragment texture and flatten once. The layer is
+    /// stacked onto the canvas at the end, so a frame costs a single GPU round trip even
+    /// for documents with thousands of cut/paste actions.
+    ///
+    /// The GPU path bins the layer's strokes **once** (transform + count + scatter + sort)
+    /// and then renders each stroke run as a sub-box of that tile grid, filtered to the
+    /// run's reference-stroke range. That keeps the cuts/pastes interleaved while removing
+    /// the per-run CPU binning (`doodle` spends ~13 ms there, 8 runs around 7 merges).
     func renderCachedLayerMixedIntoLiveCanvas(layerOps: [LiveDeviceOp],
+                                              cache: LiveRenderCache,
+                                              position: Int,
+                                              camera: CGAffineTransform,
+                                              viewport: CGRect,
                                               width: Int, height: Int,
                                               opacity: Float) throws {
         guard let compositePipeline = liveCompositeLayerPipeline else {
@@ -633,53 +694,34 @@ extension MetalRenderer {
 
         var clock = DispatchTime.now().uptimeNanoseconds
         liveStagingUsed = 0
-        var steps: [LiveMixedStep] = []
-        var bins: [LiveStrokeBin] = []
+        var work: [LiveMixedWork] = []
+        var runs: [MixedStrokeRun] = []
         var pastes: [LivePasteBin] = []
-        steps.reserveCapacity(layerOps.count)
+        work.reserveCapacity(layerOps.count)
 
+        // ── 1. Split into runs / cuts / pastes, planning the pastes into the arena.
         var index = 0
         while index < layerOps.count {
             switch layerOps[index] {
                 case .stroke:
                     // Maximal stroke run: one per-tile dispatch instead of one per stroke.
                     var end = index
-                    while end < layerOps.count, case .stroke = layerOps[end] { end += 1 }
-                    let run = Array(layerOps[index..<end])
-                    var handled = false
-                    if Self.perTileEnabled, isPerTileEligible(run) {
-                        let needsNoise = run.contains {
-                            if case .stroke(let segs, _, _, _) = $0 {
-                                return segs.contains { $0.noiseSeed != 0 }
-                            }
-                            return false
-                        }
-                        let pipelineAvailable = needsNoise
-                            ? livePerTileNoiseCompositePipeline != nil
-                            : livePerTileAACompositePipeline != nil
-                        if pipelineAvailable, !(needsNoise && noiseTexture == nil) {
-                            let plan = try buildPerTilePlan(layerOps: run,
-                                                            width: width, height: height)
-                            if !plan.empty { steps.append(.perTile(plan)) }
-                            handled = true
-                        }
+                    var run = MixedStrokeRun()
+                    run.opStart = index
+                    while end < layerOps.count,
+                          case .stroke(let segs, _, _, let marker, let strokeID) = layerOps[end] {
+                        run.strokeIDs.append(strokeID)
+                        if marker { run.hasMarker = true }
+                        if !run.hasNoise { run.hasNoise = segs.contains { $0.noiseSeed != 0 } }
+                        end += 1
                     }
-                    if !handled {
-                        let (runSteps, runBins) = try bin(layerOps: run,
-                                                          width: width, height: height)
-                        let base = bins.count
-                        bins.append(contentsOf: runBins)
-                        for step in runSteps {
-                            switch step {
-                                case .stroke(let i): steps.append(.stroke(base + i))
-                                case .cut(let meta): steps.append(.cut(meta))
-                            }
-                        }
-                    }
+                    run.opEnd = end
+                    runs.append(run)
+                    work.append(.run(runs.count - 1))
                     index = end
 
                 case .cut(let meta):
-                    steps.append(.cut(meta))
+                    work.append(.cut(meta))
                     index += 1
 
                 case .paste(let segments, let color, let isEraser, let isMarker,
@@ -691,10 +733,60 @@ extension MetalRenderer {
                                           sourceToDestination: sourceToDestination,
                                           isMerge: isMerge, mergeID: mergeID,
                                           width: width, height: height) {
-                        steps.append(.paste(pastes.count))
+                        work.append(.paste(pastes.count))
                         pastes.append(bin)
                     }
                     index += 1
+            }
+        }
+
+        // ── 2. GPU bin the whole layer's strokes once, when every run can render through
+        // the same per-tile kernels. Otherwise every run keeps its own CPU plan.
+        let gpuEligible = Self.perTileEnabled && runs.allSatisfy { run in
+            guard run.perTileEligible else { return false }
+            return run.hasNoise
+                ? (livePerTileNoiseCompositePipeline != nil && noiseTexture != nil)
+                : livePerTileAACompositePipeline != nil
+        }
+        var gpuBin: MixedGPUBin?
+        if gpuEligible {
+            // Any allocation/encoding failure falls back to the CPU plan below; a frame
+            // must never fail just because the GPU bin could not be prepared.
+            gpuBin = try? prepareMixedGPUBin(cache: cache, position: position,
+                                             camera: camera, runs: runs,
+                                             width: width, height: height)
+            if let bin = gpuBin { runs = bin.runs }
+        }
+
+        var cpuRuns: [MixedCPURun] = []
+        var bins: [LiveStrokeBin] = []
+        if gpuBin == nil {
+            cpuRuns.reserveCapacity(runs.count)
+            for run in runs {
+                let runOps = Array(layerOps[run.opStart..<run.opEnd])
+                var handled = false
+                if Self.perTileEnabled, isPerTileEligible(runOps) {
+                    let pipelineAvailable = run.hasNoise
+                        ? livePerTileNoiseCompositePipeline != nil
+                        : livePerTileAACompositePipeline != nil
+                    if pipelineAvailable, !(run.hasNoise && noiseTexture == nil) {
+                        let plan = try buildPerTilePlan(layerOps: runOps,
+                                                        width: width, height: height)
+                        cpuRuns.append(plan.empty ? .empty : .perTile(plan))
+                        handled = true
+                    }
+                }
+                if !handled {
+                    let (runSteps, runBins) = try bin(layerOps: runOps,
+                                                      width: width, height: height)
+                    let base = bins.count
+                    bins.append(contentsOf: runBins)
+                    var strokeBins: [Int] = []
+                    for step in runSteps {
+                        if case .stroke(let i) = step { strokeBins.append(base + i) }
+                    }
+                    cpuRuns.append(strokeBins.isEmpty ? .empty : .strokes(strokeBins))
+                }
             }
         }
         liveTiming.binMilliseconds += Self.milliseconds(since: clock)
@@ -702,13 +794,32 @@ extension MetalRenderer {
         try uploadArena(byteCount: liveStagingUsed)
 
         guard let queue = commandQueue,
-              let commandBuffer = queue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+              let commandBuffer = queue.makeCommandBuffer() else {
+            throw MetalRendererError.textureCreationFailed
+        }
+
+        // ── 3. Encode: clear, then the GPU bin's scatter/sort when present, then the
+        // document-ordered work list. The scatter heads need a blit fill before the
+        // compute pass, so that encoder comes first on the command buffer.
+        if let bin = gpuBin, let heads = bin.ref.heads {
+            guard let fill = commandBuffer.makeBlitCommandEncoder() else {
+                throw MetalRendererError.textureCreationFailed
+            }
+            fill.fill(buffer: heads,
+                      range: 0..<(bin.boxTiles * MemoryLayout<UInt32>.size), value: 0)
+            fill.endEncoding()
+        }
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw MetalRendererError.textureCreationFailed
         }
         clock = DispatchTime.now().uptimeNanoseconds
 
         encodeClear(target, encoder: encoder)
+        if let bin = gpuBin {
+            encodeBinScatter(bin: bin, encoder: encoder)
+            encodeBinSort(bin: bin, encoder: encoder)
+        }
+
         var openMergeID: UInt64?
         var openMergeOpacity: Float = 1
 
@@ -718,44 +829,59 @@ extension MetalRenderer {
             try encodeMergeFlush(opacity: openMergeOpacity, encoder: encoder)
         }
 
-        for step in steps {
-            switch step {
-                case .perTile(let plan):
+        func encodePaste(_ i: Int) throws {
+            let paste = pastes[i]
+            if paste.isMerge {
+                if let open = openMergeID, open != paste.mergeID {
                     try flushOpenMerge()
-                    try encodePerTile(plan: plan, encoder: encoder)
+                }
+                if openMergeID == nil {
+                    guard let fragment = mergeFragmentTexture else {
+                        throw MetalRendererError.textureCreationFailed
+                    }
+                    encodeClear(fragment, encoder: encoder)
+                    openMergeID = paste.mergeID
+                    openMergeOpacity = paste.color.w
+                }
+                guard let fragment = mergeFragmentTexture else {
+                    throw MetalRendererError.textureCreationFailed
+                }
+                try encode(paste: paste, width: width, height: height,
+                           target: fragment, alphaOverride: 1.0, encoder: encoder)
+            } else {
+                try flushOpenMerge()
+                try encode(paste: paste, width: width, height: height,
+                           target: target, alphaOverride: nil, encoder: encoder)
+            }
+        }
 
-                case .stroke(let i):
+        for item in work {
+            switch item {
+                case .run(let i):
                     try flushOpenMerge()
-                    try encode(stroke: bins[i], width: width, height: height, encoder: encoder)
+                    if let bin = gpuBin {
+                        try encodeGPURun(runs[i], bin: bin, encoder: encoder)
+                    } else {
+                        switch cpuRuns[i] {
+                            case .perTile(let plan):
+                                try encodePerTile(plan: plan, encoder: encoder)
+                            case .strokes(let strokeBins):
+                                for b in strokeBins {
+                                    try encode(stroke: bins[b], width: width, height: height,
+                                               encoder: encoder)
+                                }
+                            case .empty:
+                                break
+                        }
+                    }
 
                 case .cut(let meta):
                     try flushOpenMerge()
-                    try dispatchLiveCut(meta: meta, width: width, height: height, encoder: encoder)
+                    try dispatchLiveCut(meta: meta, width: width, height: height,
+                                        encoder: encoder)
 
                 case .paste(let i):
-                    let paste = pastes[i]
-                    if paste.isMerge {
-                        if let open = openMergeID, open != paste.mergeID {
-                            try flushOpenMerge()
-                        }
-                        if openMergeID == nil {
-                            guard let fragment = mergeFragmentTexture else {
-                                throw MetalRendererError.textureCreationFailed
-                            }
-                            encodeClear(fragment, encoder: encoder)
-                            openMergeID = paste.mergeID
-                            openMergeOpacity = paste.color.w
-                        }
-                        guard let fragment = mergeFragmentTexture else {
-                            throw MetalRendererError.textureCreationFailed
-                        }
-                        try encode(paste: paste, width: width, height: height,
-                                   target: fragment, alphaOverride: 1.0, encoder: encoder)
-                    } else {
-                        try flushOpenMerge()
-                        try encode(paste: paste, width: width, height: height,
-                                   target: target, alphaOverride: nil, encoder: encoder)
-                    }
+                    try encodePaste(i)
             }
         }
         try flushOpenMerge()
@@ -779,6 +905,369 @@ extension MetalRenderer {
         commandBuffer.waitUntilCompleted()
         liveTiming.gpuMilliseconds += Self.milliseconds(since: clock)
         if let err = commandBuffer.error { throw err }
+    }
+    // MARK: - Mixed-layer GPU binning
+
+    /// GPU-bins every stroke of a mixed layer once for this camera. The result feeds one
+    /// per-tile dispatch per stroke run: each run's box is a sub-rectangle of this layer
+    /// grid and its dispatch is filtered to the run's reference-stroke range.
+    ///
+    /// Returns nil when the layer cannot be binned this frame (no Metal pipelines, no
+    /// on-canvas strokes, allocation failure) — the caller then falls back to the CPU plan.
+    private func prepareMixedGPUBin(cache: LiveRenderCache, position: Int,
+                                    camera: CGAffineTransform,
+                                    runs: [MixedStrokeRun],
+                                    width: Int, height: Int) throws -> MixedGPUBin? {
+        guard LiveConfig.gpuBinEnabled() else { return nil }
+        guard let fusedPipe = liveBinTransformCountPipeline,
+              liveBinScatterPipeline != nil,
+              liveBinMergePassPipeline != nil,
+              liveBinChunkSortBitonicPipeline != nil || liveBinChunkSortPipeline != nil
+        else { return nil }
+        guard position < cache.layers.count, let device = device, let queue = commandQueue else {
+            return nil
+        }
+        let layer = cache.layers[position]
+        guard !layer.needsRebuild else { return nil }
+        let liveTile = liveTileSize
+        guard liveTile >= 8, width > 0, height > 0, !runs.isEmpty else { return nil }
+
+        let (tilesX, tilesY) = GpuBinSpec.tileGrid(viewportWidth: width, viewportHeight: height,
+                                                   tileSize: liveTile)
+        let texW = Float(width), texH = Float(height)
+        let invTile = 1.0 / Float(liveTile)
+
+        // Reference geometry is uploaded once per document/layer; the per-frame cull and
+        // boxes below only touch the CPU-side bounds.
+        let ref = try ensureBinRefState(device: device, docID: ObjectIdentifier(cache),
+                                        layer: layer)
+        guard ref.segCount > 0, ref.strokeCount > 0 else { return nil }
+
+        let mA = Double(camera.a), mB = Double(camera.b)
+        let mC = Double(camera.c), mD = Double(camera.d)
+        let mTX = Double(camera.tx), mTY = Double(camera.ty)
+        var visBytes = [UInt8](repeating: 0, count: ref.strokeCount)
+        var outRuns = runs
+        var inkMinX = Double.greatestFiniteMagnitude, inkMaxX = -Double.greatestFiniteMagnitude
+        var inkMinY = Double.greatestFiniteMagnitude, inkMaxY = -Double.greatestFiniteMagnitude
+        var anyBox = false
+
+        for ri in runs.indices {
+            var rMinX = Double.greatestFiniteMagnitude, rMaxX = -Double.greatestFiniteMagnitude
+            var rMinY = Double.greatestFiniteMagnitude, rMaxY = -Double.greatestFiniteMagnitude
+            for id in runs[ri].strokeIDs where id >= 0 && id < ref.strokeCount {
+                visBytes[id] = 1
+                let bounds = ref.strokeBounds[id]
+                let ax0 = Double(bounds.minX) * mA, ax1 = Double(bounds.maxX) * mA
+                let cy0 = Double(bounds.minY) * mC, cy1 = Double(bounds.maxY) * mC
+                let bx0 = Double(bounds.minX) * mB, bx1 = Double(bounds.maxX) * mB
+                let dy0 = Double(bounds.minY) * mD, dy1 = Double(bounds.maxY) * mD
+                let x00 = ax0 + cy0 + mTX, x10 = ax1 + cy0 + mTX
+                let x11 = ax1 + cy1 + mTX, x01 = ax0 + cy1 + mTX
+                let y00 = bx0 + dy0 + mTY, y10 = bx1 + dy0 + mTY
+                let y11 = bx1 + dy1 + mTY, y01 = bx0 + dy1 + mTY
+                rMinX = min(rMinX, min(min(x00, x10), min(x11, x01)))
+                rMaxX = max(rMaxX, max(max(x00, x10), max(x11, x01)))
+                rMinY = min(rMinY, min(min(y00, y10), min(y11, y01)))
+                rMaxY = max(rMaxY, max(max(y00, y10), max(y11, y01)))
+            }
+            guard rMinX <= rMaxX, rMinY <= rMaxY,
+                  let box = GpuBinSpec.tileBoxForAABB(minX: Float(rMinX), minY: Float(rMinY),
+                                                      maxX: Float(rMaxX), maxY: Float(rMaxY),
+                                                      texW: texW, texH: texH,
+                                                      tilesX: tilesX, tilesY: tilesY,
+                                                      invTile: invTile)
+            else { continue }
+            outRuns[ri].boxMinX = box.minX
+            outRuns[ri].boxMinY = box.minY
+            outRuns[ri].boxWidth = box.maxX - box.minX + 1
+            outRuns[ri].boxHeight = box.maxY - box.minY + 1
+            outRuns[ri].boxValid = true
+            anyBox = true
+            inkMinX = min(inkMinX, rMinX); inkMaxX = max(inkMaxX, rMaxX)
+            inkMinY = min(inkMinY, rMinY); inkMaxY = max(inkMaxY, rMaxY)
+        }
+        guard anyBox,
+              let layerBox = GpuBinSpec.tileBoxForAABB(minX: Float(inkMinX), minY: Float(inkMinY),
+                                                        maxX: Float(inkMaxX), maxY: Float(inkMaxY),
+                                                        texW: texW, texH: texH,
+                                                        tilesX: tilesX, tilesY: tilesY,
+                                                        invTile: invTile)
+        else { return nil }
+        let boxW = layerBox.maxX - layerBox.minX + 1
+        let boxH = layerBox.maxY - layerBox.minY + 1
+        let boxTiles = boxW * boxH
+        guard boxTiles > 0 else { return nil }
+
+        visBytes.withUnsafeBytes { raw in
+            if let src = raw.baseAddress { memcpy(ref.strokeVisible.contents(), src, raw.count) }
+        }
+
+        var needsNoise = false
+        for run in runs where run.hasNoise { needsNoise = true; break }
+        if needsNoise && noiseTexture == nil { return nil }
+
+        let cpuStart = DispatchTime.now().uptimeNanoseconds
+        try ensureBinFrameBuffers(device: device, ref: ref, boxTiles: boxTiles)
+        guard let frameSegs = ref.frameSegments, let ranges = ref.ranges,
+              let counts = ref.counts, let countsStaging = ref.countsStaging,
+              let startsBuf = ref.starts,
+              let tileIndexBuf = ref.tileIndex else { return nil }
+
+        let scaleX = sqrt(camera.a * camera.a + camera.c * camera.c)
+        let scaleY = sqrt(camera.b * camera.b + camera.d * camera.d)
+        let radiusFactor = Float((scaleX + scaleY) / 2.0)
+        var tp = LiveBinTransformParams(
+            segCount: UInt32(ref.segCount),
+            tilesPerRow: UInt32(tilesX), tilesPerCol: UInt32(tilesY),
+            tileSize: UInt32(liveTile),
+            texW: texW, texH: texH, invTile: invTile, radiusFactor: radiusFactor,
+            camA: Float(camera.a), camB: Float(camera.b),
+            camC: Float(camera.c), camD: Float(camera.d),
+            camTX: Float(camera.tx), camTY: Float(camera.ty),
+            noiseLayer: needsNoise ? 1 : 0)
+        var bp = LiveBinBoxParams(
+            segCount: UInt32(ref.segCount),
+            boxMinX: Int32(layerBox.minX), boxMinY: Int32(layerBox.minY),
+            boxW: Int32(boxW), boxH: Int32(boxH),
+            tilesPerRow: UInt32(tilesX))
+
+        // ── CB1: blit-zero counts, fused transform + count, copy counts back for the CPU
+        // prefix. The transform is the only GPU stage whose wait is inside `bin` prep; it
+        // is reported as GPU time like the pure path.
+        let binThreads = MTLSize(width: 256, height: 1, depth: 1)
+        func binGroups(_ n: Int) -> MTLSize {
+            MTLSize(width: (n + 255) / 256, height: 1, depth: 1)
+        }
+        let countBytes = boxTiles * MemoryLayout<UInt32>.size
+        guard let cb1 = queue.makeCommandBuffer(),
+              let zeroEnc = cb1.makeBlitCommandEncoder() else { return nil }
+        zeroEnc.fill(buffer: counts, range: 0..<countBytes, value: 0)
+        zeroEnc.endEncoding()
+        guard let enc1 = cb1.makeComputeCommandEncoder() else { return nil }
+        enc1.setComputePipelineState(fusedPipe)
+        enc1.setBytes(&tp, length: MemoryLayout<LiveBinTransformParams>.stride, index: 0)
+        enc1.setBuffer(ref.refSegments, offset: 0, index: 1)
+        enc1.setBuffer(ref.segStroke, offset: 0, index: 2)
+        enc1.setBuffer(ref.strokeVisible, offset: 0, index: 3)
+        enc1.setBuffer(frameSegs, offset: 0, index: 4)
+        enc1.setBuffer(ranges, offset: 0, index: 5)
+        enc1.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 6)
+        enc1.setBuffer(counts, offset: 0, index: 7)
+        enc1.setBuffer(ref.strokeFlags, offset: 0, index: 8)
+        enc1.dispatchThreadgroups(binGroups(ref.segCount), threadsPerThreadgroup: binThreads)
+        enc1.endEncoding()
+        guard let copyEnc = cb1.makeBlitCommandEncoder() else { return nil }
+        copyEnc.copy(from: counts, sourceOffset: 0, to: countsStaging, destinationOffset: 0,
+                     size: countBytes)
+        copyEnc.endEncoding()
+        let gpuStart = DispatchTime.now().uptimeNanoseconds
+        cb1.commit()
+        cb1.waitUntilCompleted()
+        if let err = cb1.error { throw err }
+        let gpuMillis = Self.milliseconds(since: gpuStart)
+
+        // ── CPU prefix over the tile counts.
+        var countsArr = [UInt32](repeating: 0, count: boxTiles)
+        countsArr.withUnsafeMutableBytes { raw in
+            if let dst = raw.baseAddress { memcpy(dst, countsStaging.contents(), countBytes) }
+        }
+        let (entries, starts, total) = GpuBinSpec.combine(counts: countsArr)
+        liveTiming.inkedTiles += countsArr.reduce(0) { $0 + ($1 > 0 ? 1 : 0) }
+        liveTiming.gpuMilliseconds += gpuMillis
+        guard total > 0 else {
+            liveTiming.binMilliseconds += max(0, Self.milliseconds(since: cpuStart) - gpuMillis)
+            return nil
+        }
+
+        // ── Sort plan + per-frame buffers (same plan as the pure GPU path).
+        if ref.tileListCap < total {
+            let cap = max(total, ref.tileListCap * 2)
+            guard let buf = device.makeBuffer(length: cap * MemoryLayout<UInt32>.size,
+                                              options: .storageModePrivate),
+                  let scratch = device.makeBuffer(length: cap * MemoryLayout<UInt32>.size,
+                                                  options: .storageModePrivate) else {
+                return nil
+            }
+            ref.tileList = buf
+            ref.tileScratch = scratch
+            ref.tileListCap = cap
+        }
+        guard let tileList = ref.tileList, let tileScratch = ref.tileScratch else { return nil }
+
+        let sortChunk = LiveConfig.sortChunkSize()
+        let (sortChunks, _, mergePasses) = GpuBinSpec.chunkTable(entries: entries,
+                                                                 chunkSize: sortChunk)
+        if ref.chunkCap < sortChunks.count {
+            let cap = max(sortChunks.count, max(ref.chunkCap * 2, 1))
+            guard let buf = device.makeBuffer(length: cap * MemoryLayout<GpuBinChunk>.stride,
+                                              options: .storageModeShared) else {
+                return nil
+            }
+            ref.sortChunks = buf
+            ref.chunkCap = cap
+        }
+        sortChunks.withUnsafeBytes { raw in
+            if let src = raw.baseAddress, let dst = ref.sortChunks?.contents() {
+                memcpy(dst, src, raw.count)
+            }
+        }
+        let (passUnits, passOffsets, totalUnits) =
+            GpuBinSpec.mergePlan(entries: entries, mergePasses: mergePasses,
+                                 chunkSize: sortChunk,
+                                 unitSize: LiveConfig.mergeUnitSize())
+        if mergePasses > 0 {
+            guard totalUnits > 0, passUnits.allSatisfy({ !$0.isEmpty }) else { return nil }
+            if ref.unitCap < totalUnits {
+                let cap = max(totalUnits, ref.unitCap * 2)
+                guard let buf = device.makeBuffer(
+                    length: cap * MemoryLayout<GpuBinMergeUnit>.stride,
+                    options: .storageModeShared) else { return nil }
+                ref.sortUnits = buf
+                ref.unitCap = cap
+            }
+            guard let unitBuf = ref.sortUnits else { return nil }
+            let unitBase = unitBuf.contents()
+            for (pass, uns) in passUnits.enumerated() {
+                uns.withUnsafeBytes { raw in
+                    if let src = raw.baseAddress {
+                        memcpy(unitBase.advanced(by: passOffsets[pass]
+                                                    * MemoryLayout<GpuBinMergeUnit>.stride),
+                               src, raw.count)
+                    }
+                }
+            }
+        }
+        let finalTileList: MTLBuffer = (mergePasses == 0 || mergePasses % 2 == 0)
+            ? tileList : tileScratch
+        entries.withUnsafeBytes { raw in
+            if let src = raw.baseAddress {
+                memcpy(tileIndexBuf.contents(), src, raw.count)
+            }
+        }
+        starts.withUnsafeBytes { raw in
+            if let src = raw.baseAddress {
+                memcpy(startsBuf.contents(), src, raw.count)
+            }
+        }
+
+        liveTiming.binMilliseconds += max(0, Self.milliseconds(since: cpuStart) - gpuMillis)
+        // Debug counters: the dispatches cover each visible run's own box.
+        var dispatchedTiles = 0
+        var strokeCount = 0
+        var segmentCount = 0
+        for run in outRuns where run.boxValid {
+            dispatchedTiles += run.boxWidth * run.boxHeight
+            for id in run.strokeIDs where id >= 0 && id < ref.strokeCount {
+                strokeCount += 1
+                segmentCount += ref.strokeSegCounts[id]
+            }
+        }
+        liveTiming.dispatchedTiles += dispatchedTiles
+        liveTiming.sdfEvaluations += total * (liveTile * liveTile)
+        liveTiming.strokes += strokeCount
+        liveTiming.segments += segmentCount
+        return MixedGPUBin(ref: ref, runs: outRuns, bp: bp, total: total,
+                           boxTiles: boxTiles,
+                           boxMinX: layerBox.minX, boxMinY: layerBox.minY,
+                           boxWidth: boxW, boxHeight: boxH,
+                           finalTileList: finalTileList, tileList: tileList,
+                           tileScratch: tileScratch,
+                           sortChunk: sortChunk, sortChunks: sortChunks,
+                           passUnits: passUnits, passOffsets: passOffsets,
+                           mergePasses: mergePasses)
+    }
+
+    /// Scatters the bin's segment ranges into the tile list (unordered; the sort follows).
+    private func encodeBinScatter(bin: MixedGPUBin, encoder: MTLComputeCommandEncoder) {
+        guard let scatterPipe = liveBinScatterPipeline,
+              let ranges = bin.ref.ranges, let starts = bin.ref.starts,
+              let heads = bin.ref.heads else { return }
+        let tileList = bin.tileList
+        encoder.setComputePipelineState(scatterPipe)
+        var bp = bin.bp
+        encoder.setBytes(&bp, length: MemoryLayout<LiveBinBoxParams>.stride, index: 0)
+        encoder.setBuffer(ranges, offset: 0, index: 1)
+        encoder.setBuffer(starts, offset: 0, index: 2)
+        encoder.setBuffer(heads, offset: 0, index: 3)
+        encoder.setBuffer(tileList, offset: 0, index: 4)
+        let groups = MTLSize(width: (bin.ref.segCount + 255) / 256, height: 1, depth: 1)
+        encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
+    /// Restores ascending segment order in every tile slice: chunk sort, then pair merges.
+    private func encodeBinSort(bin: MixedGPUBin, encoder: MTLComputeCommandEncoder) {
+        guard !bin.sortChunks.isEmpty else { return }
+        let ref = bin.ref
+        var sp = LiveBinSortParams(unitCount: UInt32(bin.sortChunks.count),
+                                   runSize: UInt32(bin.sortChunk))
+        encoder.setBytes(&sp, length: MemoryLayout<LiveBinSortParams>.stride, index: 0)
+        encoder.setBuffer(ref.sortChunks, offset: 0, index: 1)
+        encoder.setBuffer(bin.tileList, offset: 0, index: 2)
+        if LiveConfig.sortBitonicEnabled(), let bitonicPipe = liveBinChunkSortBitonicPipeline {
+            encoder.setComputePipelineState(bitonicPipe)
+            encoder.dispatchThreadgroups(MTLSize(width: bin.sortChunks.count, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        } else if let chunkPipe = liveBinChunkSortPipeline {
+            encoder.setComputePipelineState(chunkPipe)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: (bin.sortChunks.count + 255) / 256, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        } else {
+            return
+        }
+        guard let mergePipe = liveBinMergePassPipeline, let sortUnitBuf = ref.sortUnits else {
+            return
+        }
+        for pass in bin.passUnits.indices {
+            let uns = bin.passUnits[pass]
+            let srcBuf: MTLBuffer = (pass % 2 == 1) ? bin.tileScratch : bin.tileList
+            let dstBuf: MTLBuffer = (pass % 2 == 1) ? bin.tileList : bin.tileScratch
+            var mp = LiveBinSortParams(unitCount: UInt32(uns.count),
+                                       runSize: UInt32(bin.sortChunk << pass))
+            encoder.setComputePipelineState(mergePipe)
+            encoder.setBytes(&mp, length: MemoryLayout<LiveBinSortParams>.stride, index: 0)
+            encoder.setBuffer(sortUnitBuf,
+                              offset: bin.passOffsets[pass] * MemoryLayout<GpuBinMergeUnit>.stride,
+                              index: 1)
+            encoder.setBuffer(srcBuf, offset: 0, index: 2)
+            encoder.setBuffer(dstBuf, offset: 0, index: 3)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: (uns.count + 255) / 256, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
+    }
+
+    /// One stroke run of a GPU-binned mixed layer: its own tile box, its reference-stroke
+    /// range, and the AA or noise per-tile kernel.
+    private func encodeGPURun(_ run: MixedStrokeRun, bin: MixedGPUBin,
+                              encoder: MTLComputeCommandEncoder) throws {
+        guard run.boxValid, let frameSegs = bin.ref.frameSegments,
+              let tileIndex = bin.ref.tileIndex,
+              let first = run.strokeIDs.first, let last = run.strokeIDs.last else { return }
+        guard let device = device,
+              ensureEmptyGroupBuffers(device: device, tileCount: bin.boxTiles),
+              let emptyHeader = liveEmptyGroupHeader,
+              let emptyGroups = liveEmptyStrokeGroups else {
+            throw MetalRendererError.bufferCreationFailed
+        }
+        let base = (run.boxMinY - bin.boxMinY) * bin.boxWidth
+                 + (run.boxMinX - bin.boxMinX)
+        try encodePerTileBuffers(segBuffer: frameSegs, segOffset: 0,
+                                 strokeOfSegBuffer: bin.ref.segStroke, strokeOfSegOffset: 0,
+                                 tileStartCountBuffer: tileIndex, tileStartCountOffset: 0,
+                                 tileListBuffer: bin.finalTileList, tileListOffset: 0,
+                                 strokeColorBuffer: bin.ref.strokeColors, strokeColorOffset: 0,
+                                 strokeFlagsBuffer: bin.ref.strokeFlags, strokeFlagsOffset: 0,
+                                 groupHeaderBuffer: emptyHeader,
+                                 strokeGroupsBuffer: emptyGroups,
+                                 boxMinX: run.boxMinX, boxMinY: run.boxMinY,
+                                 boxWidth: run.boxWidth, boxHeight: run.boxHeight,
+                                 containsNoise: run.hasNoise,
+                                 tileGridStride: bin.boxWidth,
+                                 tileArrayBase: base,
+                                 strokeLo: first, strokeHi: last,
+                                 encoder: encoder)
     }
 
     /// Stages one paste op into the arena and bins it into its destination tile box.
@@ -950,7 +1439,7 @@ extension MetalRenderer {
         var strokeFlags: [UInt32] = []
         let liveTile = liveTileSize
         for op in layerOps {
-            if case .stroke(let segs, let color, let isEraser, let isMarker) = op {
+            if case .stroke(let segs, let color, let isEraser, let isMarker, _) = op {
                 let strokeIndex = UInt32(strokeColors.count)
                 strokeColors.append(color)
                 let hasNoise = segs.contains { $0.noiseSeed != 0 }
@@ -1100,6 +1589,10 @@ extension MetalRenderer {
                                       boxMinX: Int, boxMinY: Int,
                                       boxWidth: Int, boxHeight: Int,
                                       containsNoise: Bool,
+                                      tileGridStride: Int? = nil,
+                                      tileArrayBase: Int = 0,
+                                      strokeLo: Int = 0,
+                                      strokeHi: Int = Int(UInt32.max),
                                       encoder: MTLComputeCommandEncoder) throws {
         let liveTile = liveTileSize
         guard liveTile > 0, boxWidth > 0, boxHeight > 0 else {
@@ -1111,7 +1604,11 @@ extension MetalRenderer {
                                    boxTilesPerCol: UInt32(boxHeight),
                                    tileSize: UInt32(liveTile),
                                    ablate: UInt32(LiveConfig.ablate()),
-                                   flags: LiveConfig.saturationSkipEnabled() ? 1 : 0)
+                                   flags: LiveConfig.saturationSkipEnabled() ? 1 : 0,
+                                   tileGridStride: UInt32(tileGridStride ?? boxWidth),
+                                   tileArrayBase: UInt32(tileArrayBase),
+                                   strokeLo: UInt32(strokeLo),
+                                   strokeHi: UInt32(strokeHi))
         if containsNoise {
             guard let pipeline = livePerTileNoiseCompositePipeline else {
                 throw MetalRendererError.pipelineMissing("livePerTileNoiseCompositeKernel")
@@ -1152,12 +1649,13 @@ extension MetalRenderer {
             encoder.setBuffer(strokeGroupsBuffer, offset: 0, index: 8)
             encoder.setTexture(gpuRenderTarget, index: 0)
         }
-        let groupsPerTileX = (liveTile + Int(Self.liveThreads.width) - 1) / Int(Self.liveThreads.width)
-        let groupsPerTileY = (liveTile + Int(Self.liveThreads.height) - 1) / Int(Self.liveThreads.height)
+        let threadDim = perTileThreads
+        let groupsPerTileX = (liveTile + Int(threadDim.width) - 1) / Int(threadDim.width)
+        let groupsPerTileY = (liveTile + Int(threadDim.height) - 1) / Int(threadDim.height)
         let groups = MTLSize(width: boxWidth * groupsPerTileX,
                              height: boxHeight * groupsPerTileY,
                              depth: 1)
-        encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: Self.liveThreads)
+        encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: threadDim)
     }
 
     static func milliseconds(since start: UInt64) -> Double {
@@ -2033,7 +2531,7 @@ extension MetalRenderer {
                                    layer: LiveCachedLayer) throws -> LiveBinRefLayer {
         if liveBinDocID != docID { liveBinLayers.removeAll(); liveBinDocID = docID }
         if let ref = liveBinLayers[layer.layerIndex],
-           ref.docID == docID, ref.segCount == layer.cachedSegmentCount {
+           ref.docID == docID, ref.segCount == layer.strokeSegmentCount {
             return ref
         }
         var segments: [GPUSplineSegment] = []
@@ -2054,7 +2552,7 @@ extension MetalRenderer {
         var bRects: [SIMD4<Float>] = []
         var bMaxR: [Float] = []
         var bMarker: [Bool] = []
-        segments.reserveCapacity(layer.cachedSegmentCount)
+        segments.reserveCapacity(layer.strokeSegmentCount)
         for op in layer.ops {
             guard case .stroke(let s) = op else { continue }
             let sid = UInt32(colors.count)
@@ -2272,6 +2770,15 @@ extension MetalRenderer {
 
     static let liveThreads = MTLSize(width: 16, height: 16, depth: 1)
 
+    /// Threads per group for the per-tile kernels: one thread per tile pixel, capped at
+    /// 16×16. With a 16×16 tile (the default) this is one group per tile; with an 8×8
+    /// tile it is an 8×8 group, so the group's staged tile list and its barrier cover
+    /// exactly its tile. Larger tiles use several 16×16 groups per tile.
+    var perTileThreads: MTLSize {
+        let d = min(liveTileSize, Int(Self.liveThreads.width))
+        return MTLSize(width: d, height: d, depth: 1)
+    }
+
     /// Threadgroups needed for `width` × `height` pixels at `liveThreads`.
     static func liveGroups(width: Int, height: Int) -> MTLSize {
         MTLSize(width: (width + Int(liveThreads.width) - 1) / Int(liveThreads.width),
@@ -2302,7 +2809,7 @@ extension MetalRenderer {
                 case .paste:
                     // Pastes are planned by the mixed renderer; this path never gets them.
                     continue
-                case .stroke(let segments, let color, let isEraser, let isMarker):
+                case .stroke(let segments, let color, let isEraser, let isMarker, _):
                     guard !segments.isEmpty else { continue }
                     liveTiming.strokes += 1
                     liveTiming.segments += segments.count
@@ -2475,12 +2982,13 @@ extension MetalRenderer {
         encoder.setTexture(gpuRenderTarget, index: 0)
         // Dispatch only the stroke's tile box: ceil(tileSize / threadDim) threadgroups per
         // tile, over [minTile…maxTile]. A single-tile stroke yields 1 (never 0).
-        let groupsPerTileX = (liveTile + Int(Self.liveThreads.width) - 1) / Int(Self.liveThreads.width)
-        let groupsPerTileY = (liveTile + Int(Self.liveThreads.height) - 1) / Int(Self.liveThreads.height)
+        let threadDim = perTileThreads
+        let groupsPerTileX = (liveTile + Int(threadDim.width) - 1) / Int(threadDim.width)
+        let groupsPerTileY = (liveTile + Int(threadDim.height) - 1) / Int(threadDim.height)
         let groups = MTLSize(width: (bin.maxTileX - bin.minTileX + 1) * groupsPerTileX,
                              height: (bin.maxTileY - bin.minTileY + 1) * groupsPerTileY,
                              depth: 1)
-        encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: Self.liveThreads)
+        encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: threadDim)
     }
     
     /// Cut dispatch into a caller-supplied encoder.
