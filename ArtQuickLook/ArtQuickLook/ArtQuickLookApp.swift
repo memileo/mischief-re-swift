@@ -123,6 +123,8 @@ enum AppMenuBuilder {
         add(fileMenu, title: "Open .art File…",
             action: #selector(AppController.openDocument(_:)),
             key: "o",  modifiers: .command, target: AppController.shared)
+        add(fileMenu, title: "Open Recent", action: nil, target: nil)
+        
         fileMenu.addItem(.separator())
         add(fileMenu, title: "Close",
             action: #selector(NSWindow.performClose(_:)), key: "w",  modifiers: .command)
@@ -184,8 +186,8 @@ enum AppMenuBuilder {
         let helpMenu = NSMenu(title: "Help")
         helpItem.submenu = helpMenu
         
-//        add(helpMenu, title: "ArtQuickLook Help",
-//            action: #selector(NSApplication.showHelp(_:)))
+        //        add(helpMenu, title: "ArtQuickLook Help",
+        //            action: #selector(NSApplication.showHelp(_:)))
         NSApp.helpMenu = helpMenu
         
         return mainMenu
@@ -199,6 +201,22 @@ enum AppMenuBuilder {
         let item = menu.addItem(withTitle: title, action: action, keyEquivalent: key)
         item.keyEquivalentModifierMask = modifiers
         item.target = target                       // nil = responder chain
+        /// Generates a menu with recently opened documents from the given controller.
+        func recentDocumentsMenu(for controller: AppController) -> NSMenu? {
+            let menu = NSMenu(title: "Recent Documents")
+
+            guard !controller.recentlyOpenedDocuments.isEmpty else { return nil }
+
+            for url in controller.recentlyOpenedDocuments {
+                let item = NSMenuItem()
+                item.title = url.lastPathComponent
+//                item.action = #selector(AppController.openDocument(_:))
+                item.representedObject = url // Pass URL to the action handler
+                menu.addItem(item)
+            }
+            return menu
+        }
+        
         return item
     }
 }
@@ -208,7 +226,29 @@ enum AppMenuBuilder {
 final class AppController: NSObject {
     
     static let shared = AppController()
-    
+
+    private static let maxRecentItems = 10
+    private(set) var recentlyOpenedDocuments: [URL] = []
+
+    /// Adds a URL to the recent documents list.
+    func addRecentDocument(_ url: URL) {
+        // Remove existing entry if present
+        recentlyOpenedDocuments.removeAll { $0 == url }
+        
+        // Insert at the front
+        recentlyOpenedDocuments.insert(url, at: 0)
+
+        // Trim the list if it exceeds max count
+        if recentlyOpenedDocuments.count > Self.maxRecentItems {
+            recentlyOpenedDocuments.removeLast(recentlyOpenedDocuments.count - Self.maxRecentItems)
+        }
+    }
+
+    /// Gets the list of recently opened documents.
+    func getRecentDocuments() -> [URL] {
+        return recentlyOpenedDocuments
+    }
+
     // MARK: Settings window — AppKit-owned singleton
     
     /// Created on first use, kept alive, reused afterwards. Plain AppKit
@@ -242,8 +282,9 @@ final class AppController: NSObject {
         panel.canChooseDirectories = false
         panel.message = "Choose a Mischief .art document"
         panel.allowedContentTypes = [UTType(filenameExtension: "art") ?? .data]
-        panel.begin { response in
+        panel.begin { [weak self] response in
             guard response == .OK, let url = panel.url else { return }
+            self?.addRecentDocument(url)
             DocumentWindowCoordinator.shared.open(url: url)
         }
     }
