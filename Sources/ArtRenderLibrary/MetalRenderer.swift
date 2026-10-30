@@ -100,6 +100,7 @@ class MetalRenderer {
     internal var liveBinChunkSortPipeline: MTLComputePipelineState?
     internal var liveBinChunkSortBitonicPipeline: MTLComputePipelineState?
     internal var liveBinMergePassPipeline: MTLComputePipelineState?
+    internal var liveBinCopyPipeline: MTLComputePipelineState?
     /// Paths for the segment-parallel splat composite (small-stamp regime).
     internal var liveSplatPipeline: MTLComputePipelineState?
     internal var liveSplatCompositePipeline: MTLComputePipelineState?

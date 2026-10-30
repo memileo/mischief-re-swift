@@ -760,7 +760,11 @@ final class GpuBinSpecTests: XCTestCase {
         var running = 0
         for p in 0..<passes {
             XCTAssertEqual(plan.offsets[p], running)
-            XCTAssertFalse(plan.units[p].isEmpty)
+            // Only pairs that actually merge emit units: a pair with an empty B run
+            // (a whole tile carried to the next pass) is moved by the pass's
+            // whole-list copy (`liveBinCopyKernel`), not by a unit. At 8×8 tiles the
+            // old one-copy-unit-per-tile plan was most of the merge dispatch width.
+            for u in plan.units[p] { XCTAssertGreaterThan(Int(u.bLen), 0) }
             for u in plan.units[p] {
                 // Every unit inside its pair, covering [dst, dst+aLen+bLen) exactly
                 // once across the pair's units; each unit bounded by mergeUnitSize.
@@ -805,10 +809,13 @@ final class GpuBinSpecTests: XCTestCase {
             smallCovered += Int(u.partLen)
         }
         XCTAssertEqual(smallCovered, 600)
+        // A tile that fits one chunk needs no merge, so its pass emits no units at all —
+        // the pass's whole-list copy is the only work it does.
         let (e3, _, _) = GpuBinSpec.combine(counts: [40])
         let tiny = GpuBinSpec.mergePlan(entries: e3, mergePasses: 1)
-        XCTAssertEqual(tiny.units[0].count, 1)
-        XCTAssertEqual(tiny.units[0][0].partLen, 40)
+        XCTAssertEqual(tiny.units.count, 1)
+        XCTAssertTrue(tiny.units[0].isEmpty)
+        XCTAssertEqual(tiny.totalUnits, 0)
         // Zero passes → empty plan (chunk sort only, render reads the tile list).
         let empty = GpuBinSpec.mergePlan(entries: entries, mergePasses: 0)
         XCTAssertTrue(empty.units.isEmpty)
@@ -1390,6 +1397,11 @@ final class GpuBinSpecTests: XCTestCase {
             var cur = a, nxt = [UInt32](repeating: 0, count: total)
             let plan = GpuBinSpec.mergePlan(entries: entries, mergePasses: passes)
             for uns in plan.units {
+                // Mirror of the pass's whole-list copy (liveBinCopyKernel): every tile
+                // lands in the destination, merged or not. Units then overwrite the
+                // merged ranges. Without the copy, unmerged tiles stay in the other
+                // buffer and the ping-pong ends up incomplete.
+                nxt = cur
                 for u in uns {
                     coRankMergeUnit(src: cur, dst: &nxt, u: u)
                 }

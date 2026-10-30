@@ -85,6 +85,7 @@ LIVE_KERNELS=(
     liveBinChunkSortV3Kernel
     liveBinChunkSortV4Kernel
     liveBinMergePassV3Kernel
+    liveBinCopyKernel
     liveSplatKernel
     liveSplatCompositeKernel
     liveSplatWriteKernel

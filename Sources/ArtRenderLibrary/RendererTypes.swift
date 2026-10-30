@@ -755,6 +755,11 @@ public enum GpuBinSpec {
     /// same command buffer would read the LAST pass's data and silently mis-sort),
     /// so all passes are uploaded once up front and each dispatch binds its own
     /// offset. Pure integer logic, runs on Linux.
+    /// Merge units for every pass that actually merges. A pair whose B run is empty needs
+    /// no merge — the pass's whole-list copy carries it across the ping-pong — so it emits
+    /// no units. That keeps the plan (and the dispatch width) proportional to the runs
+    /// that really merge rather than to the tile count, which matters as soon as the tile
+    /// grid is fine (8×8 tiles: one copy unit per tile per pass was ~40 k threads/pass).
     public static func mergePlan(entries: [GpuBinTileEntry], mergePasses: Int,
                                  chunkSize: Int = sortChunkSize,
                                  unitSize: Int = mergeUnitSize)
@@ -768,7 +773,7 @@ public enum GpuBinSpec {
         for _ in 0..<mergePasses {
             offsets.append(total)
             var passUnits: [GpuBinMergeUnit] = []
-            for pr in mergePairs(entries: entries, runSize: runSize) {
+            for pr in mergePairs(entries: entries, runSize: runSize) where pr.bLen > 0 {
                 let len = Int(pr.aLen) + Int(pr.bLen)
                 var part = 0
                 while part < len {

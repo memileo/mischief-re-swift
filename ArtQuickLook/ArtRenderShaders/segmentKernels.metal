@@ -1284,6 +1284,62 @@ struct PerTileParams {
 // cursor) lives in registers and carries across chunks, so the output is unchanged.
 #define LIVE_STAGE 128u
 
+// One segment's stamped coverage at one pixel, for every walk and the splat.
+//
+// These used to exist as three verbatim copies: the AA walk, the noise walk's clean
+// branch (its noisy branch is the fourth), and `liveSplatStamped`. The identity gates
+// compare splat vs walk byte-for-byte, so a copy that drifted was a pixel difference, not
+// a compile error. One definition each, inlined at the call site.
+static inline float liveAAStamped(float2 pos, GPUSplineSegment seg) {
+    float signedDist = 1e6f;
+    float t = 0.0f;
+    if (seg.segmentType == 0) {
+        SDFResult res = sdUnevenCapsule(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
+        signedDist = res.dist; t = res.t;
+    } else if (seg.segmentType == 1) {
+        SDFResult res = sdSplineSegment(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+        signedDist = res.dist; t = res.t;
+    } else if (seg.segmentType == 2) {
+        SDFResult res = sdSoftEnvelopeSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+        signedDist = res.dist; t = res.t;
+    }
+    float opacity = mix(seg.opacity0, seg.opacity1, t);
+    float cov = 1.0f - smootherstep(-0.94f, 0.94f, signedDist + 0.5f);
+    return cov * opacity;
+}
+
+// The noisy-stroke coverage (per-stroke noise kernel and the noise-capable walk).
+static inline float liveNoisyStamped(float2 pos, GPUSplineSegment seg) {
+    float signedDist = 1e6f;
+    float t = 0.0f;
+    if (seg.segmentType == 0) {
+        SDFResult res = sdUnevenCapsule(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
+        signedDist = res.dist; t = res.t;
+    } else if (seg.segmentType == 1) {
+        SDFResult res = sdSplineSegment(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+        signedDist = res.dist; t = res.t;
+    } else if (seg.segmentType == 2) {
+        SDFResult res = sdSoftEnvelopeSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+        signedDist = res.dist; t = res.t;
+    }
+    float radius = mix(seg.radius0, seg.radius1, t);
+    float opacity = mix(seg.opacity0, seg.opacity1, t);
+    float dist = signedDist + radius;
+    float nd = dist / (max(radius, 1.0f) * 1.1f);
+    float covPencil = 1.0f;
+    if (nd > 0.08f) {
+        float tSoft = clamp((nd - 0.1f) / 0.9f, 0.0f, 1.0f);
+        float scurve = tSoft * tSoft * (3.0f - 2.0f * tSoft);
+        covPencil = 1.0f - pow(scurve, 0.9f);
+    }
+    float tAir = clamp(nd * 0.8f, 0.0f, 1.0f);
+    float covAirbrush = (1.0f - tAir);
+    covAirbrush = covAirbrush * covAirbrush;
+    float softness = saturate((radius - 4.0f) / 800.0f);
+    float cov = mix(covPencil, covAirbrush, softness);
+    return cov * opacity;
+}
+
 // MARK: - Per-tile AA composite (one dispatch per layer, AA only), stroke-box pruning
 //
 // One pruning block: `GpuBinSpec.pruneBlockSize` (=32) consecutive segments of one
@@ -1472,10 +1528,11 @@ kernel void livePerTileAACompositeKernel(
             uint segLoad = ((ablate & 16u) != 0u) ? 0u : segIdx;   // bit 16: hoistable load address
             GPUSplineSegment seg = segments[segLoad];               // only entries that can paint
 
-            float signedDist = 1e6f;
-            float t = 0.0f;
+            float stamped = 0.0f;
             if ((ablate & 1u) == 0u) {
                 if ((curFlags & 4u) != 0u) {                  // chisel marker stroke
+                    float signedDist;
+                    float t;
                     if (seg.segmentType == 0) {
                         SDFResult res = sdSlantedMarkerStraight(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
                         signedDist = res.dist; t = res.t;
@@ -1483,22 +1540,13 @@ kernel void livePerTileAACompositeKernel(
                         SDFResult res = sdSlantedMarkerSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
                         signedDist = res.dist; t = res.t;
                     }
-                } else if (seg.segmentType == 0) {
-                    SDFResult res = sdUnevenCapsule(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
-                    signedDist = res.dist; t = res.t;
-                } else if (seg.segmentType == 1) {
-                    SDFResult res = sdSplineSegment(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
-                    signedDist = res.dist; t = res.t;
-                } else if (seg.segmentType == 2) {
-                    SDFResult res = sdSoftEnvelopeSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
-                    signedDist = res.dist; t = res.t;
+                    float opacity = mix(seg.opacity0, seg.opacity1, t);
+                    float cov = 1.0f - smootherstep(-0.94f, 0.94f, signedDist + 0.5f);
+                    stamped = cov * opacity;
+                } else {
+                    stamped = liveAAStamped(pos, seg);
                 }
             }
-            float opacity = mix(seg.opacity0, seg.opacity1, t);
-            float edgeWidth = 0.94f;
-            float bias = 0.5f;
-            float cov = 1.0f - smootherstep(-edgeWidth, edgeWidth, signedDist + bias);
-            float stamped = cov * opacity;
             if (stamped > curMax) curMax = stamped;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1710,53 +1758,8 @@ kernel void livePerTileNoiseCompositeKernel(
 
             GPUSplineSegment seg = segments[segIdx];   // only entries that can paint
 
-            float stamped = 0.0f;
-            if (curNoisy) {
-                float signedDist = 1e6f;
-                float t = 0.0f;
-                if (seg.segmentType == 0) {
-                    SDFResult res = sdUnevenCapsule(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
-                    signedDist = res.dist; t = res.t;
-                } else if (seg.segmentType == 1) {
-                    SDFResult res = sdSplineSegment(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
-                    signedDist = res.dist; t = res.t;
-                } else if (seg.segmentType == 2) {
-                    SDFResult res = sdSoftEnvelopeSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
-                    signedDist = res.dist; t = res.t;
-                }
-                float radius = mix(seg.radius0, seg.radius1, t);
-                float opacity = mix(seg.opacity0, seg.opacity1, t);
-                float dist = signedDist + radius;
-                float nd = dist / (max(radius, 1.0f) * 1.1f);
-                float covPencil = 1.0f;
-                if (nd > 0.08f) {
-                    float tSoft = clamp((nd - 0.1f) / 0.9f, 0.0f, 1.0f);
-                    float scurve = tSoft * tSoft * (3.0f - 2.0f * tSoft);
-                    covPencil = 1.0f - pow(scurve, 0.9f);
-                }
-                float tAir = clamp(nd * 0.8f, 0.0f, 1.0f);
-                float covAirbrush = (1.0f - tAir);
-                covAirbrush = covAirbrush * covAirbrush;
-                float softness = saturate((radius - 4.0f) / 800.0f);
-                float cov = mix(covPencil, covAirbrush, softness);
-                stamped = cov * opacity;
-            } else {
-                float signedDist = 1e6f;
-                float t = 0.0f;
-                if (seg.segmentType == 0) {
-                    SDFResult res = sdUnevenCapsule(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
-                    signedDist = res.dist; t = res.t;
-                } else if (seg.segmentType == 1) {
-                    SDFResult res = sdSplineSegment(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
-                    signedDist = res.dist; t = res.t;
-                } else if (seg.segmentType == 2) {
-                    SDFResult res = sdSoftEnvelopeSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
-                    signedDist = res.dist; t = res.t;
-                }
-                float opacity = mix(seg.opacity0, seg.opacity1, t);
-                float cov = 1.0f - smootherstep(-0.94f, 0.94f, signedDist + 0.5f);
-                stamped = cov * opacity;
-            }
+            float stamped = curNoisy ? liveNoisyStamped(pos, seg)
+                                     : liveAAStamped(pos, seg);
             if (stamped > curMax) curMax = stamped;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1791,9 +1794,9 @@ kernel void livePerTileNoiseCompositeKernel(
 // disk. For an exactness proof (why the prune disk equals the walk's contributing set)
 // see SPLAT-DESIGN.md.
 //
-// `liveSplatStamped` is a VERBATIM copy of the walk kernels' inner stamp maths (AA and
-// noisy branches). The identity gates compare splat vs walk byte-for-byte, so any edit
-// here must be mirrored there.
+// Splat coverage is `liveAAStamped` / `liveNoisyStamped` — the same functions the walk
+// kernels call, so splat-vs-walk identity is structural, not a copy that has to be kept
+// in step.
 //
 // `LiveSplatParams` — must match the Swift struct field for field, in order.
 struct LiveSplatParams {
@@ -1810,42 +1813,6 @@ struct LiveSplatParams {
     int  boxPixW;           // boxTilesPerRow * tileSize
     int  boxPixH;
 };
-
-inline float liveSplatStamped(GPUSplineSegment seg, float2 pos, bool noisy) {
-    float signedDist = 1e6f;
-    float t = 0.0f;
-    if (seg.segmentType == 0) {
-        SDFResult res = sdUnevenCapsule(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
-        signedDist = res.dist; t = res.t;
-    } else if (seg.segmentType == 1) {
-        SDFResult res = sdSplineSegment(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
-        signedDist = res.dist; t = res.t;
-    } else if (seg.segmentType == 2) {
-        SDFResult res = sdSoftEnvelopeSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
-        signedDist = res.dist; t = res.t;
-    }
-    if (noisy) {
-        float radius = mix(seg.radius0, seg.radius1, t);
-        float opacity = mix(seg.opacity0, seg.opacity1, t);
-        float dist = signedDist + radius;
-        float nd = dist / (max(radius, 1.0f) * 1.1f);
-        float covPencil = 1.0f;
-        if (nd > 0.08f) {
-            float tSoft = clamp((nd - 0.1f) / 0.9f, 0.0f, 1.0f);
-            float scurve = tSoft * tSoft * (3.0f - 2.0f * tSoft);
-            covPencil = 1.0f - pow(scurve, 0.9f);
-        }
-        float tAir = clamp(nd * 0.8f, 0.0f, 1.0f);
-        float covAirbrush = (1.0f - tAir);
-        covAirbrush = covAirbrush * covAirbrush;
-        float softness = saturate((radius - 4.0f) / 800.0f);
-        float cov = mix(covPencil, covAirbrush, softness);
-        return cov * opacity;
-    }
-    float opacity = mix(seg.opacity0, seg.opacity1, t);
-    float cov = 1.0f - smootherstep(-0.94f, 0.94f, signedDist + 0.5f);
-    return cov * opacity;
-}
 
 // One thread per reference segment. Segments outside this batch's visible-ordinal range
 // return immediately, so one dispatch per batch re-reads the whole segment buffer; that
@@ -1911,7 +1878,7 @@ kernel void liveSplatKernel(
         for (int px = x0; px <= x1; ++px) {
             float2 pos = float2(float(px), float(py)) + float2(0.5f, 0.5f);
             if (liveSegPruned(pos, a, b, prune * prune)) continue;
-            float stamped = liveSplatStamped(s, pos, noisy);
+            float stamped = noisy ? liveNoisyStamped(pos, s) : liveAAStamped(pos, s);
             if (!(stamped > 0.0f)) continue;    // 0 adds nothing to the max
             uint idx = uint(py - p.originPxY) * uint(p.boxPixW) + uint(px - p.originPxX);
             // Slot-major (slot * pixelCount + idx): a segment's inner loop walks
@@ -2359,6 +2326,26 @@ struct LiveBinMergeUnit {
     uint part;
     uint partLen;
 };
+
+// Carries a tile list between the sort's ping-pong buffers.
+//
+// Every merge pass moves the whole list from one buffer to the other: a tile that needs
+// no merge still has to end up in the pass's destination. Encoding that as merge "units"
+// with an empty B run (the pre-Round-17 plan) made the plan's size and the dispatch width
+// scale with the tile count — at 8×8 tiles that was ~40 k copy threads per pass versus a
+// handful of real merges. This is one coalesced pass over the list instead, and the
+// merge units now exist only for pairs that actually merge. It runs before the pass's
+// merge dispatches in the same encoder, so a merged range simply overwrites the copy of
+// itself that was just written.
+kernel void liveBinCopyKernel(
+    const device uint *src [[buffer(0)]],
+    device uint *dst [[buffer(1)]],
+    constant uint &count [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= count) return;
+    dst[gid] = src[gid];
+}
 
 // One partitioned merge over the CPU-built unit table: one thread per unit, each
 // owning at most `mergeUnitSize` outputs. The thread locates its input split with a

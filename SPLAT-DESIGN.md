@@ -1904,3 +1904,138 @@ kernels and the installed metallib matches a fresh build of the sources.
 3. **Display-link frame pacing** (Round 14, item 1) — unchanged, still needs an
    interactive A/B and a `CVDisplayLink` shim for the macOS 12 target.
 4. **SDF approximations** — only with an accepted tolerance.
+
+## Round 17 — the merge pass pays for merges, not for tiles
+
+Round 16 left one lever open: the sort's cost grew with the tile count, which is why 8×8
+was a loss on multi-layer art (logo layer 0: 1.7 → 7.7 ms) even though it cuts SDF
+evaluations by 45 %. This round attributes that cost and removes it, then folds the sort
+plumbing both GPU paths had duplicated into one place.
+
+### Attribution: the plan, not the merge work
+
+A temporary ablation knob (`ART_LIVE_SORT_ABLATE`, since removed) skipped the chunk sort
+(bit 0) and the merge passes (bit 1) on logo at 8×8: the chunk sort was 0.65 ms, the merge
+passes ~7.9 ms of the 8.6 ms sort. The product is ~190 k tile-list entries per pass and
+three passes; a merge of that much data is not 8 ms of work on this GPU.
+
+The shape of the plan was. `mergePlan` emitted one unit for *every* pair `mergePairs`
+produced, including pairs whose B run was empty (`bLen == 0`). Those units just copy a
+finished tile into the next ping-pong buffer, and at 8×8 there are ~17.6 k tiles per pass,
+so three passes dispatched ~40 k such copy threads — each doing a co-rank binary search,
+like a real merge unit. A unit-size sweep (64…1024) moved the sort between 14.5 ms and
+6.0 ms with the best at 128–512: 64 was pathological, and no unit size came close to
+proportional, because the units were doing the ping-pong bookkeeping tile by tile.
+
+### One copy per pass, units only where runs merge
+
+`liveBinCopyKernel` copies the whole tile list from the pass's source to its destination
+in one coalesced dispatch; `mergePlan` now emits units only for pairs with `bLen > 0`. A
+merged range overwrites the copy of itself, and a tile that needs no merge simply stays
+where the copy put it. The pass's cost is O(entries) bytes copied plus O(entries that
+merge) serial-merge work, and the plan — and therefore the dispatch width — grows with the
+runs that really merge, not with the tile grid.
+
+Strict tileList/scratch alternation is unchanged: src is never dst, so a merge can never
+clobber unread input. The copy is encoded before the pass's merge dispatch in the same
+compute encoder, which is the same execution-order assumption the existing
+scatter → sort → render sequence already relies on. No pads or literals are written; the
+output is still a permutation of the input.
+
+Logo layer 0 sort (warm, 1920×1080, zoom 1):
+
+| grid | Round 16 | now |
+|---|---|---|
+| 16×16 (4 480 tiles, 2 834 chunks) | 1.67 ms | 1.65–1.79 ms |
+| 8×8 (17 653 tiles, 9 936 chunks) | 7.7–8.6 ms | **3.6–3.7 ms** |
+
+Of the remaining 3.65 ms at 8×8, ~0.95 ms is the chunk sort and ~2.7 ms is copy + merges.
+Frame totals are noisier than the stage split and move ±2 ms between runs on this machine;
+repeated runs now put logo at 38–41 ms on 8×8 and 40–42 ms on 16×16 (Round 16 recorded
+36 ms for 16×16; the sort is unchanged within noise, so that difference is run variance,
+not this round).
+
+### 8×8 is still a knob, not the default
+
+With the tile-count term gone, 8×8 is now neutral on multi-layer art at zoom 1 and a win
+on dense single-layer art:
+
+| document, zoom 1 | 16×16 | 8×8 |
+|---|---|---|
+| kaos — 321 k segments | 21–22 ms | **18–19 ms** |
+| doodle | 17–19 ms | **15–18 ms** |
+| qwerty | 9 ms | 9 ms |
+| logo-sketch_03 — 4 layers | 40–42 ms | 38–41 ms |
+| cutpaste — paste-bound | 173–175 ms | 173–174 ms |
+
+It still loses where the ink covers the whole tile grid, because smaller tiles buy no SDF
+savings but add per-tile overhead: zooms 2 put logo at 48 vs 44 ms and kaos at 21 vs 18 ms
+(doodle ties). Zoomed out, single-layer documents win big (kaos 11 vs 14 ms, doodle 14 vs
+17 ms), but the multi-layer CPU bin scales with the tile count — logo at zoom 0.5 pays
+10 ms of `bin` on 10 596 tiles against 3 ms on 2 857, with identical 32 ms GPU time, for
+49 vs 39 ms total. The default therefore stays **16**; `ART_LIVE_TILE_SIZE=8` is the knob
+for dense single-layer views and zoomed-out work, and no longer a sort regression.
+
+### One sort plan for both GPU paths
+
+The pure path (`renderCachedLayerGPUThrowing`) and the mixed-layer path
+(`prepareMixedGPUBin`) built and encoded the same chunk table, merge plan and five
+dispatches twice. They now share:
+
+* `LiveBinSortPlan` — chunks, per-pass real-merge units + offsets, chunk size, merge count,
+  and which buffer the ping-pong leaves the ordered list in (`finalTileList`);
+* `makeBinSortPlan` — chunk table, all-passes-concatenated unit upload, final-buffer parity
+  (the pure path still reports its allocation window separately for `BINTIME`);
+* `encodeBinScatter`, `encodeBinChunkSort`, `encodeBinMergePass`, `encodeBinOrder`.
+
+`MixedGPUBin` shrank to `sortPlan` plus the two list buffers; the pure path's local
+closures are one-line calls into the shared encoders (the `BINTIME` form keeps its
+per-stage waits, `BINCHECK` reads the plan's tables and the pass's units for its mirrors).
+Both GPU-path guards, the startup readiness line and `build-metallib.sh` now require/list
+`liveBinCopyKernel` (32 kernels), since a metallib with merges but no copy would silently
+lose every unmerged tile.
+
+### One definition of a stamp
+
+The same coverage maths existed four times in `segmentKernels.metal`: the AA walk, the
+noise walk's clean branch and noisy branch, and `liveSplatStamped`, which the file itself
+described as a "VERBATIM copy" kept in step by hand. The splat-vs-walk identity gates
+compare bytes, so a drifting copy showed up as a pixel difference, not as a build error.
+
+`liveAAStamped` and `liveNoisyStamped` now hold the only definitions; the AA walk's marker
+branch still selects its own chisel SDF but uses the same coverage tail, and the noise
+walk picks one of the two per stroke. Splat-vs-walk identity is structural now. The
+walk scaffolding above the stamp — threadgroup staging, block-table cursor, stroke
+switching, stroke-range filter, saturation — stays duplicated between the AA and noise
+kernels: the two differ in prune reach and composite rules on every entry, and the
+inlined twins measurably cost nothing (logo `render+comp` 9.6–10.0 ms at 8×8 before and
+after, kaos 17.3 ms), so a flag-driven shared walk is deliberately not taken.
+
+### Gates
+
+kaos static byte-identical to `art/kaos.png`; live-vs-static identical on kaos, doodle,
+logo, cutpaste and y-flip; cached-vs-rebuild identical at zoom 2 and 0.5 for kaos, logo and
+doodle; `stroke-splat-ab.sh --all` 10/10 identical; `stroke-prune-ab.sh --modes 0,1,2`
+byte-equal on kaos and logo; the 8×8 grid byte-identical to 16×16 on kaos, logo and doodle;
+`swift test` 107 tests / 4 skipped / 0 failures (the merge-plan and chunk-sort mirrors now
+apply the whole-list copy and expect units only for real merges); Xcode app + extension
+build; `build-metallib.sh` verifies all 32 kernels and the installed metallib matches a
+fresh build of the sources. After the stamp consolidation the full set was re-run,
+including noise/marker documents (`b`, `dab`, `marker`, `shapes`, `multiply`): all
+identical. `tiles` / `chunks` / `sdf` counters are unchanged for a given tile size: this
+round changes the shape of the sort tables and the memory movement, not what is rendered.
+
+### What is left, in order
+
+1. **Merge dispatch at 8×8** — still ~2.7 ms for logo layer 0 (copy + real merges, three
+   passes). Batching several units per thread, or one threadgroup per merged run, would
+   matter if 8×8 ever becomes the default.
+2. **CPU `bin` prefix scales with the tile count** — logo at zoom 0.5: 10 ms on 10 596
+   tiles vs 3 ms on 2 857. A prefix/scatter pass that does not walk every tile on the CPU
+   is the prerequisite for a fine default grid on multi-layer art.
+3. **Display-link frame pacing** (Round 14, item 1) — unchanged, still needs an
+   interactive A/B and a `CVDisplayLink` shim for the macOS 12 target.
+4. **SDF approximations** — only with an accepted tolerance.
+5. **`cutpaste` paste overdraw** — 541 k dispatched tiles / 6.9 G SDF evaluations for
+   2 047 pastes. Merging non-overlapping pastes per destination box, or tightening the
+   per-dispatch box, is the lever; it is a synthetic stress document.
