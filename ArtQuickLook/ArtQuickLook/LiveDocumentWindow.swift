@@ -323,6 +323,7 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
         
         framebufferOnly = true
         colorPixelFormat = .bgra8Unorm
+        colorspace = nil
         clearColor = MTLClearColorMake(0.11, 0.11, 0.12, 1)
         autoResizeDrawable = true
         enableSetNeedsDisplay = true
