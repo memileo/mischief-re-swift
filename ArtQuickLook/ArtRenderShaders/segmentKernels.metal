@@ -994,6 +994,39 @@ static inline bool liveSegPruned(float2 p, float2 a, float2 b, float r2) {
     return cr * cr > r2 * bb;
 }
 
+// Squared point-to-segment distance, used by the noise kernel's staged tile ceiling
+// (one evaluation per entry, not per pixel).
+static inline float liveSegmentDistSq(float2 p, float2 a, float2 b) {
+    float2 pa = p - a;
+    float2 ba = b - a;
+    float bb = dot(ba, ba);
+    float pb = dot(pa, ba);
+    if (pb <= 0.0f) return dot(pa, pa);
+    if (pb >= bb) { float2 q = pa - ba; return dot(q, q); }
+    float cr = ba.x * pa.y - ba.y * pa.x;
+    return (cr * cr) / bb;
+}
+
+// Conservative upper bound on the noise coverage at `nd`, used to skip an entry's SDF
+// when even that bound cannot beat the stroke's running max. The kernel's coverage is
+//   cov = mix(1 - scurve(nd)^0.9, (1 - clamp(0.8·nd))², softness(radius)),
+// with softness ∈ [0,1]. `scurve^0.9 ≥ scurve` on [0,1], so the pencil term is at most
+// `1 - scurve`; a mix of two values is at most their max. Both terms are non-increasing
+// in nd, so evaluating them at a *lower* bound on nd over-estimates the coverage.
+static inline float liveNoiseCovUB(float nd) {
+    float tSoft = clamp((nd - 0.1f) / 0.9f, 0.0f, 1.0f);
+    float covPencil = 1.0f - tSoft * tSoft * (3.0f - 2.0f * tSoft);
+    float tAir = clamp(nd * 0.8f, 0.0f, 1.0f);
+    float covAir = (1.0f - tAir) * (1.0f - tAir);
+    return max(covPencil, covAir);
+}
+
+// The AA twin: `cov = 1 − smootherstep(−0.94, 0.94, sd + 0.5)` is non-increasing in the
+// signed distance, so evaluating it at a lower bound on sd upper-bounds the coverage.
+static inline float liveAACovUB(float sd) {
+    return 1.0f - smootherstep(-0.94f, 0.94f, sd + 0.5f);
+}
+
 // Device-space prune margin for the noise kernels (mirror of
 // `SegmentPrune.noiseDeviceMargin` in RendererTypes.swift). The noise coverage falls to
 // zero at `1.375·max(radius, 1)` from the shape: 0.375·r for a thick stroke, and up to
@@ -1380,6 +1413,7 @@ kernel void livePerTileAACompositeKernel(
     threadgroup uint  tgStroke[LIVE_STAGE];
     threadgroup float tgPad2[LIVE_STAGE];
     threadgroup float4 tgChord[LIVE_STAGE];
+    threadgroup uchar tgOpMax[LIVE_STAGE];   // max(op0,op1)·255, rounded down; 255 = >1
     uint w = target.get_width();
     uint h = target.get_height();
     uint2 originTile = uint2(params.tileOriginX, params.tileOriginY);
@@ -1454,6 +1488,10 @@ kernel void livePerTileAACompositeKernel(
             float pruneRadius = (st.padding1 != 0u)
                 ? as_type<float>(st.padding1) + 0.5f : 3.4e38f;
             tgPad2[t] = pruneRadius * pruneRadius;
+            // Per-entry ceiling for the max-only walk (see the skip below).
+            float opMax = max(st.opacity0, st.opacity1);
+            tgOpMax[t] = (opMax > 1.0f)
+                ? 255u : (uchar)min(254.0f, floor(opMax * 255.0f));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1515,6 +1553,12 @@ kernel void livePerTileAACompositeKernel(
                 }
             }
             if (!strokeActive) continue;    // box-missed block: every segment stamps nothing
+            // Exact per-entry max ceiling (see tgOpMax): this segment's stamped value can
+            // never beat max(op0,op1), so a max that already reached it is final for this
+            // entry — skip the prune and the SDF without changing the result.
+            uint opByte = tgOpMax[j];
+            if (opByte != 255u &&
+                curMax >= float(opByte + 1u) * (1.0f / 255.0f)) continue;
             if (curMax >= satCeil) continue;    // saturated stroke: this pixel's max is final
 
             // Prune from the staged record: the entry's chord and prune radius² are already
@@ -1594,6 +1638,8 @@ kernel void livePerTileNoiseCompositeKernel(
     threadgroup uint  tgStroke[LIVE_STAGE];
     threadgroup float tgPad2[LIVE_STAGE];
     threadgroup float4 tgChord[LIVE_STAGE];
+    threadgroup uchar tgOpMax[LIVE_STAGE];   // max(op0,op1)·255, rounded down; 255 = >1
+    threadgroup float tgBound[LIVE_STAGE];   // stamped ceiling over this whole tile
     uint w = target.get_width();
     uint h = target.get_height();
     uint2 originTile = uint2(params.tileOriginX, params.tileOriginY);
@@ -1635,23 +1681,57 @@ kernel void livePerTileNoiseCompositeKernel(
     float curMax = 0.0f;
     bool curNoisy = false;
     const float satCeil = PT_SAT_CEIL(params);
+    // Same attribution bits as the AA kernel (ART_LIVE_ABLATE, debug only, wrong pixels):
+    //   1 no SDF, 2 prune all, 4 no composite, 8 no write, 16 constant segment load.
+    const uint ablate = params.ablate;
 
     // Tile-list stage (see LIVE_STAGE); the noise kernel's prune reach is the noise one.
     const uint stageSize = tpg.x * tpg.y;
     const uint stageIndex = tid.x + tid.y * tpg.x;
+    // The staged coverage bound is per (entry, tile), not per pixel: the tile centre plus
+    // its half-diagonal lower-bounds every pixel's chord distance by `d_centre − halfDiag`,
+    // so one bound covers all 256 pixels. Computing it once here instead of per pixel is
+    // what makes the bound affordable (3.7 M evaluations, not 950 M).
+    const float2 stageTileCenter = (float2(tileID) + 0.5f) * float(params.tileSize);
+    const float stageTileSlack = float(params.tileSize) * 0.70710678f;
 
     for (uint base = 0; base < tc.count; base += LIVE_STAGE) {
         const uint n = min(LIVE_STAGE, tc.count - base);
         for (uint t = stageIndex; t < n; t += stageSize) {
             uint si = tileList[tc.start + base + t];
             GPUSplineSegment st = segments[si];
+            uint sid = strokeOfSegment[si];
             tgSeg[t] = si;
-            tgStroke[t] = strokeOfSegment[si];
+            tgStroke[t] = sid;
             tgChord[t] = float4(st.p1, st.p2);
             float pruneRadius = (st.padding1 != 0u)
                 ? as_type<float>(st.padding1) + liveNoisePruneMargin(st.radius0, st.radius1)
                 : 3.4e38f;
             tgPad2[t] = pruneRadius * pruneRadius;
+            // Per-entry ceiling for the max-only walk (see the skip below).
+            float opMax = max(st.opacity0, st.opacity1);
+            tgOpMax[t] = (opMax > 1.0f)
+                ? 255u : (uchar)min(254.0f, floor(opMax * 255.0f));
+            // Stamped ceiling for the whole tile. Every curve point is within `farOff` of
+            // the chord (SegmentPrune.radius's shape term), so the distance from any tile
+            // pixel to the curve is ≥ (centre→chord) − halfDiag − farOff. With
+            // nd = dist/(1.1·max(r,1)) that lower bound gives an upper bound on the noise
+            // coverage; times the entry's opacity ceiling it bounds stamped. Computing it
+            // per tile rather than per pixel costs one sqrt per entry, not per pixel.
+            uint sFlags = strokeFlags[sid];
+            float bound = 1e30f;                      // marker or opacity > 1: no bound
+            if (st.padding1 != 0u && opMax <= 1.0f && (sFlags & 4u) == 0u) {
+                float rMax = max(st.radius0, st.radius1);
+                float farOff = max(0.0f, as_type<float>(st.padding1) - rMax);
+                float dc = sqrt(liveSegmentDistSq(stageTileCenter, st.p1, st.p2));
+                // Lower bound on the distance from any tile pixel to the curve.
+                float distLB = max(0.0f, dc - stageTileSlack - farOff - 0.5f);
+                float covUB = ((sFlags & 2u) != 0u)
+                    ? liveNoiseCovUB(distLB / (1.1f * max(rMax, 1.0f)))
+                    : liveAACovUB(distLB - rMax);
+                bound = covUB * float((uint)tgOpMax[t] + 1u) * (1.0f / 255.0f);
+            }
+            tgBound[t] = bound;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1663,7 +1743,7 @@ kernel void livePerTileNoiseCompositeKernel(
                 uint sId = tgStroke[j];
                 if (sId < params.strokeLo) continue;
                 if (sId > params.strokeHi) {
-                    if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f) {
+                    if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f && (ablate & 4u) == 0u) {
                         float4 col = strokeColor[curStroke];
                         float a;
                         if (curNoisy) {
@@ -1691,7 +1771,7 @@ kernel void livePerTileNoiseCompositeKernel(
                         LiveStrokeGroupBlock g = strokeGroups[gBase + blockCursor];
                         ++blockCursor;
                         if (haveCur && curStroke != g.strokeID) {   // stroke boundary: composite the last
-                            if (curMax >= 0.001f) {
+                            if (curMax >= 0.001f && (ablate & 4u) == 0u) {
                                 float4 col = strokeColor[curStroke];
                                 float a;
                                 if (curNoisy) {
@@ -1724,7 +1804,7 @@ kernel void livePerTileNoiseCompositeKernel(
             } else {
                 uint sId = tgStroke[j];
                 if (sId != curStroke) {
-                    if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f) {
+                    if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f && (ablate & 4u) == 0u) {
                         float4 col = strokeColor[curStroke];
                         float a;
                         if (curNoisy) {
@@ -1750,21 +1830,38 @@ kernel void livePerTileNoiseCompositeKernel(
                 }
             }
             if (!strokeActive) continue;    // box-missed block: every segment stamps nothing
+            // Exact per-entry max ceiling (see tgOpMax): this segment's stamped value can
+            // never beat max(op0,op1), so a max that already reached it is final for this
+            // entry — skip the prune and the SDF without changing the result.
+            uint opByte = tgOpMax[j];
+            if (opByte != 255u &&
+                curMax >= float(opByte + 1u) * (1.0f / 255.0f)) continue;
             if (curMax >= satCeil) continue;    // saturated stroke: this pixel's max is final
+
+            // Staged tile-level ceiling: this entry cannot beat curMax anywhere in the
+            // tile, so the SDF and the fetch below are dead work.
+            if (tgBound[j] <= curMax) continue;
 
             // Prune from the staged record (see the AA kernel): no global fetch on this path.
             float4 chord = tgChord[j];
-            if (liveSegPruned(pos, chord.xy, chord.zw, tgPad2[j])) continue;
+            bool pruned = ((ablate & 2u) != 0u)
+                ? true
+                : liveSegPruned(pos, chord.xy, chord.zw, tgPad2[j]);
+            if (pruned) continue;
 
-            GPUSplineSegment seg = segments[segIdx];   // only entries that can paint
+            uint segLoad = ((ablate & 16u) != 0u) ? 0u : segIdx;
+            GPUSplineSegment seg = segments[segLoad];   // only entries that can paint
 
-            float stamped = curNoisy ? liveNoisyStamped(pos, seg)
-                                     : liveAAStamped(pos, seg);
+            float stamped = 0.0f;
+            if ((ablate & 1u) == 0u) {
+                stamped = curNoisy ? liveNoisyStamped(pos, seg)
+                                   : liveAAStamped(pos, seg);
+            }
             if (stamped > curMax) curMax = stamped;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }   // stage chunk
-    if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f) {
+    if (curStroke != 0xFFFFFFFFu && curMax >= 0.001f && (ablate & 4u) == 0u) {
         float4 col = strokeColor[curStroke];
         if (curNoisy) {
             float inverted = 1.0f - curMax;
@@ -1780,7 +1877,7 @@ kernel void livePerTileNoiseCompositeKernel(
         }
     }
 
-    if (modified && active) target.write(acc, pixel);
+    if (modified && (ablate & 8u) == 0u && active) target.write(acc, pixel);
 }
 
 // MARK: - Splat composite (segment-parallel small-stamp regime)
@@ -2172,20 +2269,22 @@ kernel void liveBinScatterKernel(
 }
 
 // Ascending document order, restored with bounded work per thread (zoom-independent).
-// The CPU splits every tile slice into fixed 512-entry chunks (`GpuBinSpec.chunkTable`);
+// The CPU splits every tile slice into fixed chunks of at most
+// `GpuBinSpec.sortChunkSize` entries (1024; `GpuBinSpec.chunkTable`);
 // one thread heapsorts one chunk in place (`liveBinChunkSortV3Kernel`: no pads, no
 // barriers, no cross-thread cooperation — its failure mode is misordering, never
 // poison), then pairwise merge passes over a tiny CPU-built unit table
-// (`GpuBinSpec.mergePlan`: each pair's output split into ≤1024-entry units, one
-// thread per unit locating its input split with a co-rank binary search, then
+// (`GpuBinSpec.mergePlan`: each pair's output split into `mergeUnitSize`-entry units,
+// one thread per unit locating its input split with a co-rank binary search, then
 // serial-merging only its partition) restore full order. The common case (every tile fits
 // one chunk) needs zero merge passes. The CPU scatter is stable, so sorted-ascending
 // == the exact CPU tile list, which is what makes the per-tile render kernel's
 // stroke grouping correct. Segment indices are unique, so only ascending order
 // matters.
 //
-// Chunk size 512 must match `GpuBinSpec.sortChunkSize` (merge run sizes start at one
-// chunk and double from there).
+// The chunk length and the merge run sizes both arrive in the parameters (the chunk
+// table's `len` and `LiveBinSortParams.runSize`), so no constant here has to match
+// `GpuBinSpec.sortChunkSize` — only the bitonic kernel's `sh[1024]` capacity does.
 
 // `LiveBinSortParams` — must match the Swift struct field for field, in order.
 struct LiveBinSortParams {
@@ -2193,16 +2292,15 @@ struct LiveBinSortParams {
     uint runSize;
 };
 
-// Sort one 512-entry chunk in place with a per-thread heapsort (O(n log n) worst
-// case). Deliberately NO cross-thread cooperation: no threadgroup memory, no pads,
+// Sort one chunk (at most `GpuBinSpec.sortChunkSize` entries) in place with a per-thread
+// heapsort (O(n log n) worst case). Deliberately NO cross-thread cooperation: no threadgroup memory, no pads,
 // no barriers — one thread owns its chunk start to finish, so the kernel can only
 // ever permute the scattered indices, never inject out-of-range values. (A 512-wide
 // cooperative bitonic tried here sorted correctly in review and in the Swift mirror
 // yet emitted UINT_MAX pads into the tile list on-device — BINCHECK attributed;
-// cooperation removed, class of failure removed.) Chunks hold at most 512 entries,
-// so per-thread work stays bounded at any zoom; the pair-parallel merges reassemble
-// full order. Chunk size 512 must match `GpuBinSpec.sortChunkSize` (merge run sizes
-// start at one chunk and double from there).
+// cooperation removed, class of failure removed.) Chunks hold at most
+// `GpuBinSpec.sortChunkSize` entries, so per-thread work stays bounded at any zoom; the
+// pair-parallel merges reassemble full order.
 
 // Max-heap sift-down over `list[0, heapEnd)`: drops `v` from `root` to its heap
 // position. Iterative (no recursion/stack) and in-place — Metal-2 safe.
@@ -2219,9 +2317,9 @@ inline void liveBinSiftDown(device uint *list, uint root, uint v, uint heapEnd) 
     list[root] = v;
 }
 
-// Sort one chunk in place (heapsort via `liveBinSiftDown`). Chunks cover only
-// slices with >= 2 entries and hold at most 512 of them, so per-thread nonlinear
-// work is bounded no matter how far the user zooms out.
+// Sort one chunk in place (heapsort via `liveBinSiftDown`). Chunks cover only slices
+// with >= 2 entries and hold at most `GpuBinSpec.sortChunkSize` of them, so per-thread
+// nonlinear work is bounded no matter how far the user zooms out.
 kernel void liveBinChunkSortV3Kernel(
     constant LiveBinSortParams &p [[buffer(0)]],
     const device uint2 *chunks [[buffer(1)]],

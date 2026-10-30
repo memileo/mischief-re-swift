@@ -126,8 +126,8 @@ struct LiveBinBoxParams {
 
 // Must match `LiveBinSortParams` in segmentKernels.metal field for field, in order.
 // 2×uint = stride 8 on both sides. The chunk-sort dispatch uses `unitCount` as the
-// chunk count (one 512-wide threadgroup each); each merge dispatch reuses it as the
-// pair count, with `runSize` doubling per pass from one sort chunk.
+// chunk count (one threadgroup each); each merge dispatch reuses it as the pair
+// count, with `runSize` doubling per pass from one sort chunk.
 struct LiveBinSortParams {
     var unitCount: UInt32
     var runSize: UInt32
@@ -2475,9 +2475,9 @@ extension MetalRenderer {
             tRender = try sync(cbR)
             liveTiming.gpuMilliseconds += tScatter + tSort + tRender
             if stageTiming {
-                print(String(format: "livebin layer %d: segs %d tiles %d chunks %d passes %d — xform %.2f scatter %.2f sort %.2f render+comp %.2f ms",
-                             position, ref.segCount, boxTiles, sortPlan.chunks.count,
-                             sortPlan.mergePasses,
+                print(String(format: "livebin layer %d: segs %d entries %d tiles %d chunks %d passes %d %@ — xform %.2f scatter %.2f sort %.2f render+comp %.2f ms",
+                             position, ref.segCount, total, boxTiles, sortPlan.chunks.count,
+                             sortPlan.mergePasses, needsNoise ? "noise" : "aa",
                              tXform, tScatter, tSort, tRender))
             }
             liveTiming.dispatchedTiles += boxTiles

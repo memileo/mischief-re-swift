@@ -676,33 +676,32 @@ final class GpuBinSpecTests: XCTestCase {
         // chunk-sort kernel reads — same two-UInt32 layout, stride 8.
         XCTAssertEqual(MemoryLayout<GpuBinChunk>.stride, 8)
         XCTAssertEqual(MemoryLayout<GpuBinChunk>.size, 8)
-        XCTAssertEqual(GpuBinSpec.sortChunkSize, 512)
-        // Counts [600, 100, 0, 1, 2000]: tiles 1 and 3 need no merge, tile 0 needs
-        // 2 chunks (1 pass), tile 4 needs 4 chunks (2 passes).
+        XCTAssertEqual(GpuBinSpec.sortChunkSize, 1024)
+        // Counts [600, 100, 0, 1, 2000]: tiles 0, 1 and 3 each fit one chunk (no
+        // merge), tile 4 needs 2 chunks (1 pass).
         let (entries, _, _) = GpuBinSpec.combine(counts: [600, 100, 0, 1, 2000])
         let (chunks, maxChunks, passes) = GpuBinSpec.chunkTable(entries: entries)
-        XCTAssertEqual(chunks.count, 2 + 1 + 4)
-        XCTAssertEqual(maxChunks, 4)
-        XCTAssertEqual(passes, 2)
+        XCTAssertEqual(chunks.count, 1 + 1 + 2)
+        XCTAssertEqual(maxChunks, 2)
+        XCTAssertEqual(passes, 1)
         // Chunks tile tile 0's slice [0, 600) then tile 1's [600, 700), etc.
-        XCTAssertEqual(chunks[0].start, 0); XCTAssertEqual(chunks[0].len, 512)
-        XCTAssertEqual(chunks[1].start, 512); XCTAssertEqual(chunks[1].len, 88)
-        XCTAssertEqual(chunks[2].start, 600); XCTAssertEqual(chunks[2].len, 100)
-        XCTAssertEqual(chunks[3].start, 701); XCTAssertEqual(chunks[3].len, 512)
-        XCTAssertEqual(chunks[6].start, 701 + 512 * 3); XCTAssertEqual(chunks[6].len, 2000 - 512 * 3)
+        XCTAssertEqual(chunks[0].start, 0); XCTAssertEqual(chunks[0].len, 600)
+        XCTAssertEqual(chunks[1].start, 600); XCTAssertEqual(chunks[1].len, 100)
+        XCTAssertEqual(chunks[2].start, 701); XCTAssertEqual(chunks[2].len, 1024)
+        XCTAssertEqual(chunks[3].start, 1725); XCTAssertEqual(chunks[3].len, 976)
         for c in chunks { XCTAssertLessThanOrEqual(Int(c.len), GpuBinSpec.sortChunkSize) }
         // Nothing sortable → no chunks, no passes (sort dispatches skipped entirely).
         let (e2, _, _) = GpuBinSpec.combine(counts: [0, 1, 1, 0])
         let (ch2, mx2, p2) = GpuBinSpec.chunkTable(entries: e2)
         XCTAssertTrue(ch2.isEmpty); XCTAssertEqual(mx2, 0); XCTAssertEqual(p2, 0)
         // Exact multiple of the chunk size: no short tail, passes still ceil(log2).
-        let (e3, _, _) = GpuBinSpec.combine(counts: [1024])
+        let (e3, _, _) = GpuBinSpec.combine(counts: [2048])
         let (ch3, mx3, p3) = GpuBinSpec.chunkTable(entries: e3)
         XCTAssertEqual(ch3.count, 2); XCTAssertEqual(mx3, 2); XCTAssertEqual(p3, 1)
         // Pass count is ceil(log2(maxChunks)): 3 chunks need 2 passes, 5 need 3.
-        let (e4, _, _) = GpuBinSpec.combine(counts: [1536])
+        let (e4, _, _) = GpuBinSpec.combine(counts: [3072])
         XCTAssertEqual(GpuBinSpec.chunkTable(entries: e4).mergePasses, 2)
-        let (e5, _, _) = GpuBinSpec.combine(counts: [2560])
+        let (e5, _, _) = GpuBinSpec.combine(counts: [5120])
         XCTAssertEqual(GpuBinSpec.chunkTable(entries: e5).mergePasses, 3)
     }
 
@@ -796,9 +795,10 @@ final class GpuBinSpecTests: XCTestCase {
         }
         XCTAssertEqual(plan.totalUnits, running)
         // A pair at or under one unit stays a single unit (common case: no extra
-        // threads for small tiles); a larger pair splits into bounded units.
+        // threads for small tiles); a larger pair splits into bounded units. The run
+        // size is pinned below the 600-entry tile so the pair really is a merge.
         let (e2, _, _) = GpuBinSpec.combine(counts: [600])
-        let small = GpuBinSpec.mergePlan(entries: e2, mergePasses: 1)
+        let small = GpuBinSpec.mergePlan(entries: e2, mergePasses: 1, chunkSize: 512)
         let unitLen = GpuBinSpec.mergeUnitSize
         XCTAssertEqual(small.units.count, 1)
         XCTAssertEqual(small.units[0].count, (600 + unitLen - 1) / unitLen)
@@ -1174,7 +1174,8 @@ final class GpuBinSpecTests: XCTestCase {
         // Out-of-range / malformed values clamp or fall back to the default.
         XCTAssertEqual(LiveConfig.sortChunkSize(environment: ["ART_LIVE_SORT_CHUNK": "32"]), 64)
         XCTAssertEqual(LiveConfig.sortChunkSize(environment: ["ART_LIVE_SORT_CHUNK": "4096"]), 1024)
-        XCTAssertEqual(LiveConfig.sortChunkSize(environment: ["ART_LIVE_SORT_CHUNK": "abc"]), 512)
+        XCTAssertEqual(LiveConfig.sortChunkSize(environment: ["ART_LIVE_SORT_CHUNK": "abc"]),
+                       GpuBinSpec.sortChunkSize)
     }
 
     func testSplatConfigDefaultsAndClamps() {

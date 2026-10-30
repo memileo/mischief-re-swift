@@ -414,11 +414,11 @@ public enum LiveConfig {
         return env["ART_LIVE_STROKE_PRUNE"] == "2"
     }
 
-    /// Sort chunk size override (`ART_LIVE_SORT_CHUNK`, clamped 64…1024, default 512).
-    /// Smaller chunks give `liveBinChunkSortV3Kernel` more threads and shallower
-    /// per-thread heaps; merge passes/units grow correspondingly (spec, CPU-only —
-    /// the kernels are chunk-size-agnostic, so no rebuild of the metallib is needed
-    /// to sweep this).
+    /// Sort chunk size override (`ART_LIVE_SORT_CHUNK`, clamped 64…1024, default
+    /// `GpuBinSpec.sortChunkSize` = 1024). Smaller chunks give the heapsort fallback
+    /// more threads and shallower per-thread heaps; merge passes/units grow
+    /// correspondingly (spec, CPU-only — the kernels are chunk-size-agnostic, so no
+    /// rebuild of the metallib is needed to sweep this).
     public static func sortChunkSize(environment: [String: String]? = nil) -> Int {
         let env = environment ?? ProcessInfo.processInfo.environment
         guard let raw = env["ART_LIVE_SORT_CHUNK"], let v = Int(raw) else {
@@ -514,8 +514,9 @@ public enum LiveConfig {
     /// Debug only — the pixels it produces are wrong by construction. It exists to
     /// attribute the per-tile composite's frame time on GPUs with no per-line profiling
     /// (AMD): run the same view once per bit and compare `render+comp`. Implemented in
-    /// `livePerTileAACompositeKernel`; noisy layers take the noise twin, which ignores
-    /// the mask. Each bit is a dispatch-uniform branch, so 0 is the shipping kernel:
+    /// both per-tile kernels (`livePerTileAACompositeKernel` and the noise twin); the
+    /// per-stroke path ignores the mask. Each bit is a dispatch-uniform branch, so 0 is
+    /// the shipping kernel:
     ///   1  no SDF — isolates SDF + coverage
     ///   2  prune rejects everything — loop + tile-list staging + staged prune (walk floor)
     ///   4  no per-stroke blend/quantise
@@ -800,11 +801,19 @@ public enum GpuBinSpec {
     /// give the same pass 16× the threads and a 16× shorter chain.
     public static let mergeUnitSize = 64
 
-    /// Fixed sort work quantum (entries). Every GPU sort thread sorts at most this
-    /// many entries, so per-thread nonlinear work is bounded no matter how far the
-    /// user zooms out. Must match the `512` in `liveBinChunkSortV3Kernel` /
-    /// `liveBinMergePassV2Kernel` (merge run sizes start at one chunk and double).
-    public static let sortChunkSize = 512
+    /// Fixed sort work quantum (entries): the CPU cuts every tile slice into chunks of
+    /// at most this many entries, so per-thread nonlinear work is bounded no matter how
+    /// far the user zooms out. The sort kernels take the chunk length from the chunk
+    /// table and their merge run sizes from `LiveBinSortParams`, so no metallib constant
+    /// has to match; the bitonic kernel's `sh[1024]` is the hard ceiling (1024 here,
+    /// and `LiveConfig.sortChunkSize()` clamps the env override to the same range).
+    ///
+    /// 1024 rather than 512: a chunk twice as wide halves the chunk count, which at
+    /// zoom-3 robotcrab turns two merge passes into one (sort 19.7 → 2.8 ms) and is
+    /// neutral at zoom ≤ 1 (there every tile already fits one chunk). The merge cost is
+    /// per-pass dispatch + ping-pong copy, not per-entry work, so wider chunks pay for
+    /// themselves as soon as any tile overflows.
+    public static let sortChunkSize = 1024
 
     /// Prefix-sums per-tile counts into per-tile (start, count) entries plus the grand
     /// total (the tile-list size). `entries[t].start` is the tile's tile-list slice —
