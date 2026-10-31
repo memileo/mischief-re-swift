@@ -178,6 +178,7 @@ struct LiveViewHelp: View {
 
 struct ScaleRow: View {
     @ObservedObject var store: SettingsStore
+    @State private var sliderID = 0
     
     static let sliderRange: ClosedRange<Double> = 0.05...2.0
     static let textRange: ClosedRange<Double> = 0.25...4.0
@@ -196,8 +197,26 @@ struct ScaleRow: View {
             
             VStack(spacing: 1) {
                 Slider(value: sliderBinding, in: Self.sliderRange) { editing in
-                    if editing { textFocused = false } // release field editor so text tracks the drag
+                    if editing {
+                        textFocused = false
+                    } else {
+                        // After a track click the knob can rest on the raw clicked
+                        // position while the binding already holds the snapped value.
+                        // Rebuilding the control re-syncs it. No-op after a drag.
+                        DispatchQueue.main.async { sliderID += 1 }
+                    }
+                    
+//                    else {
+//                        let snapped = store.previewScale
+//                        DispatchQueue.main.async {
+//                            store.previewScale = snapped.nextUp      // invisible, forces a render
+//                            DispatchQueue.main.async {
+//                                store.previewScale = snapped         // this render re-centers the knob
+//                            }
+//                        }
+//                    }
                 }
+                .id(sliderID)               // ← new
                 .overlay(tickMarks)
                 
                 tickLabels
