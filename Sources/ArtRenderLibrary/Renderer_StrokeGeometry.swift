@@ -742,12 +742,26 @@ internal func buildOpFromStroke(
     var segmentsForStroke: [GPUSplineSegment] = []
     segmentsForStroke.reserveCapacity((pts.count - 3) * 4)
     
+    // The marker chisel is fixed to the page, so the kernels start from a reference nib
+    // axis and rotate it by this segment's extra rotation. `atan2(b − c, a + d)` is the
+    // rotation of a similarity transform (and exactly 0 for scale/translation only, so
+    // unrotated renders keep the reference axis bit for bit); a mirrored transform
+    // falls back to the rotation of the x-axis image. Stored in `padding2` as float
+    // bits; non-marker kernels ignore it.
+    let total = artToDevice.concatenating(flip)
+    let determinant = total.a * total.d - total.b * total.c
+    let nibAngle = determinant >= 0
+        ? atan2(total.b - total.c, total.a + total.d)
+        : atan2(total.b, total.a)
+    let nibBits = Float(nibAngle).bitPattern
+
     for i in 1..<(pts.count - 2) {
         let pSpan = CRPointSpan(p0: pts[i-1], p1: pts[i], p2: pts[i+1], p3: pts[i+2])
         let rSpan = CRScalarSpan(s0: rads[i-1], s1: rads[i], s2: rads[i+1], s3: rads[i+2])
         let oSpan = CRScalarSpan(s0: opas[i-1], s1: opas[i], s2: opas[i+1], s3: opas[i+2])
         flattenAndBuild(span: pSpan, rSpan: rSpan, oSpan: oSpan, seed: seed, depth: 0, into: &segmentsForStroke, isPolyline: stroke.isPolyline, isMarker: stroke.pen.isMarker)
     }
+    for i in segmentsForStroke.indices { segmentsForStroke[i].padding2 = nibBits }
     
     return (segments: segmentsForStroke, color: color, isEraser: stroke.pen.isEraser, isMarker: stroke.pen.isMarker, meta: nil, m2Transform: nil)
 }

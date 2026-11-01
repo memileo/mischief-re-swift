@@ -2039,3 +2039,141 @@ round changes the shape of the sort tables and the memory movement, not what is 
 5. **`cutpaste` paste overdraw** — 541 k dispatched tiles / 6.9 G SDF evaluations for
    2 047 pastes. Merging non-overlapping pastes per destination box, or tightening the
    per-dispatch box, is the lever; it is a synthetic stress document.
+
+## Round 18 — the noise walk skips dead entries; sort chunks at 1024
+
+Committed as `c652a73` (marked *WIP interrupted* — the code is complete, the doc entry was
+not). Three changes, all exact: they remove work that provably cannot change a pixel, or
+change only how the sort's work is cut up.
+
+### A staged coverage ceiling per (entry, tile)
+
+The per-tile noise kernel walks every tile-list entry at every pixel of the tile. The AA
+walker already had a per-entry skip (`curMax >= satCeil`), but on noisy art the expensive
+part is the staged entries whose SDF can never beat the stroke's running max. That test was
+being repeated 256 times per entry.
+
+`tgBound[t]` now holds a coverage upper bound for the **whole tile**:
+
+* every curve point of the entry is within `farOff = padding1 − rMax` of its chord, so any
+  tile pixel is at least `d(centre, chord) − halfDiagonal(tile) − farOff − 0.5` from the
+  curve;
+* the noise and AA falloffs are non-increasing in that distance, so evaluating them at the
+  lower bound upper-bounds the coverage;
+* `× (opacityByte + 1)/255` upper-bounds `stamped`.
+
+The bound costs one distance + one falloff per entry and is computed in the same staging
+loop that already loads the record: **3.7 M evaluations instead of ~950 M per-pixel ones**
+on robotcrab zoom 3. The skip `tgBound[j] <= curMax` is a max-only short circuit, so it
+cannot change the result; the bound is conservative in the safe direction (a too-large
+bound only loses the skip). Markers and entries with opacity > 1 get no bound.
+
+### A per-entry opacity ceiling byte
+
+Both per-tile kernels stage `tgOpMax`: `floor(max(op0, op1) · 255)`, capped at 254, with
+255 meaning "opacity > 1, no ceiling". Since `stamped = cov · opacity`, `cov ≤ 1`, and the
+composite is a max over segments, once `curMax ≥ (byte + 1)/255` the entry's remaining
+segments are dead *for that pixel*. Rounding down is what makes the threshold safe: it is
+at or below the true ceiling, so the skipped stamps were all ≤ the value already there.
+The byte also feeds the tile bound above.
+
+### Sort chunks at 1024, with no matching metallib constant
+
+`GpuBinSpec.sortChunkSize` is now 1024 (was 512), and it is the only definition. The chunk
+table already carried each chunk's `len`, and `LiveBinSortParams.runSize` carries the merge
+run size, so `liveBinChunkSortV3Kernel` / `liveBinMergePassV2Kernel` need no compile-time
+chunk constant at all; only the bitonic `sh[1024]` capacity is a hard ceiling, which the
+env override (`ART_LIVE_SORT_CHUNK`, clamped 64…1024) also respects. On robotcrab zoom 3 a
+wider chunk halves the chunk count and turns **two merge passes into one** (sort
+19.7 → 2.8 ms); at zoom ≤ 1 every tile already fits one chunk, so the change is neutral.
+
+### Measurements (1920×1080, release, `ART_LIVE_BINTIME=1`, steady state)
+
+| view | entries | chunks | passes | xform | scatter | sort | render+comp | frame |
+|---|---|---|---|---|---|---|---|---|
+| robotcrab z3 L0 | 3 723 371 | 7 950 | 1 | 1.0 | 1.4 | 2.8 | **58.9** | 81 ms |
+| robotcrab z3 L1 | 505 258 | 6 259 | 0 | 0.8 | 1.0 | 0.4 | 11.2 | |
+| robotcrab z1 | 764 603 | 2 675 | 1 | 0.7 | 0.4 | 1.0 | 14.0 | 24 ms |
+| kaos z1 | 1 185 719 | 7 559 | 0 | 0.7 | 0.5 | 0.5 | 19.2 | 24 ms |
+| doodle z1 | — | — | — | — | — | — | — | 19 ms |
+
+Zoom 3 on robotcrab is still 81 ms: 3.7 M entries × 256 px of magnified ink is a real
+amount of coverage work, and the staged bound only removes entries that cannot beat the
+running max — most of those entries *are* ink at that zoom. Reaching ~16 ms there needs a
+cheaper coverage evaluation (SDF approximation) or a different dispatch shape, not another
+skip.
+
+### Gates
+
+`swift test` 107 tests / 4 skipped / 0 failures; `stroke-splat-ab.sh --all` 10/10 identical
+(3 views actually on the splat); `stroke-prune-ab.sh --modes 0,1,2` byte-equal on robotcrab
+at zoom 1 and 3; kaos static byte-identical to `art/kaos.png`; live-vs-static 42 px / 1 LSB
+(the long-standing envelope); Xcode `ArtQuickLook` app + extension build; `build-metallib.sh`
+verifies all 32 kernels. Cached-path renders for kaos, doodle and robotcrab at zoom 2 and 0.5
+are byte-identical before and after the round. `tiles` / `chunks` / `sdf` change only where
+the chunking or the skips change the work, as intended; the pixels do not.
+
+## Round 19 — mixed paste batches, and a chisel that turns with the page
+
+Two live-view regressions from the rounds above, plus the comparator that had been hiding
+differences.
+
+### One noisy stroke no longer softens a whole paste group
+
+Paste groups are keyed by colour / eraser / marker / transform / masks
+(`Renderer_PasteMerge.swift`), so a group can hold both clean (AA) and noisy strokes. The
+live paste planner put the group into **one** bin with one `hasNoise` flag, while the static
+dispatcher (`dispatchPasteToGPU`) split a mixed batch into a clean batch and a noisy batch
+and dispatched clean first. On a mixed group the live bin therefore sent every clean stroke
+through the noise kernel, and the composite — a max over the batch's segments — also used
+the wrong softness. The symptom was the pasted drawing turning into noise dots.
+
+The planner now performs the same split, in the same order, before boxing each batch:
+same segments, same pixels, one bin per class. `art/groupings-dispatch.art` (mixed AA and
+noisy pasted strokes) is the regression case: live and static are now byte-identical.
+
+### The chisel is page-fixed, so it has to rotate with the camera
+
+`sdSlantedMarkerStamp` hard-coded the nib axis in **device** space. Panning and zooming were
+fine, but rotating the camera left the chisel at 45° while the artwork turned. The nib is
+part of the artwork, so its angle is now carried per segment in `GPUSplineSegment.padding2`
+(float bits; `0` = the reference axis):
+
+* `buildOpFromStroke` bakes `atan2(b − c, a + d)` of `artToDevice ∘ flip` (a similarity's
+  rotation; exactly 0 for scale/translation, so unrotated renders keep the reference axis
+  bit for bit). A mirrored transform falls back to `atan2(b, a)`.
+* `LiveRenderCache.remap` adds the camera's angle to the stored nib angle.
+* `liveBinTransformCountKernel` adds the same angle when it stages a segment.
+
+The kernel's `liveMarkerAxis(theta)` rotates `±(1, −1)/√2` by `theta`, and short-circuits
+`theta == 0` to the literal reference axis, so the static and unrotated live paths cannot
+move. Only the `isMarker` branch reads `padding2`; circular markers and ordinary strokes
+take the capsule/spline SDF and are untouched. Verified by rendering `qwerty` and `marker`
+at the default view and at `--rotate 0.6`: per-tile and per-stroke paths are byte-identical
+in both views, and the chisel visibly turns with the page.
+
+### `tmp/pngdiff.py` was reporting false IDENTICALs
+
+Pillow's `ImageChops.difference(...).getbbox()` defaults to **alpha-only** on RGBA, and the
+live/static PNGs have identical alpha, so the comparator printed `IDENTICAL` whenever RGB
+differed. It now builds the union of per-band "any difference" masks and scans all four
+channels, with the old tolerance argument (default 1 LSB) retained. The gates above were
+re-run after the fix; the ones that had been reported IDENTICAL on RGB were re-checked
+directly (`shasum` where identity is expected, `pngdiff` where a 1-LSB envelope applies).
+
+### Gates
+
+`stroke-splat-ab.sh --all` 10/10; `stroke-prune-ab.sh --modes 0,1,2` byte-equal on
+robotcrab z1/z3; `groupings-dispatch` live == static; kaos live-vs-static 42 px / 1 LSB;
+qwerty live-vs-static 9 px / 1 LSB (both the historical envelopes); per-tile vs per-stroke
+identical for `qwerty` and `marker` at rotation 0 and 0.6; cached renders for kaos, doodle and
+robotcrab at zoom 2 and 0.5 byte-identical to the pre-change build; `swift test` 107 / 4
+skipped / 0 failures; Xcode `ArtQuickLook` app + extension build; `build-metallib.sh` 32/32.
+
+### What is left
+
+1. **Robotcrab zoom 3 is still ~81 ms**, 59 ms of it `render+comp` (Round 18). The remaining
+   cost is genuine magnified coverage, not skippable entries.
+2. **Display-link frame pacing** — unchanged (Round 14, item 1).
+3. **`cutpaste` paste overdraw** — deliberately still last priority.
+

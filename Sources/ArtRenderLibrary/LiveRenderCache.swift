@@ -526,6 +526,14 @@ extension LiveRenderCache {
         let tx = Float(camera.tx), ty = Float(camera.ty)
         let identityLike = (a == 1 && b == 0 && c == 0 && d == 1 && tx == 0 && ty == 0)
         let noRadiusChange = (radiusFactor == 1)
+        // The marker chisel is page-fixed: its per-segment angle (see
+        // `buildOpFromStroke`) must follow the camera like the points do. Same formula
+        // as the GPU bin transform kernel, and exactly 0 for an unrotated camera.
+        let determinant = camera.a * camera.d - camera.b * camera.c
+        let cameraAngle = determinant >= 0
+            ? atan2(camera.b - camera.c, camera.a + camera.d)
+            : atan2(camera.b, camera.a)
+        let cameraAngleBits = Float(cameraAngle).bitPattern
         
         var out = [GPUSplineSegment]()
         out.reserveCapacity(segments.count)
@@ -549,6 +557,12 @@ extension LiveRenderCache {
                 // full SDF cost). The coverage margin the kernels add is a device-pixel
                 // constant and deliberately *not* scaled. 0 = unset, stays 0.
                 s.padding1 = (Float(bitPattern: s.padding1) * radiusFactor).bitPattern
+            }
+            if !identityLike {
+                // Nib angle: stored page-space angle + the camera's rotation. Adding
+                // +0.0 to a stored 0 keeps it 0, so unrotated views are unchanged.
+                s.padding2 = (Float(bitPattern: s.padding2)
+                              + Float(bitPattern: cameraAngleBits)).bitPattern
             }
             out.append(s)
         }

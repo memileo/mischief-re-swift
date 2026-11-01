@@ -206,7 +206,7 @@ inline SDFResult sdSoftEnvelopeSpline(float2 p, float2 p0, float2 p1, float2 p2,
     return res;
 }
 
-// MARK: - Shape 3: Slanted Marker (chisel-tip, 4:1 length:diameter, 45° fixed)
+// MARK: - Shape 3: Slanted Marker (chisel-tip, 4:1 length:diameter, page-fixed 45°)
 
 // Even capsule SDF (Inigo Quilez)
 inline float sdEvenCapsule(float2 pos, float2 pa, float2 pb, float r) {
@@ -216,12 +216,24 @@ inline float sdEvenCapsule(float2 pos, float2 pa, float2 pb, float r) {
     return length(pa2p - ba * h) - r;
 }
 
+// The nib's device-space axis. The chisel is fixed to the page (the ±(1, −1)/√2
+// diagonal), so it must turn with the camera: `theta` is the extra rotation the
+// segment's transform applies on top of that reference (0 for an unrotated view — and
+// then the early-out returns the reference axis bit for bit, so existing renders cannot
+// move).
+inline float2 liveMarkerAxis(float theta) {
+    constexpr float2 reference = float2(-0.70710678f, -0.70710678f);
+    if (theta == 0.0f) return reference;
+    float cs = cos(theta);
+    float sn = sin(theta);
+    return float2(reference.x * cs - reference.y * sn,
+                  reference.x * sn + reference.y * cs);
+}
+
 // Single slanted capsule stamp at a center point.
-// Axis is fixed at 45° bottom-left → upper-right in screen coords (y-down).
-//   axis = (1, -1) / √2
-// Capsule length = 4 × diameter = 8r; half-length = 4r.
-inline float sdSlantedMarkerStamp(float2 p, float2 center, float r) {
-    constexpr float2 axis = float2(-0.70710678f, -0.70710678f);
+// Capsule length = 4 × diameter = 8r; half-length = 3r (stamp extent).
+inline float sdSlantedMarkerStamp(float2 p, float2 center, float r, float theta) {
+    float2 axis = liveMarkerAxis(theta);
     float halfLen = 3.0f * r;            // length = 6r from center = 4 × diameter
     float2 pa = center - axis * halfLen;
     float2 pb = center + axis * halfLen;
@@ -230,7 +242,7 @@ inline float sdSlantedMarkerStamp(float2 p, float2 center, float r) {
 
 // Marker sweep along a straight segment (segmentType == 0)
 inline SDFResult sdSlantedMarkerStraight(float2 p, float2 a, float2 b,
-                                         float ra, float rb) {
+                                         float ra, float rb, float theta) {
     const int SAMPLES = 10;
     float best_t = 0.0f;
     float min_dist = 1e20f;
@@ -239,7 +251,7 @@ inline SDFResult sdSlantedMarkerStraight(float2 p, float2 a, float2 b,
         float t_sample = float(i) / float(SAMPLES);
         float2 center = mix(a, b, t_sample);
         float r = mix(ra, rb, t_sample);
-        float d = sdSlantedMarkerStamp(p, center, r);
+        float d = sdSlantedMarkerStamp(p, center, r, theta);
         if (d < min_dist) { min_dist = d; best_t = t_sample; }
     }
     
@@ -252,7 +264,7 @@ inline SDFResult sdSlantedMarkerStraight(float2 p, float2 a, float2 b,
 // Marker sweep along a Catmull-Rom spline (segmentType == 1 or 2)
 inline SDFResult sdSlantedMarkerSpline(float2 p, float2 p0, float2 p1,
                                        float2 p2, float2 p3,
-                                       float ra, float rb) {
+                                       float ra, float rb, float theta) {
     const int SAMPLES = 10;
     float best_t = 0.0f;
     float min_dist = 1e20f;
@@ -261,7 +273,7 @@ inline SDFResult sdSlantedMarkerSpline(float2 p, float2 p0, float2 p1,
         float t_sample = float(i) / float(SAMPLES);
         float2 center = getSplinePos(p0, p1, p2, p3, t_sample);
         float r = mix(ra, rb, t_sample);
-        float d = sdSlantedMarkerStamp(p, center, r);
+        float d = sdSlantedMarkerStamp(p, center, r, theta);
         if (d < min_dist) { min_dist = d; best_t = t_sample; }
     }
     
@@ -304,10 +316,12 @@ kernel void segmentAACompositeKernel(
         
         if (params.isMarker) {
             // ── Slanted chisel-tip marker mode ──
-            // Fixed 45° axis, 4:1 capsule swept along the segment.
+            // Page-fixed 45° reference axis, rotated by this segment's camera angle;
+            // a 4:1 capsule swept along the segment.
             if (seg.segmentType == 0) {
                 SDFResult res = sdSlantedMarkerStraight(
-                                                        pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
+                                                        pos, seg.p1, seg.p2, seg.radius0, seg.radius1,
+                                                        as_type<float>(seg.padding2));
                 signedDist = res.dist;
                 t = res.t;
             } else {
@@ -315,7 +329,8 @@ kernel void segmentAACompositeKernel(
                 // along the Catmull-Rom curve.
                 SDFResult res = sdSlantedMarkerSpline(
                                                       pos, seg.p0, seg.p1, seg.p2, seg.p3,
-                                                      seg.radius0, seg.radius1);
+                                                      seg.radius0, seg.radius1,
+                                                      as_type<float>(seg.padding2));
                 signedDist = res.dist;
                 t = res.t;
             }
@@ -590,12 +605,14 @@ kernel void segmentPasteLayerAACompositeKernel(
         if (params.isMarker) {
             if (seg.segmentType == 0) {
                 SDFResult res = sdSlantedMarkerStraight(srcPos, seg.p1, seg.p2,
-                                                        seg.radius0, seg.radius1);
+                                                        seg.radius0, seg.radius1,
+                                                        as_type<float>(seg.padding2));
                 signedDist = res.dist; segT = res.t;
             } else {
                 SDFResult res = sdSlantedMarkerSpline(srcPos, seg.p0, seg.p1,
                                                       seg.p2, seg.p3,
-                                                      seg.radius0, seg.radius1);
+                                                      seg.radius0, seg.radius1,
+                                                      as_type<float>(seg.padding2));
                 signedDist = res.dist; segT = res.t;
             }
         } else if (seg.segmentType == 0) {
@@ -1097,10 +1114,14 @@ kernel void liveSegmentAACompositeKernel(
 
         if (isMarker) {
             if (seg.segmentType == 0) {
-                SDFResult res = sdSlantedMarkerStraight(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
+                SDFResult res = sdSlantedMarkerStraight(pos, seg.p1, seg.p2,
+                                                        seg.radius0, seg.radius1,
+                                                        as_type<float>(seg.padding2));
                 signedDist = res.dist; t = res.t;
             } else {
-                SDFResult res = sdSlantedMarkerSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+                SDFResult res = sdSlantedMarkerSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3,
+                                                      seg.radius0, seg.radius1,
+                                                      as_type<float>(seg.padding2));
                 signedDist = res.dist; t = res.t;
             }
         } else if (seg.segmentType == 0) {
@@ -1578,10 +1599,14 @@ kernel void livePerTileAACompositeKernel(
                     float signedDist;
                     float t;
                     if (seg.segmentType == 0) {
-                        SDFResult res = sdSlantedMarkerStraight(pos, seg.p1, seg.p2, seg.radius0, seg.radius1);
+                        SDFResult res = sdSlantedMarkerStraight(pos, seg.p1, seg.p2,
+                                                        seg.radius0, seg.radius1,
+                                                        as_type<float>(seg.padding2));
                         signedDist = res.dist; t = res.t;
                     } else {
-                        SDFResult res = sdSlantedMarkerSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3, seg.radius0, seg.radius1);
+                        SDFResult res = sdSlantedMarkerSpline(pos, seg.p0, seg.p1, seg.p2, seg.p3,
+                                                      seg.radius0, seg.radius1,
+                                                      as_type<float>(seg.padding2));
                         signedDist = res.dist; t = res.t;
                     }
                     float opacity = mix(seg.opacity0, seg.opacity1, t);
@@ -2208,7 +2233,11 @@ kernel void liveBinTransformCountKernel(
     o.radius0 = r0; o.radius1 = r1;
     o.opacity0 = s.opacity0; o.opacity1 = s.opacity1;
     o.noiseSeed = s.noiseSeed; o.segmentType = s.segmentType;
-    o.padding1 = as_type<uint>(prune); o.padding2 = s.padding2;
+    o.padding1 = as_type<uint>(prune);
+    // The nib angle is document-space; the per-frame camera rotates it too. Identity
+    // camera → atan2(0, 2) = 0 exactly, so the stored bits pass through unchanged.
+    float camTheta = atan2(p.camB - p.camC, p.camA + p.camD);
+    o.padding2 = as_type<uint>(as_type<float>(s.padding2) + camTheta);
     outSegs[gid] = o;
 
     int4 r = liveBinRangeForSeg(p, p1, p2, binPad(p, r0, r1, prune,

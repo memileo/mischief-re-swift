@@ -725,14 +725,30 @@ extension MetalRenderer {
                 case .paste(let segments, let color, let isEraser, let isMarker,
                             let meta, let masks, let sourceToDestination,
                             let isMerge, let mergeID):
-                    if let bin = try plan(paste: segments, color: color,
-                                          isEraser: isEraser, isMarker: isMarker,
-                                          meta: meta, masks: masks,
-                                          sourceToDestination: sourceToDestination,
-                                          isMerge: isMerge, mergeID: mergeID,
-                                          width: width, height: height) {
-                        work.append(.paste(pastes.count))
-                        pastes.append(bin)
+                    // A paste group is keyed by colour / eraser / marker / transform /
+                    // masks, so it can hold both clean and noisy strokes. A bin picks
+                    // ONE coverage model for the whole batch (`bin.hasNoise`), so a
+                    // single noisy stroke would drag every clean stroke of the group
+                    // onto the noise kernel (the paste is a max over the batch's
+                    // segments, so a mixed batch also paints the wrong softness).
+                    // Mirror the static dispatcher's split: one batch per class, clean
+                    // first — same segments, same order, same pixels.
+                    let hasNoisy = segments.contains { $0.noiseSeed != 0 }
+                    let hasClean = segments.contains { $0.noiseSeed == 0 }
+                    let batches: [[GPUSplineSegment]] = (hasNoisy && hasClean)
+                        ? [segments.filter { $0.noiseSeed == 0 },
+                           segments.filter { $0.noiseSeed != 0 }]
+                        : [segments]
+                    for batch in batches {
+                        if let bin = try plan(paste: batch, color: color,
+                                              isEraser: isEraser, isMarker: isMarker,
+                                              meta: meta, masks: masks,
+                                              sourceToDestination: sourceToDestination,
+                                              isMerge: isMerge, mergeID: mergeID,
+                                              width: width, height: height) {
+                            work.append(.paste(pastes.count))
+                            pastes.append(bin)
+                        }
                     }
                     index += 1
             }
