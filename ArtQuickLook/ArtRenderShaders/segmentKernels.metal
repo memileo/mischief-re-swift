@@ -142,39 +142,174 @@ inline float2 getSplineTangent(float2 p0, float2 p1, float2 p2, float2 p3, float
     return 0.5f * ((-p0 + p2) + 2.0f * (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t + 3.0f * (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t2);
 }
 
-
-// MARK: - Shape 1: Analytical Adaptive Spline
-inline SDFResult sdSplineSegment(float2 p, float2 p0, float2 p1, float2 p2, float2 p3, float ra, float rb) {
-    float best_t = 0.0f, min_dist_sq = 1e20f;
-    const int PRE_SAMPLES = 6; // Reduced from 10 to 6 for performance
+inline float2 getSplineAcceleration(float2 p0, float2 p1, float2 p2, float2 p3, float t) {
+    float2 b = 2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3;
+    float2 c = -p0 + 3.0f * p1 - 3.0f * p2 + p3;
     
+    return b + 3.0f * c * t;
+}
+
+
+// MARK: - Shape 1: Variable-Radius Envelope Spline
+
+inline SDFResult sdSplineSegment(float2 p, float2 p0, float2 p1, float2 p2, float2 p3, float ra, float rb) {
+    const int PRE_SAMPLES = 6; // 6-8
+    const int NEWTON_STEPS = 4;
+    
+    float best_t = 0.0f;
+    float best_f = 1e20f;
+    int best_i = 0;
+    
+    float dr = rb - ra;
+    
+    // Scale-aware epsilon.
+    float scale_sq = max(
+        max(dot(p1 - p0, p1 - p0),
+            dot(p2 - p1, p2 - p1)),
+        dot(p3 - p2, p3 - p2)
+    );
+    
+    float scale = sqrt(max(scale_sq, 1e-12f));
+    float dist_eps = scale * 1e-6f;
+    
+    // --------------------------------------------------
+    // 1. Initial search
+    // Minimize distance - radius, NOT centerline distance.
+    // --------------------------------------------------
     
     for (int i = 0; i <= PRE_SAMPLES; i++) {
         float t_sample = float(i) / float(PRE_SAMPLES);
-        float2 p_curve = getSplinePos(p0, p1, p2, p3, t_sample);
-        float2 diff = p - p_curve;
-        float d_sq = dot(diff, diff);
-        if (d_sq < min_dist_sq) { min_dist_sq = d_sq; best_t = t_sample; }
+        
+        float2 curve = getSplinePos(
+            p0, p1, p2, p3, t_sample
+        );
+        
+        float radius = mix(ra, rb, t_sample);
+        float f = length(p - curve) - radius;
+        
+        if (f < best_f) {
+            best_f = f;
+            best_t = t_sample;
+            best_i = i;
+        }
     }
+    
+    // --------------------------------------------------
+    // 2. Restrict refinement to the winning neighborhood.
+    // --------------------------------------------------
+    
+    float sample_step = 1.0f / float(PRE_SAMPLES);
+    
+    float lo = max(
+        0.0f,
+        float(best_i - 1) * sample_step
+    );
+    
+    float hi = min(
+        1.0f,
+        float(best_i + 1) * sample_step
+    );
     
     float t = best_t;
-    for (int i = 0; i < 2; i++) { // Reduced from 3 to 2
-        float2 p_curve = getSplinePos(p0, p1, p2, p3, t);
-        float2 tangent = getSplineTangent(p0, p1, p2, p3, t);
-        float2 diff = p - p_curve;
-        float t_len_sq = dot(tangent, tangent);
-        t = clamp(t + (dot(diff, tangent) / (t_len_sq + 1e-5f)), 0.0f, 1.0f);
+    float current_f = best_f;
+    
+    // --------------------------------------------------
+    // 3. Safeguarded Newton refinement.
+    // --------------------------------------------------
+    
+    for (int i = 0; i < NEWTON_STEPS; i++) {
+        
+        float2 curve = getSplinePos(
+            p0, p1, p2, p3, t
+        );
+        
+        float2 tangent = getSplineTangent(
+            p0, p1, p2, p3, t
+        );
+        
+        float2 accel = getSplineAcceleration(
+            p0, p1, p2, p3, t
+        );
+        
+        float2 diff = p - curve;
+        
+        float d = max(length(diff), dist_eps);
+        
+        float tangent_sq = dot(tangent, tangent);
+        float dv = dot(diff, tangent);
+        
+        // First derivative of distance - radius.
+        float g = -dv / d - dr;
+        
+        // Second derivative of distance - radius.
+        float h =
+        (tangent_sq - dot(diff, accel)) / d
+        - (dv * dv) / (d * d * d);
+        
+        // Avoid unstable Newton steps.
+        float h_floor = max(
+            tangent_sq / d * 0.05f,
+            scale * 1e-6f
+        );
+        
+        float denom = max(h, h_floor);
+        
+        float step = -g / denom;
+        
+        // Limit the step to the local search region.
+        step = clamp(step, -(hi - lo), hi - lo);
+        
+        // Backtracking.
+        bool accepted = false;
+        float trial_t = t;
+        float trial_f = current_f;
+        
+        for (int ls = 0; ls < 3; ls++) {
+            
+            trial_t = clamp(t + step, lo, hi);
+            
+            float2 trial_curve = getSplinePos(
+                p0, p1, p2, p3, trial_t
+            );
+            
+            float trial_radius = mix(ra, rb, trial_t);
+            
+            trial_f = length(p - trial_curve) - trial_radius;
+            
+            if (trial_f <= current_f) {
+                accepted = true;
+                break;
+            }
+            
+            step *= 0.5f;
+        }
+        
+        if (!accepted) {
+            break;
+        }
+        
+        if (abs(trial_t - t) < 1e-6f) {
+            break;
+        }
+        
+        t = trial_t;
+        current_f = trial_f;
     }
     
-    float2 p_curve = getSplinePos(p0, p1, p2, p3, t);
-//    float current_radius = mix(ra, rb, smoothstep(0.0f, 1.0f, t));
-    float current_radius = mix(ra, rb, t);
+    // --------------------------------------------------
+    // 4. Final result.
+    // --------------------------------------------------
     
-    float dist = fast::length(p - p_curve) - current_radius;
+    float2 final_curve = getSplinePos(
+        p0, p1, p2, p3, t
+    );
+    
+    float final_radius = mix(ra, rb, t);
     
     SDFResult res;
-    res.dist = dist;
+    res.dist = length(p - final_curve) - final_radius;
     res.t = t;
+    
     return res;
 }
 
