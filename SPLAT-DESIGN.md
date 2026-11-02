@@ -2184,8 +2184,9 @@ The robotcrab performance work was split into two documents, `robotcrab-layer1.a
 all noisy 10.6 px strokes) and `robotcrab-layer2.art` (a mixed layer: 570 strokes, ~20 % of
 them noisy, but the noisy ones are the fat 128 px brush). Layer 2 is the slow case. This
 round makes the noise layer's prune/bin margin **per stroke** (exact), adds the debug shape
-colour mode used to isolate a shape-1 cap glitch, measures where the remaining layer-2 time
-actually goes, and adopts a cheaper shape-2 evaluator within an accepted tolerance.
+colour mode used to isolate a shape-1 cap glitch, and measures where the remaining layer-2
+time actually goes. A cheaper shape-2 evaluator was tried and rejected (it introduced hard
+notches at segment joins), so the shape-2 sample count stays at 10.
 
 ### Debug shape colours (`ART_DEBUG_SEG_COLORS=1`)
 
@@ -2238,48 +2239,60 @@ per-tile kernels can be timed on identical work. On the old 3 723 371 entries: A
 noise 62.7 ms; the difference is the noise SDF + coverage, not the walk. `ART_LIVE_ABLATE`
 on the noise kernel at z3:
 
-| ablation | exact 9-sample build | shipped refine build |
+| ablation | render+comp | attribution |
 |---|---|---|
-| 0 (normal) | 58.5 ms | 50.4 ms |
-| 1 (no SDF/coverage) | 37.0 | 34.3 |
-| 2 (prune everything) | 24.9 | 23.8 |
+| 0 (normal) | 58.5 ms | |
+| 1 (no SDF/coverage) | 37.0 | SDF + coverage ≈ 21.7 ms |
+| 2 (prune everything) | 24.9 | loop + staging + fixed bin/sort ≈ 24.9 ms |
 | 4 (no composite) / 8 (no write) | 58.2 / 58.1 | not measurable |
 
-So the cost before the shape-2 change was roughly 25 ms of fixed bin/sort + per-entry walk,
-12 ms of per-entry prune/fetch, and 22 ms of SDF + coverage. Reducing entries by 6 % only
-touches the middle term, which is why z3 moved ~1 ms while z1 moved more. After the
-shape-2 change the SDF + coverage term is ~16 ms and the fixed/walk terms are ~24 / 11 ms.
+So the remaining cost is roughly 25 ms of fixed bin/sort + per-entry walk, 12 ms of
+per-entry prune/fetch, and 22 ms of SDF + coverage. Reducing entries by 6 % only touches
+the middle term, which is why z3 moves ~1 ms while z1 moves more. (The rejected shape-2
+refine build measured 50.4 / 34.3 / 23.8, i.e. an SDF + coverage term of ~16 ms; it was
+reverted for the join notches described below.)
 
-### Shape-2 sample count (accepted approximation)
+### Shape-2 sample count: rejected refinements, keep 10 samples
 
-`sdSoftEnvelopeSpline` evaluated 10 Catmull-Rom samples per pixel-entry and kept the
-minimum of `|p − C(t)| − r(t)`. Shape 2 is selected for the fat/noisy spans (chord at most
-`min(5·(rMax−0.82)·|Δr|, rMax)`), so this loop is exactly what the 128 px robotcrab strokes
-pay for. Paired A/B against the exact build (same per-stroke binning):
+`sdSoftEnvelopeSpline` evaluates 10 Catmull-Rom samples per pixel-entry (`SAMPLES = 9`)
+and keeps the minimum of `|p − C(t)| − r(t)`. Shape 2 is selected for the fat/noisy spans
+(chord at most `min(5·(rMax−0.82)·|Δr|, rMax)`), so this loop is exactly what the 128 px
+robotcrab strokes pay for. Paired A/B against the exact build (same per-stroke binning):
 
 | shape-2 variant | z1 | z3 | max channel diff | pixels differing (z3) |
 |---|---|---|---|---|
-| 9 samples (old) | 13.06 ms | 58.3 ms | — | — |
+| 10 samples (shipping) | 13.06 ms | 58.3 ms | — | — |
 | 7 uniform samples | 12.2 (−6.6 %) | 54.1 (−7.2 %) | 5 LSB | 30 562 |
 | 5 uniform samples | 11.3 (−13.8 %) | 50.0 (−14.2 %) | 8 LSB | 40 879 |
-| 4 coarse + parabolic refine | 11.1 (−15 %) | 50.5 (−13 %) | 7 LSB | 28 686 |
-| **5 coarse + parabolic refine** | **11.3 (−13 %)** | **50.4 (−14 %)** | **6 LSB** | **23 813** |
+| 5 coarse + parabolic refine | 11.3 (−13 %) | 50.4 (−14 %) | 6 LSB | 23 813 |
 | 6 coarse + parabolic refine | 11.8 (−10 %) | 52.9 (−9 %) | 5 LSB | 21 397 |
+| 5 coarse + endpoint-aware refine | same | same | same | same |
 
-The refinement variant samples `n+1` points then takes one parabolic step through the
-three samples around the coarse minimum (`d(t)` is smooth near it), so it costs one extra
-evaluation but recovers a good part of the 10-sample resolution: at the same speed as five
-uniform samples it halves the number of differing pixels and drops the worst error from
-8 to 6 LSB. **The 5-coarse + parabolic refine row is what ships** (accepted tolerance: max
-6 LSB, ~1.2 % of pixels at z3). Both live and static kernels call the same function, so
-live-vs-static identity is preserved. Hoisting the Catmull-Rom coefficients out of the loop
-was tried separately: byte-identical output, but 57.2 ms vs 57.2 ms, i.e. no measurable
-gain (the compiler already hoists/CSEs enough), so it was not kept.
+The parabolic refinement samples `n+1` points, then takes one parabolic step through the
+three samples around the coarse minimum. It is cheap and numerically close, but on
+`doodle-zoom.art` at `--zoom 50` it leaves **hard notches at segment joins** (the same
+failure mode as the `sdSplineSegment` cap crease): the refined interior pulls the coverage
+out while the neighbouring segment still uses its coarse sample, so the boundary steps
+instead of blending. Refining the endpoint-adjacent interval too (the last row) produced a
+byte-identical image — the notches are at interior interval switches, not at the segment
+ends. Fixing that needs a refinement whose result is continuous across the interval
+switch (e.g. an exact distance to a fixed polyline approximation), which was not attempted.
+It was therefore **reverted**: the shipping shader is the 10-sample uniform version.
+The uniform 7- and 5-sample variants are continuous by construction (a fixed grid is a
+minimum of continuous functions) and show only the softer "blob" error, but their
+7–14 % speedup was not adopted in this round either.
 
-Shipping numbers: layer2 z1 13.1 → 11.3 ms, z3 58.3 → 50.7 ms; layer1 z3 11.3 → 9.5 ms.
-The accepted per-view change is static layer1 max 6 LSB / 4 739 px, static layer2 max
-3 LSB / 6 371 px, and live layer2 z3 max 6 LSB / 23 813 px. The post-change live renders
-are saved in `tmp/sdf-base-refine/` as the new comparison baseline.
+Test case: `ART_DEBUG_SEG_COLORS=1 .build/release/art2png --live-view --viewport 1920x1080 --zoom 50 --pan 0,0 art/doodle-zoom.art`
+(compare `art/doodle-zoom.live-view-sample9.png` with
+`art/doodle-zoom.live-view-parabolic.png`).
+
+Hoisting the Catmull-Rom coefficients out of the loop was tried separately: byte-identical
+output, but 57.2 ms vs 57.2 ms, i.e. no measurable gain (the compiler already hoists/CSEs
+enough), so it was not kept.
+
+Shipping numbers after the revert: layer2 z1 ~13.1 ms, z3 ~57.3 ms (from 58.5 ms with the
+per-stroke bin margin); layer1 z3 ~11.2 ms. The exact live renders are byte-identical to
+`tmp/sdf-base/`.
 
 ### Stale-metallib trap
 
@@ -2300,16 +2313,18 @@ live-vs-static stays within the existing 1–2 LSB envelopes: `kaos` 42 px / 1 L
 `doodle` 26 936 px / 1 LSB, `robotcrab-layer2` z1 181 580 px / 2 LSB (the
 per-tile-vs-per-stroke noise envelope);
 `groupings-dispatch` live == static; `kaos` static byte-identical to `art/kaos.png`;
-static output moved by the accepted shape-2 tolerance
-(layer1 max 6 LSB, layer2 max 3 LSB); Xcode `ArtQuickLook` app build succeeds;
+live renders for `robotcrab-layer1`/`layer2` at zoom 1 and 3 and the `doodle-zoom` test view
+byte-identical to the exact baseline (`tmp/sdf-base/`); static output unchanged (the
+shape-2 refinement was reverted); Xcode `ArtQuickLook` app build succeeds;
 `build-metallib.sh` verifies 32/32 kernels.
 
 ### What is left
 
-1. **Robotcrab layer-2 zoom 3 is now ~50.7 ms** (from 58.3 ms) with the accepted shape-2
-   approximation. The remaining ~24 ms fixed bin/sort + walk and ~11 ms per-entry work are
-   not skippable entries; beating this needs a different dispatch shape or a cheaper
-   coverage model.
+1. **Robotcrab layer-2 zoom 3 is ~57.3 ms** (from 58.5 ms with the exact per-stroke bin
+   margin). The cheaper shape-2 variants (7 uniform samples, parabolic refinement) were
+   rejected: the uniform ones blur, the refined one notches at segment joins. A continuous
+   refinement (e.g. exact distance to a fixed polyline) remains an option if the ~7–14 %
+   is worth revisiting.
 2. **`sdSplineSegment` cap glitch** (deferred): at high zoom a segment the shape picker
    would have sent to shape 2 keeps shape 1, and its mid-section/cap junction shows a
    crease. Test case:

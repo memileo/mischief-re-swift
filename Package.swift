@@ -58,6 +58,7 @@ let package = Package(
                 
                 // Live Metal view (interactive pan/zoom/rotate preview)
                 "LiveViewTransform.swift",
+                "LiveFramePacing.swift",
                 "LiveRenderedCanvas.swift",
                 "LiveRenderCache.swift",
                 "MetalRenderer_LiveCompositing.swift",
@@ -74,6 +75,7 @@ let package = Package(
                 .unsafeFlags(["-framework", "Metal"], .when(platforms: [.macOS])),
                 .unsafeFlags(["-framework", "CoreGraphics"], .when(platforms: [.macOS])),
                 .unsafeFlags(["-framework", "CoreImage"], .when(platforms: [.macOS])),
+                .unsafeFlags(["-framework", "CoreVideo"], .when(platforms: [.macOS])),
                 .unsafeFlags(["-framework", "AppKit"], .when(platforms: [.macOS]))
             ]
         ),

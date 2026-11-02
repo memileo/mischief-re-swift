@@ -183,53 +183,23 @@ inline SDFResult sdSplineSegment(float2 p, float2 p0, float2 p1, float2 p2, floa
 inline SDFResult sdSoftEnvelopeSpline(float2 p, float2 p0, float2 p1, float2 p2, float2 p3, float ra, float rb) {
     float strokeSDF = 1e20f;
     float best_t = 0.0f;
-    // Six uniform samples (five intervals) plus one parabolic refinement. The refinement
-    // recovers most of the old 10-sample resolution for a single extra evaluation: the
-    // original uniform minimum was off by up to half the sample spacing, which is visible
-    // on the fat noisy spans (shape 2 is chosen when the chord is short relative to the
-    // radius change). Measured on robotcrab layer 2 z3: 58.3 → 50.4 ms, max channel
-    // difference 6 LSB, 23 813 pixels (≈1.2 %) differ; live-vs-static stays identical
-    // because both paths call this function.
-    const int SAMPLES = 5;
-    float ds[SAMPLES + 1];
-    int best_i = 0;
-
+    const int SAMPLES = 9;
+    
     for (int i = 0; i <= SAMPLES; i++) {
         float t = float(i) / float(SAMPLES);
         float2 p_curve = getSplinePos(p0, p1, p2, p3, t);
-
+        
         // Exact mathematical radius, matching Shape 0 and Shape 1
         float radius = mix(ra, rb, t);
         float d_sample = fast::length(p - p_curve) - radius;
-        ds[i] = d_sample;
-
+        
         // Simple minimum is perfectly continuous across segments and has no bulge
         if (d_sample < strokeSDF) {
             strokeSDF = d_sample;
             best_t = t;
-            best_i = i;
         }
     }
-
-    // One parabolic step through the three samples around the coarse minimum: d(t) is
-    // smooth near its minimum. The divisor is positive at a true minimum; anything else
-    // (flat/degenerate span) keeps the coarse result.
-    if (best_i > 0 && best_i < SAMPLES) {
-        float h = 1.0f / float(SAMPLES);
-        float dl = ds[best_i - 1], dc = ds[best_i], dr = ds[best_i + 1];
-        float denom = dl - 2.0f * dc + dr;
-        if (denom > 1e-6f) {
-            float delta = clamp(0.5f * h * (dl - dr) / denom, -h, h);
-            float t = clamp(best_t + delta, 0.0f, 1.0f);
-            float radius = mix(ra, rb, t);
-            float d_refined = fast::length(p - getSplinePos(p0, p1, p2, p3, t)) - radius;
-            if (d_refined < strokeSDF) {
-                strokeSDF = d_refined;
-                best_t = t;
-            }
-        }
-    }
-
+    
     SDFResult res;
     res.dist = strokeSDF;
     res.t = best_t;

@@ -93,13 +93,9 @@ final class LiveDocumentSession {
 
     // ── main thread only ──
     private var latestRequest: Request?
-    private var rendering = false
-    private let throttle: LiveFrameThrottle
-    /// Start of the last render — the throttle paces start-to-start.
-    private var lastFrameStartedAt: CFTimeInterval = CACurrentMediaTime()
-    /// A deferred kick is already queued for the current slot (input can arrive at 120 Hz;
-    /// without this every event in the wait window would queue another timer).
-    private var kickScheduled = false
+    /// Display-link (or timer) pacing: exactly one render in flight, the newest request
+    /// starts on the next display tick.
+    private let pacer: LiveFramePacer
     /// Last time the status line was posted. Posting it on every frame makes SwiftUI
     /// re-lay-out a text view inside the present path at frame rate; 5 Hz reads the same
     /// and keeps the main thread free for the drawable handoff.
@@ -132,7 +128,8 @@ final class LiveDocumentSession {
         self.scale = CGFloat(max(settings.previewScale, 0.25))
         self.canvasSize = CGSize(width: 1920, height: 1080)
         // Same cap the Quick Look preview honours (0 = uncapped).
-        self.throttle = LiveFrameThrottle(maxFPS: settings.liveMaxFPS)
+        self.pacer = LiveFramePacer(maxFPS: settings.liveMaxFPS)
+        self.pacer.onStart = { [weak self] in self?.startPendingRender() }
     }
 
     // MARK: Requests (main thread)
@@ -140,31 +137,12 @@ final class LiveDocumentSession {
     func request(transform: LiveViewTransform, viewport: CGSize) {
         guard viewport.width >= 1, viewport.height >= 1 else { return }
         latestRequest = Request(transform: transform, viewport: viewport)
-        kick()
+        pacer.request()
     }
 
-    private func kick() {
-        guard !rendering, let request = latestRequest else { return }
-        // Same cap the Quick Look preview honours (0 = uncapped). Paced start-to-start:
-        // timing the gap from the *end* of the previous render added the whole render time
-        // to the interval, so a 60 fps cap produced a 37 fps cycle with an idle gap —
-        // visible judder. This window used to ignore the setting entirely.
-        let wait = throttle.waitTime(now: CACurrentMediaTime(),
-                                     lastStarted: lastFrameStartedAt)
-        if wait > 0 {
-            guard !kickScheduled else { return }
-            kickScheduled = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
-                guard let self else { return }
-                self.kickScheduled = false
-                guard !self.rendering else { return }
-                self.kick()
-            }
-            return
-        }
+    private func startPendingRender() {
+        guard let request = latestRequest else { return }
         latestRequest = nil                 // coalesce: only the newest state survives
-        rendering = true
-        lastFrameStartedAt = CACurrentMediaTime()
         run(request)
     }
 
@@ -229,8 +207,7 @@ final class LiveDocumentSession {
                                           timing.strokes, timing.segments, timing.culledStrokes))
                 }
             }
-            self.rendering = false
-            if self.latestRequest != nil { self.kick() }
+            self.pacer.renderFinished()
         }
     }
 

@@ -12,9 +12,12 @@
 //        `present(canvas, transform, drawable, clearColor)` → session draws
 //    In interactive mode a canvas already contains the camera, so it is presented 1:1;
 //    in the single-raster fallback the live transform is used instead.
-//  - No display link dependency: frames happen when a canvas arrives, when the transform
-//    changes (fallback mode), or on a resize. That keeps the gesture responsive inside a
-//    Quick Look panel, where MTKView's CADisplayLink is not something we can rely on.
+//  - Frame pacing is owned by `LivePreviewSession` (`LiveFramePacer`), not by MTKView:
+//    the session uses its own `CVDisplayLink` (with a timer fallback) to start renders
+//    just after a flip, and the view still draws when a canvas arrives, when the
+//    transform changes in fallback mode, or on a resize. That keeps the gesture
+//    responsive inside a Quick Look panel, where MTKView's CADisplayLink is not
+//    something we can rely on.
 //  - All input funnels through `commitTransform(...)`, which mutates the transform, tells
 //    the shared HUD and asks for a refresh — one code path for gestures and resets alike.
 //  - Bindings: left drag pans (shift → rotate, cmd → zoom), middle drag pans (cmd → zoom,

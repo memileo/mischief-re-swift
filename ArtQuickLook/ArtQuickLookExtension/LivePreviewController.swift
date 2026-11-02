@@ -8,12 +8,13 @@
 //  Scheduling
 //  ----------
 //  Every change (drag event, reset, resize, first frame) is a *request*, not a frame:
-//  the request records the latest transform and kicks the render queue. While a render
-//  is in flight further requests only overwrite that latest transform, so a fast mouse
-//  produces a handful of frames instead of one per event, and the view never depends on
-//  MTKView's display link running inside the Quick Look host. Exactly one render is in
-//  flight at a time — the renderer relies on that (its per-frame geometry arena is
-//  reused between frames).
+//  the request records the latest transform, and `LiveFramePacer` starts it on the next
+//  display-refresh tick (or after the rest of the frame-rate slot, if the panel's link
+//  is unavailable). While a render is in flight further requests only overwrite that
+//  latest transform, so a fast mouse produces a handful of frames instead of one per
+//  event. The view never depends on MTKView's display link running inside the Quick Look
+//  host. Exactly one render is in flight at a time — the renderer relies on that (its
+//  per-frame geometry arena is reused between frames).
 //
 //  Threading
 //  ---------
@@ -58,8 +59,9 @@ final class LivePreviewSession {
     /// Frames slower than this log their stage breakdown (bin / encode / gpu / paper), so
     /// "the preview feels sluggish" can be diagnosed without a rebuild.
     private static let slowFrameMilliseconds: Double = 250
-    /// Frame-rate cap, shared with the app's document windows (`LiveFrameThrottle`).
-    private let throttle: LiveFrameThrottle
+    /// Frame-rate cap and display-refresh pacing, shared with the app's document windows
+    /// (`LiveFramePacer`).
+    private let pacer: LiveFramePacer
     private let canvasSize: CGSize
     private let scale: CGFloat
 
@@ -70,12 +72,6 @@ final class LivePreviewSession {
 
     // ── Main thread only ──
     private var latestRequest: LiveRenderRequest?
-    private var rendering = false
-    /// When the last render *started* — the rate limiter paces start-to-start (see
-    /// `LiveFrameThrottle.waitTime`).
-    private var lastFrameStartedAt: CFTimeInterval = CACurrentMediaTime()
-    /// A deferred kick is already queued for the current slot.
-    private var kickScheduled = false
     private var didShowStatus = false
     private var didAnnounceFallback = false
     /// Published from `finish(...)` so the present closure (main thread) never has to
@@ -99,9 +95,11 @@ final class LivePreviewSession {
         self.scale = scale
         // 0 = uncapped. A display cannot show more than its refresh rate, so anything
         // above that only burns GPU time.
-        self.throttle = LiveFrameThrottle(maxFPS: Settings().liveMaxFPS)
+        self.pacer = LiveFramePacer(maxFPS: Settings().liveMaxFPS)
         self.art = art
         self.view = LivePreviewView.make(device: device)
+
+        self.pacer.onStart = { [weak self] in self?.startPendingRender() }
 
         view.onRenderRequest = { [weak self] transform, viewport in
             self?.request(transform: transform, viewport: viewport)
@@ -135,32 +133,12 @@ final class LivePreviewSession {
         }
 
         latestRequest = LiveRenderRequest(transform: transform, viewport: viewport)
-        kick()
+        pacer.request()
     }
 
-    private func kick() {
-        guard !rendering, let request = latestRequest else { return }
-
-        // Rate limit: a request that arrives too soon waits for the next slot instead of
-        // starting a render the screen cannot show anyway. The pending request is kept, so
-        // the deferred kick renders the *newest* state rather than a stale one.
-        let wait = throttle.waitTime(now: CACurrentMediaTime(),
-                                     lastStarted: lastFrameStartedAt)
-        if wait > 0 {
-            guard !kickScheduled else { return }
-            kickScheduled = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
-                guard let self else { return }
-                self.kickScheduled = false
-                guard !self.rendering else { return }
-                self.kick()
-            }
-            return
-        }
-
+    private func startPendingRender() {
+        guard let request = latestRequest else { return }
         latestRequest = nil                 // coalesce: only the newest state survives
-        rendering = true
-        lastFrameStartedAt = CACurrentMediaTime()
         run(request)
     }
 
@@ -179,17 +157,13 @@ final class LivePreviewSession {
                 self.isInteractive = interactive
             } else if failed && !self.view.hasCanvas {
                 // Nothing was ever drawn: hand over to the static preview.
-                self.rendering = false
+                self.pacer.invalidate()
                 self.onFailure?(LivePreviewError.renderUnavailable)
                 return
             }
             // A nil canvas with one already on screen is a transient failure: keep the
             // current mode so the next change retries the same way.
-            self.rendering = false
-            // A newer request arrived while we were busy: keep going, but only once. The
-            // throttle paces from `lastFrameStartedAt`, so this waits out the rest of the
-            // slot rather than a whole fresh interval.
-            if self.latestRequest != nil { self.kick() }
+            self.pacer.renderFinished()
         }
     }
 
