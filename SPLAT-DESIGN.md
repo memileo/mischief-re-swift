@@ -2177,3 +2177,144 @@ skipped / 0 failures; Xcode `ArtQuickLook` app + extension build; `build-metalli
 2. **Display-link frame pacing** — unchanged (Round 14, item 1).
 3. **`cutpaste` paste overdraw** — deliberately still last priority.
 
+
+## Round 20 — robotcrab: per-stroke noise margin, debug shape colours, shape-2 cost
+
+The robotcrab performance work was split into two documents, `robotcrab-layer1.art` (almost
+all noisy 10.6 px strokes) and `robotcrab-layer2.art` (a mixed layer: 570 strokes, ~20 % of
+them noisy, but the noisy ones are the fat 128 px brush). Layer 2 is the slow case. This
+round makes the noise layer's prune/bin margin **per stroke** (exact), adds the debug shape
+colour mode used to isolate a shape-1 cap glitch, measures where the remaining layer-2 time
+actually goes, and adopts a cheaper shape-2 evaluator within an accepted tolerance.
+
+### Debug shape colours (`ART_DEBUG_SEG_COLORS=1`)
+
+Each segment is composited on its own with a colour that identifies the shape type:
+red = `sdUnevenCapsule` (0), blue = `sdSplineSegment` (1), magenta =
+`sdSoftEnvelopeSpline` (2). The value follows a six-step sawtooth over the segment index so
+neighbouring segments stay distinguishable, and alpha is capped at 0.8 so overlapping caps
+remain visible. Per-segment (not per-stroke) compositing is deliberate: the normal
+max-over-a-stroke walk hides a bad cap behind the neighbouring segment that still covers
+the pixel. `Params.debugSegmentColors` / `PerTileParams.flags` bit 1 carry the flag, and the
+splat path is bypassed while it is on. It is a debug mode: the pixels are wrong by
+definition. It found the `sdSplineSegment` mid-section/cap glitch (blue), which is deferred
+(see below).
+
+### A clean stroke in a noisy layer no longer pays the noise margin
+
+Noise coverage reaches zero at `1.375·max(radius, 1)` device px; AA coverage reaches zero
+past ~0.44 px. The per-tile noise kernel already chose the coverage model **per stroke**
+(`strokeFlags` bit 1), but binning and staging used the wide noise margin for *every*
+segment of the layer. On layer 2 that is ~80 % of segments (458 clean strokes / 15 961
+points vs 112 noisy / 3 981 points): clean strokes were binned with a disk up to 30 px
+wider than anything they can paint.
+
+* `binPad` (GPU) and `buildSegmentTileIndicesBoxed` (CPU) now take the margin from the
+  segment's own `hasNoise` flag. `noiseLayer` in `LiveBinTransformParams` is force-only
+  (`ART_LIVE_FORCE_KERNEL`), so the A/B modes still bin identical wide tile lists.
+* The per-tile noise staging uses `liveNoisePruneMargin` for a noisy stroke and `0.5` for a
+  clean one, matching the coverage the composite actually evaluates (`liveAAStamped`).
+* Clean strokes in a noisy layer render AA coverage, whose reach is 0.44 px, so the tighter
+  box is exact, not an approximation.
+
+Paired A/B, same kernel and per-stroke staging, only the bin margin differs (1920×1080,
+release, `ART_LIVE_BINTIME=1`, warmup 2):
+
+| view | wide margin (old) | per-stroke (new) | entries | render+comp |
+|---|---|---|---|---|
+| layer2 z1 | 764 603 | 695 053 (−9.1 %) | | 13.3 → 13.1 ms |
+| layer2 z3 | 3 723 371 | 3 486 805 (−6.4 %) | | 58.5 → 57.3 ms |
+
+Pixels are byte-identical between the two bins at both zooms. The win is smaller than the
+segment ratio suggests because the 39 noisy 128 px strokes (2 238 points) dominate the
+incidence count: their disks are huge, and every segment is visited in every tile of its
+padded box. At zoom 1 the walk is a larger share of the frame, so the same entry reduction
+is worth more there.
+
+### Where layer-2 zoom-3 time goes
+
+`ART_LIVE_FORCE_KERNEL=aa|noise` bins both modes with the same wide tile lists, so the two
+per-tile kernels can be timed on identical work. On the old 3 723 371 entries: AA 42.9 ms vs
+noise 62.7 ms; the difference is the noise SDF + coverage, not the walk. `ART_LIVE_ABLATE`
+on the noise kernel at z3:
+
+| ablation | exact 9-sample build | shipped refine build |
+|---|---|---|
+| 0 (normal) | 58.5 ms | 50.4 ms |
+| 1 (no SDF/coverage) | 37.0 | 34.3 |
+| 2 (prune everything) | 24.9 | 23.8 |
+| 4 (no composite) / 8 (no write) | 58.2 / 58.1 | not measurable |
+
+So the cost before the shape-2 change was roughly 25 ms of fixed bin/sort + per-entry walk,
+12 ms of per-entry prune/fetch, and 22 ms of SDF + coverage. Reducing entries by 6 % only
+touches the middle term, which is why z3 moved ~1 ms while z1 moved more. After the
+shape-2 change the SDF + coverage term is ~16 ms and the fixed/walk terms are ~24 / 11 ms.
+
+### Shape-2 sample count (accepted approximation)
+
+`sdSoftEnvelopeSpline` evaluated 10 Catmull-Rom samples per pixel-entry and kept the
+minimum of `|p − C(t)| − r(t)`. Shape 2 is selected for the fat/noisy spans (chord at most
+`min(5·(rMax−0.82)·|Δr|, rMax)`), so this loop is exactly what the 128 px robotcrab strokes
+pay for. Paired A/B against the exact build (same per-stroke binning):
+
+| shape-2 variant | z1 | z3 | max channel diff | pixels differing (z3) |
+|---|---|---|---|---|
+| 9 samples (old) | 13.06 ms | 58.3 ms | — | — |
+| 7 uniform samples | 12.2 (−6.6 %) | 54.1 (−7.2 %) | 5 LSB | 30 562 |
+| 5 uniform samples | 11.3 (−13.8 %) | 50.0 (−14.2 %) | 8 LSB | 40 879 |
+| 4 coarse + parabolic refine | 11.1 (−15 %) | 50.5 (−13 %) | 7 LSB | 28 686 |
+| **5 coarse + parabolic refine** | **11.3 (−13 %)** | **50.4 (−14 %)** | **6 LSB** | **23 813** |
+| 6 coarse + parabolic refine | 11.8 (−10 %) | 52.9 (−9 %) | 5 LSB | 21 397 |
+
+The refinement variant samples `n+1` points then takes one parabolic step through the
+three samples around the coarse minimum (`d(t)` is smooth near it), so it costs one extra
+evaluation but recovers a good part of the 10-sample resolution: at the same speed as five
+uniform samples it halves the number of differing pixels and drops the worst error from
+8 to 6 LSB. **The 5-coarse + parabolic refine row is what ships** (accepted tolerance: max
+6 LSB, ~1.2 % of pixels at z3). Both live and static kernels call the same function, so
+live-vs-static identity is preserved. Hoisting the Catmull-Rom coefficients out of the loop
+was tried separately: byte-identical output, but 57.2 ms vs 57.2 ms, i.e. no measurable
+gain (the compiler already hoists/CSEs enough), so it was not kept.
+
+Shipping numbers: layer2 z1 13.1 → 11.3 ms, z3 58.3 → 50.7 ms; layer1 z3 11.3 → 9.5 ms.
+The accepted per-view change is static layer1 max 6 LSB / 4 739 px, static layer2 max
+3 LSB / 6 371 px, and live layer2 z3 max 6 LSB / 23 813 px. The post-change live renders
+are saved in `tmp/sdf-base-refine/` as the new comparison baseline.
+
+### Stale-metallib trap
+
+`art2png` loads
+`.build/x86_64-apple-macosx/release/art2png_ArtRenderLibrary.bundle/ArtRenderShaders.metallib`,
+not `Sources/ArtRenderLibrary/ArtRenderShaders.metallib`. Installing only the source copy
+(what `Scripts/build-metallib.sh` writes) has no effect until `swift build` re-runs and
+copies it into the bundle, or the bundle copy is updated by hand. Every measurement above
+updated both. A stale metallib verifies “OK” by name even when a kernel's parameter struct
+changed, so the symbol check is not a freshness check.
+
+### Gates
+
+`swift test` 109 tests / 4 skipped / 0 failures (including the new debug-config and
+forced-kernel tests); `stroke-splat-ab.sh --all` 10/10 identical (3 views on the splat);
+`stroke-prune-ab.sh --modes 0,1,2` byte-equal on `robotcrab-layer2` at zoom 1 and 3;
+live-vs-static stays within the existing 1–2 LSB envelopes: `kaos` 42 px / 1 LSB,
+`doodle` 26 936 px / 1 LSB, `robotcrab-layer2` z1 181 580 px / 2 LSB (the
+per-tile-vs-per-stroke noise envelope);
+`groupings-dispatch` live == static; `kaos` static byte-identical to `art/kaos.png`;
+static output moved by the accepted shape-2 tolerance
+(layer1 max 6 LSB, layer2 max 3 LSB); Xcode `ArtQuickLook` app build succeeds;
+`build-metallib.sh` verifies 32/32 kernels.
+
+### What is left
+
+1. **Robotcrab layer-2 zoom 3 is now ~50.7 ms** (from 58.3 ms) with the accepted shape-2
+   approximation. The remaining ~24 ms fixed bin/sort + walk and ~11 ms per-entry work are
+   not skippable entries; beating this needs a different dispatch shape or a cheaper
+   coverage model.
+2. **`sdSplineSegment` cap glitch** (deferred): at high zoom a segment the shape picker
+   would have sent to shape 2 keeps shape 1, and its mid-section/cap junction shows a
+   crease. Test case:
+   `ART_DEBUG_SEG_COLORS=1 .build/release/art2png --live-view --viewport 1920x1080 --zoom 500 --pan 200500,-174500 art/doodle.art`.
+   Options, best first: fix the shape-1 SDF, re-run the shape cache at the new zoom on
+   mouse release and switch if it finishes before the next view action, or cap the zoom.
+3. **Display-link frame pacing** — unchanged (Round 14, item 1).
+4. **`cutpaste` paste overdraw** — deliberately still last priority.

@@ -1178,6 +1178,33 @@ final class GpuBinSpecTests: XCTestCase {
                        GpuBinSpec.sortChunkSize)
     }
 
+    func testForcedCompositeKernelOverride() {
+        XCTAssertEqual(LiveConfig.forcedCompositeKernel(environment: [:]), .auto)
+        XCTAssertEqual(LiveConfig.forcedCompositeKernel(environment: ["ART_LIVE_FORCE_KERNEL": "aa"]), .aa)
+        XCTAssertEqual(LiveConfig.forcedCompositeKernel(environment: ["ART_LIVE_FORCE_KERNEL": "AA"]), .aa)
+        XCTAssertEqual(LiveConfig.forcedCompositeKernel(environment: ["ART_LIVE_FORCE_KERNEL": "noise"]), .noise)
+        XCTAssertEqual(LiveConfig.forcedCompositeKernel(environment: ["ART_LIVE_FORCE_KERNEL": "bogus"]), .auto)
+        XCTAssertEqual(LiveConfig.LiveCompositeKernel.auto, .auto)
+        XCTAssertFalse(LiveConfig.LiveCompositeKernel.auto.isForced)
+        XCTAssertTrue(LiveConfig.LiveCompositeKernel.aa.isForced)
+        XCTAssertTrue(LiveConfig.LiveCompositeKernel.noise.isForced)
+        XCTAssertTrue(LiveConfig.LiveCompositeKernel.auto.applied(to: true))
+        XCTAssertFalse(LiveConfig.LiveCompositeKernel.auto.applied(to: false))
+        XCTAssertFalse(LiveConfig.LiveCompositeKernel.aa.applied(to: true))
+        XCTAssertTrue(LiveConfig.LiveCompositeKernel.noise.applied(to: false))
+    }
+
+    func testDebugSegmentColorsConfig() {
+        XCTAssertFalse(LiveConfig.debugSegmentColors(environment: [:]))
+        XCTAssertTrue(LiveConfig.debugSegmentColors(environment: ["ART_DEBUG_SEG_COLORS": "1"]))
+        XCTAssertFalse(LiveConfig.debugSegmentColors(environment: ["ART_DEBUG_SEG_COLORS": "0"]))
+        XCTAssertFalse(LiveConfig.debugSegmentColors(environment: ["ART_DEBUG_SEG_COLORS": "true"]))
+        // Per-stroke noise flag bit layout: binning and the composite kernels share it.
+        XCTAssertEqual(LivePerTileEligibility.strokeFlags(isEraser: false, hasNoise: true), 2)
+        XCTAssertEqual(LivePerTileEligibility.strokeFlags(isEraser: true, hasNoise: true,
+                                                          isMarker: true), 7)
+    }
+
     func testSplatConfigDefaultsAndClamps() {
         XCTAssertTrue(LiveConfig.splatEnabled(environment: [:]))
         XCTAssertFalse(LiveConfig.splatEnabled(environment: ["ART_LIVE_SPLAT": "0"]))

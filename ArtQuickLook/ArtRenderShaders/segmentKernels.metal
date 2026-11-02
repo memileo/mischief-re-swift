@@ -183,23 +183,53 @@ inline SDFResult sdSplineSegment(float2 p, float2 p0, float2 p1, float2 p2, floa
 inline SDFResult sdSoftEnvelopeSpline(float2 p, float2 p0, float2 p1, float2 p2, float2 p3, float ra, float rb) {
     float strokeSDF = 1e20f;
     float best_t = 0.0f;
-    const int SAMPLES = 9;
-    
+    // Six uniform samples (five intervals) plus one parabolic refinement. The refinement
+    // recovers most of the old 10-sample resolution for a single extra evaluation: the
+    // original uniform minimum was off by up to half the sample spacing, which is visible
+    // on the fat noisy spans (shape 2 is chosen when the chord is short relative to the
+    // radius change). Measured on robotcrab layer 2 z3: 58.3 → 50.4 ms, max channel
+    // difference 6 LSB, 23 813 pixels (≈1.2 %) differ; live-vs-static stays identical
+    // because both paths call this function.
+    const int SAMPLES = 5;
+    float ds[SAMPLES + 1];
+    int best_i = 0;
+
     for (int i = 0; i <= SAMPLES; i++) {
         float t = float(i) / float(SAMPLES);
         float2 p_curve = getSplinePos(p0, p1, p2, p3, t);
-        
+
         // Exact mathematical radius, matching Shape 0 and Shape 1
         float radius = mix(ra, rb, t);
         float d_sample = fast::length(p - p_curve) - radius;
-        
+        ds[i] = d_sample;
+
         // Simple minimum is perfectly continuous across segments and has no bulge
         if (d_sample < strokeSDF) {
             strokeSDF = d_sample;
             best_t = t;
+            best_i = i;
         }
     }
-    
+
+    // One parabolic step through the three samples around the coarse minimum: d(t) is
+    // smooth near its minimum. The divisor is positive at a true minimum; anything else
+    // (flat/degenerate span) keeps the coarse result.
+    if (best_i > 0 && best_i < SAMPLES) {
+        float h = 1.0f / float(SAMPLES);
+        float dl = ds[best_i - 1], dc = ds[best_i], dr = ds[best_i + 1];
+        float denom = dl - 2.0f * dc + dr;
+        if (denom > 1e-6f) {
+            float delta = clamp(0.5f * h * (dl - dr) / denom, -h, h);
+            float t = clamp(best_t + delta, 0.0f, 1.0f);
+            float radius = mix(ra, rb, t);
+            float d_refined = fast::length(p - getSplinePos(p0, p1, p2, p3, t)) - radius;
+            if (d_refined < strokeSDF) {
+                strokeSDF = d_refined;
+                best_t = t;
+            }
+        }
+    }
+
     SDFResult res;
     res.dist = strokeSDF;
     res.t = best_t;
@@ -283,6 +313,23 @@ inline SDFResult sdSlantedMarkerSpline(float2 p, float2 p0, float2 p1,
     return res;
 }
 
+// MARK: - Debug shape colouring (`ART_DEBUG_SEG_COLORS`)
+//
+// Hue identifies the shape type: red = 0 (straight capsule), blue = 1 (shape-1 spline),
+// magenta = 2 (shape-2 soft envelope). The value follows a short sawtooth over the
+// segment index, so consecutive segments of the same type shade differently and their
+// individual caps can be told apart. The debug branch composites **per segment** (not
+// per stroke) for exactly that reason: the normal max-over-a-stroke walk would hide a
+// missing/back-facing cap behind the neighbouring segment that still covers the pixel.
+// Per-segment alpha is capped at 0.8 so overlapping strokes and their caps show through.
+#define DEBUG_ALPHA_CAP 0.8f
+static inline float3 debugSegmentColor(uint segmentType, uint segIdx) {
+    float v = 0.45f + 0.55f * float(segIdx % 6u) / 5.0f;
+    if (segmentType == 1) return float3(0.0f, 0.0f, v);   // blue - sdSplineSegment
+    if (segmentType == 2) return float3(v, 0.0f, v);      // magenta - sdSoftEnvelopeSpline
+    return float3(v, 0.0f, 0.0f);                         // red - sdUnevenCapsule
+}
+
 // MARK: - KERNEL 1: SDF + Hard Edge AA + Composite (Single Pass)
 kernel void segmentAACompositeKernel(
                                      const device Params &params [[buffer(0)]],
@@ -303,9 +350,7 @@ kernel void segmentAACompositeKernel(
     float2 pos = float2(gid.x, gid.y) + float2(0.5f, 0.5f);
     
     float maxCoverage = 0.0f;
-#ifdef DEBUG_SEGMENT_COLORS
-    float3 debugColor = float3(0.0);
-#endif
+    const bool debugColors = params.debugSegmentColors;
     
     for (uint i = 0; i < tIdx.count; ++i) {
         uint segIdx = tileList[tIdx.start + i];
@@ -361,14 +406,24 @@ kernel void segmentAACompositeKernel(
         float cov = 1.0f - smootherstep(-edgeWidth, edgeWidth, adjustedDist);
         float stamped = cov * opacity;
         
-        if (stamped > maxCoverage) {
+        if (debugColors) {
+            // One composite per segment: the normal max-over-a-stroke walk would hide a
+            // bad cap behind the neighbour still covering the pixel.
+            float a = min(stamped * params.penColor.a, DEBUG_ALPHA_CAP);
+            if (a > 0.0f) {
+                float4 dst = target.read(gid);
+                float3 rgb = debugSegmentColor(seg.segmentType, segIdx);
+                if (params.isEraser) {
+                    dst.rgb *= (1.0f - a);
+                    dst.a *= (1.0f - a);
+                } else {
+                    dst.rgb = rgb * a + dst.rgb * (1.0f - a);
+                    dst.a = a + dst.a * (1.0f - a);
+                }
+                target.write(dst, gid);
+            }
+        } else if (stamped > maxCoverage) {
             maxCoverage = stamped;
-#ifdef DEBUG_SEGMENT_COLORS
-            float rand = fract(sin(float(segIdx) * 12.9898) * 43758.5453);
-//            debugColor = float3(rand, fract(rand * 1.3), fract(rand * 1.7));
-            
-            debugColor = float3( (seg.segmentType + 0.002) / 2, (seg.segmentType + 0.002) / 2, (seg.segmentType + 0.002) / 2  );
-#endif
         }
     }
     
@@ -377,11 +432,7 @@ kernel void segmentAACompositeKernel(
     float finalAlpha = maxCoverage * params.penColor.a;
     float4 dst = target.read(gid);
     
-#ifdef DEBUG_SEGMENT_COLORS
-    float3 srcPremultiplied = debugColor * finalAlpha;
-#else
     float3 srcPremultiplied = params.penColor.rgb * finalAlpha;
-#endif
     
     if (params.isEraser) {
         dst.rgb = dst.rgb * (1.0f - finalAlpha);
@@ -415,9 +466,15 @@ kernel void segmentNoiseCompositeKernel(
     float2 pos = float2(gid.x, gid.y) + float2(0.5f, 0.5f);
     
     float maxCoverage = 0.0f;
-#ifdef DEBUG_SEGMENT_COLORS
-    float3 debugColor = float3(0.0);
-#endif
+    const bool debugColors = params.debugSegmentColors;
+
+    // The noise sample depends only on the pixel, so hoist it: the debug branch needs it
+    // per segment and the normal path uses it once at the end.
+    float noiseVal = 1.0f;
+    if (noiseTex.get_width() > 0) {
+        float2 noiseUV = fract(float2(gid) / (float(noiseTex.get_width()) * params.noiseScale));
+        noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
+    }
     
     for (uint i = 0; i < tIdx.count; ++i) {
         uint segIdx = tileList[tIdx.start + i];
@@ -466,22 +523,31 @@ kernel void segmentNoiseCompositeKernel(
         
         float stamped = cov * opacity;
         
-        if (stamped > maxCoverage) {
+        if (debugColors) {
+            // Per-segment composite (see segmentAACompositeKernel): each segment's own
+            // noise coverage, so a bad cap cannot hide under its neighbour.
+            float inverted = 1.0f - stamped;
+            float noiseAdd = (stamped * 0.94f) + noiseVal;
+            float a = min((1.0f - saturate(inverted / noiseAdd)) * params.penColor.a,
+                          DEBUG_ALPHA_CAP);
+            if (a > 0.0001f) {
+                float4 dst = target.read(gid);
+                float3 rgb = debugSegmentColor(seg.segmentType, segIdx);
+                if (params.isEraser) {
+                    dst.rgb *= (1.0f - a);
+                    dst.a *= (1.0f - a);
+                } else {
+                    dst.rgb = rgb * a + dst.rgb * (1.0f - a);
+                    dst.a = a + dst.a * (1.0f - a);
+                }
+                target.write(dst, gid);
+            }
+        } else if (stamped > maxCoverage) {
             maxCoverage = stamped;
-#ifdef DEBUG_SEGMENT_COLORS
-            float rand = fract(sin(float(segIdx) * 12.9898) * 43758.5453);
-            debugColor = float3(rand, fract(rand * 1.3), fract(rand * 1.7));
-#endif
         }
     }
     
     if (maxCoverage < 0.001f) return;
-    
-    float noiseVal = 1.0f;
-    if (noiseTex.get_width() > 0) {
-        float2 noiseUV = fract(float2(gid) / (float(noiseTex.get_width()) * params.noiseScale));
-        noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
-    }
     
     float inverted = 1.0f - maxCoverage;
     float noiseAdd = (maxCoverage * 0.94f) + noiseVal;
@@ -491,11 +557,7 @@ kernel void segmentNoiseCompositeKernel(
     if (finalAlpha > 0.0001f) {
         float4 dst = target.read(gid);
         
-#ifdef DEBUG_SEGMENT_COLORS
-        float3 srcPremultiplied = debugColor * finalAlpha;
-#else
         float3 srcPremultiplied = params.penColor.rgb * finalAlpha;
-#endif
         
         if (params.isEraser) {
             dst.rgb = dst.rgb * (1.0f - finalAlpha);
@@ -1467,6 +1529,9 @@ kernel void livePerTileAACompositeKernel(
     // makes them additive with the saturation skip instead of fighting it.
     const uint ablate = params.ablate;
     const float satCeil = PT_SAT_CEIL(params);
+    // `ART_DEBUG_SEG_COLORS`: paint and composite each segment on its own. `curMax` then
+    // stays 0, which makes every max-based fast path below inert without extra gates.
+    const bool debugColors = (params.flags & 0x2u) != 0u;
 
     // Block skip table: per box-local tile, blocks ascending by segStart, each with a
     // conservative half-open device box. The cursor advances exactly when the walk's
@@ -1616,7 +1681,18 @@ kernel void livePerTileAACompositeKernel(
                     stamped = liveAAStamped(pos, seg);
                 }
             }
-            if (stamped > curMax) curMax = stamped;
+            if (debugColors) {
+                float4 sc = strokeColor[curStroke];
+                float a = min(stamped * sc.a, DEBUG_ALPHA_CAP);
+                if (a > 0.0f) {
+                    perTileCompositeStroke(acc,
+                                           float4(debugSegmentColor(seg.segmentType, segIdx), 1.0f),
+                                           curFlags, a);
+                    modified = true;
+                }
+            } else if (stamped > curMax) {
+                curMax = stamped;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }   // stage chunk
@@ -1706,6 +1782,9 @@ kernel void livePerTileNoiseCompositeKernel(
     float curMax = 0.0f;
     bool curNoisy = false;
     const float satCeil = PT_SAT_CEIL(params);
+    // `ART_DEBUG_SEG_COLORS` (see the AA per-tile kernel): per-segment composite, and
+    // `curMax` stays 0 so the max-based skips below never fire.
+    const bool debugColors = (params.flags & 0x2u) != 0u;
     // Same attribution bits as the AA kernel (ART_LIVE_ABLATE, debug only, wrong pixels):
     //   1 no SDF, 2 prune all, 4 no composite, 8 no write, 16 constant segment load.
     const uint ablate = params.ablate;
@@ -1726,11 +1805,18 @@ kernel void livePerTileNoiseCompositeKernel(
             uint si = tileList[tc.start + base + t];
             GPUSplineSegment st = segments[si];
             uint sid = strokeOfSegment[si];
+            uint sFlags = strokeFlags[sid];
             tgSeg[t] = si;
             tgStroke[t] = sid;
             tgChord[t] = float4(st.p1, st.p2);
+            // Per-stroke margin, matching the stroke's actual coverage: the wide noise
+            // disk only for a noisy stroke; a clean stroke in the same layer renders AA
+            // coverage (zero past 0.44 px), so `aaDeviceMargin` is exact and rejects far
+            // more entries — the dominant win on a layer that is mostly clean strokes.
+            float margin = ((sFlags & 2u) != 0u)
+                ? liveNoisePruneMargin(st.radius0, st.radius1) : 0.5f;
             float pruneRadius = (st.padding1 != 0u)
-                ? as_type<float>(st.padding1) + liveNoisePruneMargin(st.radius0, st.radius1)
+                ? as_type<float>(st.padding1) + margin
                 : 3.4e38f;
             tgPad2[t] = pruneRadius * pruneRadius;
             // Per-entry ceiling for the max-only walk (see the skip below).
@@ -1743,7 +1829,6 @@ kernel void livePerTileNoiseCompositeKernel(
             // nd = dist/(1.1·max(r,1)) that lower bound gives an upper bound on the noise
             // coverage; times the entry's opacity ceiling it bounds stamped. Computing it
             // per tile rather than per pixel costs one sqrt per entry, not per pixel.
-            uint sFlags = strokeFlags[sid];
             float bound = 1e30f;                      // marker or opacity > 1: no bound
             if (st.padding1 != 0u && opMax <= 1.0f && (sFlags & 4u) == 0u) {
                 float rMax = max(st.radius0, st.radius1);
@@ -1882,7 +1967,26 @@ kernel void livePerTileNoiseCompositeKernel(
                 stamped = curNoisy ? liveNoisyStamped(pos, seg)
                                    : liveAAStamped(pos, seg);
             }
-            if (stamped > curMax) curMax = stamped;
+            if (debugColors) {
+                float4 sc = strokeColor[curStroke];
+                float a;
+                if (curNoisy) {
+                    float inverted = 1.0f - stamped;
+                    float noiseAdd = (stamped * 0.94f) + noiseVal;
+                    a = (1.0f - saturate(inverted / noiseAdd)) * sc.a;
+                } else {
+                    a = stamped * sc.a;
+                }
+                a = min(a, DEBUG_ALPHA_CAP);
+                if (a > 0.0001f) {
+                    perTileCompositeStroke(acc,
+                                           float4(debugSegmentColor(seg.segmentType, segIdx), 1.0f),
+                                           strokeFlags[curStroke], a);
+                    modified = true;
+                }
+            } else if (stamped > curMax) {
+                curMax = stamped;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }   // stage chunk
@@ -2152,9 +2256,15 @@ struct LiveBinBoxParams {
 // `padding1 == 0` is the "unset" sentinel (never prune): fall back to the historic
 // radius-only constants, which stay conservative.
 inline float binPad(constant LiveBinTransformParams &p, float r0, float r1,
-                    float prune, bool isMarker) {
+                    float prune, bool isMarker, bool noisy) {
     if (prune > 0.0f) {
-        float margin = (p.noiseLayer != 0u) ? max(1.0f, liveNoisePruneMargin(r0, r1)) : 1.0f;
+        // Only a noisy stroke needs the wide noise disk. A clean stroke in the same
+        // noisy layer renders through the AA coverage, whose reach is 0.44 px + slack,
+        // so the AS margin is exact for it and bins far fewer tiles. `p.noiseLayer`
+        // forces the noise margin for every segment (`ART_LIVE_FORCE_KERNEL` A/B, where
+        // both kernels must traverse identical tile lists).
+        float margin = (p.noiseLayer != 0u || noisy)
+            ? max(1.0f, liveNoisePruneMargin(r0, r1)) : 1.0f;
         return prune + margin;
     }
     float rMax = max(r0, r1);
@@ -2240,8 +2350,9 @@ kernel void liveBinTransformCountKernel(
     o.padding2 = as_type<uint>(as_type<float>(s.padding2) + camTheta);
     outSegs[gid] = o;
 
+    uint sFlags = strokeFlags[sId];
     int4 r = liveBinRangeForSeg(p, p1, p2, binPad(p, r0, r1, prune,
-                                                (strokeFlags[sId] & 4u) != 0u));
+                                                (sFlags & 4u) != 0u, (sFlags & 2u) != 0u));
     outRanges[gid] = r;
     if (r.x > r.z || r.y > r.w) return;   // empty sentinel — nothing to count
     // Clamp to the layer box: stroke-bounds boxes don't carry the full 1.4r+1 binning

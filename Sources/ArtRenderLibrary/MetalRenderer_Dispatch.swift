@@ -63,7 +63,8 @@ extension MetalRenderer {
             penColor: color,
             noiseScale: 0.4,
             isEraser: isEraser,
-            isMarker: isMarker
+            isMarker: isMarker,
+            debugSegmentColors: LiveConfig.debugSegmentColors()
         )
         
         // Debug: Print pen color alpha
@@ -331,7 +332,8 @@ extension MetalRenderer {
             tilesPerRow: (UInt32(width) + UInt32(tileSize) - 1) / UInt32(tileSize),
             stampCount: UInt32(segments.count),
             penColor: color, noiseScale: 0.4,
-            isEraser: isEraser, isMarker: isMarker
+            isEraser: isEraser, isMarker: isMarker,
+            debugSegmentColors: LiveConfig.debugSegmentColors()
         )
         if let pb = paramsBuffer {
             let pptr = pb.contents().assumingMemoryBound(to: Params.self)
@@ -479,7 +481,8 @@ extension MetalRenderer {
                 penColor: color,
                 noiseScale: 0.4,
                 isEraser: isEraser,
-                isMarker: isMarker
+                isMarker: isMarker,
+                debugSegmentColors: LiveConfig.debugSegmentColors()
             )
         
         if pasteMetaBuffer == nil ||
@@ -884,7 +887,8 @@ extension MetalRenderer {
         tileSize: Int,
         isMarker: Bool = false,
         markerFlags: [Bool]? = nil,
-        transform: CGAffineTransform? = nil
+        transform: CGAffineTransform? = nil,
+        forceNoiseMargin: Bool = false
     ) -> (tileIndices: [TileIndex], tileList: [UInt32],
         minTileX: Int, minTileY: Int, boxWidth: Int, boxHeight: Int)
     {
@@ -899,11 +903,14 @@ extension MetalRenderer {
         var ranges = [SegTileRange](repeating: .empty, count: segments.count)
         // Exact bin pad (see `SegmentPadding.pad(reach:margin:)`): the composite kernels
         // prune each pixel at `padding1 + margin`, so the tiles a segment can paint are
-        // exactly AABB(chord) ⊕ (padding1 + margin). The noise-capable kernel prunes with
-        // the wider noise margin for *every* segment of its layer, clean ones included, so
-        // a noisy layer is binned with that margin. `transform == nil` ⇒ these segments are
-        // already camera-mapped (device space), which is what `padding1` is scaled for.
-        let binNoiseLayer = segments.contains { $0.noiseSeed != 0 }
+        // exactly AABB(chord) ⊕ (padding1 + margin). The margin is **per segment**: only a
+        // noisy stroke renders the wide noise disk, while a clean stroke in the same noisy
+        // layer renders the AA coverage (zero past 0.44 px) and bins far fewer tiles. This
+        // matches the per-tile kernels, which pick the margin from the stroke's
+        // `hasNoise` flag. `transform == nil` ⇒ these segments are already camera-mapped
+        // (device space), which is what `padding1` is scaled for. `ART_LIVE_FORCE_KERNEL`
+        // bins both forced modes with the noise margin, so the two per-tile kernels
+        // traverse identical tile lists for the A/B timing run.
         // `padding1` is a source-space distance. A destination-device margin (AA/noise
         // cutoff + tile rounding) must be divided by this scale before it is added to that
         // reach, because the resulting box is transformed into destination space below.
@@ -918,7 +925,8 @@ extension MetalRenderer {
                     let marker = markerFlags.map { i < $0.count && $0[i] } ?? isMarker
                     let padding: Float
                     if seg.padding1 != 0 {
-                        let margin = binNoiseLayer
+                        let noisy = forceNoiseMargin || seg.noiseSeed != 0
+                        let margin = noisy
                             ? max(SegmentPadding.binDeviceMargin,
                                   SegmentPrune.noiseDeviceMargin(radius0: seg.radius0,
                                                                  radius1: seg.radius1))

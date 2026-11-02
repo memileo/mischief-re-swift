@@ -19,6 +19,9 @@ struct Params {
     float noiseScale;
     bool isEraser;
     bool isMarker;
+    // `ART_DEBUG_SEG_COLORS`: paint each segment with its shape-type colour and composite
+    // it on its own (see debugSegmentColor in segmentKernels.metal). Off in normal use.
+    bool debugSegmentColors;
 };
 
 struct TileIndex {

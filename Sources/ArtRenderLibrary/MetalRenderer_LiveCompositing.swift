@@ -599,10 +599,12 @@ extension MetalRenderer {
         liveStagingUsed = 0                    // planning appends from here
         var perTilePlan: PerTilePlan?
         if Self.perTileEnabled, isPerTileEligible(layerOps) {
-            let needsNoise = layerOps.contains {
+            let force = LiveConfig.forcedCompositeKernel()
+            let rawNeedsNoise = layerOps.contains {
                 if case .stroke(let segs, _, _, _, _) = $0 { return segs.contains { $0.noiseSeed != 0 } }
                 return false
             }
+            let needsNoise = force.applied(to: rawNeedsNoise)
             let pipelineAvailable = needsNoise
                 ? livePerTileNoiseCompositePipeline != nil
                 : livePerTileAACompositePipeline != nil
@@ -756,9 +758,11 @@ extension MetalRenderer {
 
         // ── 2. GPU bin the whole layer's strokes once, when every run can render through
         // the same per-tile kernels. Otherwise every run keeps its own CPU plan.
+        let force = LiveConfig.forcedCompositeKernel()
         let gpuEligible = Self.perTileEnabled && runs.allSatisfy { run in
             guard run.perTileEligible else { return false }
-            return run.hasNoise
+            let needsNoise = force.applied(to: run.hasNoise)
+            return needsNoise
                 ? (livePerTileNoiseCompositePipeline != nil && noiseTexture != nil)
                 : livePerTileAACompositePipeline != nil
         }
@@ -780,10 +784,11 @@ extension MetalRenderer {
                 let runOps = Array(layerOps[run.opStart..<run.opEnd])
                 var handled = false
                 if Self.perTileEnabled, isPerTileEligible(runOps) {
-                    let pipelineAvailable = run.hasNoise
+                    let needsNoise = force.applied(to: run.hasNoise)
+                    let pipelineAvailable = needsNoise
                         ? livePerTileNoiseCompositePipeline != nil
                         : livePerTileAACompositePipeline != nil
-                    if pipelineAvailable, !(run.hasNoise && noiseTexture == nil) {
+                    if pipelineAvailable, !(needsNoise && noiseTexture == nil) {
                         let plan = try buildPerTilePlan(layerOps: runOps,
                                                         width: width, height: height)
                         cpuRuns.append(plan.empty ? .empty : .perTile(plan))
@@ -1213,8 +1218,10 @@ extension MetalRenderer {
             if let src = raw.baseAddress { memcpy(ref.strokeVisible.contents(), src, raw.count) }
         }
 
-        var needsNoise = false
-        for run in runs where run.hasNoise { needsNoise = true; break }
+        let force = LiveConfig.forcedCompositeKernel()
+        var rawNeedsNoise = false
+        for run in runs where run.hasNoise { rawNeedsNoise = true; break }
+        let needsNoise = force.applied(to: rawNeedsNoise)
         if needsNoise && noiseTexture == nil { return nil }
 
         let cpuStart = DispatchTime.now().uptimeNanoseconds
@@ -1235,7 +1242,7 @@ extension MetalRenderer {
             camA: Float(camera.a), camB: Float(camera.b),
             camC: Float(camera.c), camD: Float(camera.d),
             camTX: Float(camera.tx), camTY: Float(camera.ty),
-            noiseLayer: needsNoise ? 1 : 0)
+            noiseLayer: force.isForced ? 1 : 0)
         var bp = LiveBinBoxParams(
             segCount: UInt32(ref.segCount),
             boxMinX: Int32(layerBox.minX), boxMinY: Int32(layerBox.minY),
@@ -1369,7 +1376,7 @@ extension MetalRenderer {
                                  strokeGroupsBuffer: emptyGroups,
                                  boxMinX: run.boxMinX, boxMinY: run.boxMinY,
                                  boxWidth: run.boxWidth, boxHeight: run.boxHeight,
-                                 containsNoise: run.hasNoise,
+                                 containsNoise: LiveConfig.forcedCompositeKernel().applied(to: run.hasNoise),
                                  tileGridStride: bin.boxWidth,
                                  tileArrayBase: base,
                                  strokeLo: first, strokeHi: last,
@@ -1487,7 +1494,8 @@ extension MetalRenderer {
             penColor: bin.color,
             noiseScale: 0.4,
             isEraser: bin.isEraser,
-            isMarker: bin.isMarker)
+            isMarker: bin.isMarker,
+            debugSegmentColors: LiveConfig.debugSegmentColors())
         if let alphaOverride { params.penColor.w = alphaOverride }
 
         if bin.hasNoise, let pipeline = segmentPasteLayerNoiseCompositePipeline,
@@ -1544,11 +1552,16 @@ extension MetalRenderer {
         var strokeColors: [SIMD4<Float>] = []
         var strokeFlags: [UInt32] = []
         let liveTile = liveTileSize
+        let force = LiveConfig.forcedCompositeKernel()
         for op in layerOps {
             if case .stroke(let segs, let color, let isEraser, let isMarker, _) = op {
                 let strokeIndex = UInt32(strokeColors.count)
                 strokeColors.append(color)
-                let hasNoise = segs.contains { $0.noiseSeed != 0 }
+                let rawHasNoise = segs.contains { $0.noiseSeed != 0 }
+                // Forced noise renders clean strokes through the noise coverage too, so
+                // both per-tile kernels see the same geometry. Forced AA needs no flag
+                // change (the AA kernel ignores bit1).
+                let hasNoise = force == .noise ? true : rawHasNoise
                 strokeFlags.append(LivePerTileEligibility.strokeFlags(isEraser: isEraser,
                                                                       hasNoise: hasNoise,
                                                                       isMarker: isMarker))
@@ -1562,13 +1575,18 @@ extension MetalRenderer {
         plan.strokeCount = strokeColors.count
         plan.segCount = segments.count
         plan.strokeOfSegCount = strokeOfSegment.count
-        plan.containsNoise = strokeFlags.contains { ($0 & 0x2) != 0 }
+        let rawNeedsNoise = layerOps.contains {
+            if case .stroke(let segs, _, _, _, _) = $0 { return segs.contains { $0.noiseSeed != 0 } }
+            return false
+        }
+        plan.containsNoise = force.applied(to: rawNeedsNoise)
 
         let boxed = buildSegmentTileIndicesBoxed(segments: segments,
                                                  textureWidth: width, textureHeight: height,
                                                  tileSize: liveTile, isMarker: false,
                                                  markerFlags: segmentIsMarker,
-                                                 transform: nil)
+                                                 transform: nil,
+                                                 forceNoiseMargin: force.isForced)
         plan.tileListCount = boxed.tileList.count
         plan.tileBoxCount = boxed.tileIndices.count
         plan.minTileX = boxed.minTileX
@@ -1710,7 +1728,8 @@ extension MetalRenderer {
                                    boxTilesPerCol: UInt32(boxHeight),
                                    tileSize: UInt32(liveTile),
                                    ablate: UInt32(LiveConfig.ablate()),
-                                   flags: LiveConfig.saturationSkipEnabled() ? 1 : 0,
+                                   flags: (LiveConfig.saturationSkipEnabled() ? 1 : 0)
+                                        | (LiveConfig.debugSegmentColors() ? 2 : 0),
                                    tileGridStride: UInt32(tileGridStride ?? boxWidth),
                                    tileArrayBase: UInt32(tileArrayBase),
                                    strokeLo: UInt32(strokeLo),
@@ -1912,8 +1931,10 @@ extension MetalRenderer {
 
         // Reference state is ensured above the timing window; here only per-frame data
         // prep follows.
-        var needsNoise = false
-        for id in visStrokeIDs where ref.strokeHasNoise[id] { needsNoise = true; break }
+        let force = LiveConfig.forcedCompositeKernel()
+        var rawNeedsNoise = false
+        for id in visStrokeIDs where ref.strokeHasNoise[id] { rawNeedsNoise = true; break }
+        let needsNoise = force.applied(to: rawNeedsNoise)
         // A marker needs the chisel SDF, which only the AA per-tile kernel implements; the
         // noise twin has no marker branch, so both together stay on the CPU/per-stroke path.
         if hasVisibleMarker && needsNoise { return false }
@@ -1951,7 +1972,7 @@ extension MetalRenderer {
             camA: Float(camera.a), camB: Float(camera.b),
             camC: Float(camera.c), camD: Float(camera.d),
             camTX: Float(camera.tx), camTY: Float(camera.ty),
-            noiseLayer: needsNoise ? 1 : 0)
+            noiseLayer: force.isForced ? 1 : 0)
         var bp = LiveBinBoxParams(
             segCount: UInt32(ref.segCount),
             boxMinX: Int32(box.minX), boxMinY: Int32(box.minY),
@@ -2053,6 +2074,9 @@ extension MetalRenderer {
             $0 >= 0 && $0 < ref.strokeIsMarker.count && ref.strokeIsMarker[$0]
         }
         let splatFits = !splatHasMarker
+            && !force.isForced
+            // The splat keeps one colour per stroke; debug mode needs one per segment.
+            && !LiveConfig.debugSegmentColors()
             && LiveConfig.splatEnabled()
             && radiusFactor <= LiveConfig.splatMaxRadiusFactor()
             && splatPixels * splatBatch <= LiveConfig.splatSlotBudget()
@@ -2557,11 +2581,16 @@ extension MetalRenderer {
         var bMaxR: [Float] = []
         var bMarker: [Bool] = []
         segments.reserveCapacity(layer.strokeSegmentCount)
+        let force = LiveConfig.forcedCompositeKernel()
         for op in layer.ops {
             guard case .stroke(let s) = op else { continue }
             let sid = UInt32(colors.count)
             colors.append(s.color)
-            let hasNoise = s.segments.contains { $0.noiseSeed != 0 }
+            let rawHasNoise = s.segments.contains { $0.noiseSeed != 0 }
+            // Forced noise must render clean strokes through the noise coverage, so its
+            // per-stroke flag has to say noisy. Forced AA leaves the flag alone (the AA
+            // kernel ignores it).
+            let hasNoise = force == .noise ? true : rawHasNoise
             flags.append(LivePerTileEligibility.strokeFlags(isEraser: s.isEraser,
                                                             hasNoise: hasNoise,
                                                             isMarker: s.isMarker))

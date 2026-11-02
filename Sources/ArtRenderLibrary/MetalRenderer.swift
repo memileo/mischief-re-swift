@@ -37,6 +37,8 @@ struct Params {
     var noiseScale: Float
     var isEraser: Bool
     var isMarker: Bool
+    /// `ART_DEBUG_SEG_COLORS` — see `LiveConfig.debugSegmentColors()`.
+    var debugSegmentColors: Bool = false
 }
 
 /// Destination tile box a paste dispatch covers (matches `PasteBoxParams` in

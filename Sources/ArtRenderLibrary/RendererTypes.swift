@@ -510,6 +510,51 @@ public enum LiveConfig {
         return 16
     }
 
+    /// Composite-kernel override for A/B timing (`ART_LIVE_FORCE_KERNEL=aa|noise`).
+    ///
+    /// Debug only: the pixels are wrong whenever the forced model does not match the
+    /// stroke (a noisy stroke through the AA kernel, a clean one through the noise
+    /// kernel). It exists to time the two per-tile kernels on **identical work**: the
+    /// tile lists are binned with the noise margin in both modes, so both runs traverse
+    /// the same entries, and only the coverage model / kernel body changes.
+    /// `.auto` is the shipping behaviour.
+    public enum LiveCompositeKernel: String {
+        case auto, aa, noise
+
+        public var isForced: Bool { self != .auto }
+
+        /// The per-tile kernel's `containsNoise` decision after the override.
+        public func applied(to rawHasNoise: Bool) -> Bool {
+            switch self {
+            case .auto: return rawHasNoise
+            case .aa: return false
+            case .noise: return true
+            }
+        }
+    }
+
+    /// See `LiveCompositeKernel`. Unknown/missing values fall back to `.auto`.
+    public static func forcedCompositeKernel(environment: [String: String]? = nil) -> LiveCompositeKernel {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        switch env["ART_LIVE_FORCE_KERNEL"]?.lowercased() {
+        case "aa": return .aa
+        case "noise": return .noise
+        default: return .auto
+        }
+    }
+
+    /// Debug shape colouring (`ART_DEBUG_SEG_COLORS=1`, off by default).
+    ///
+    /// Each segment is painted on its own with a colour that identifies its shape type
+    /// (red = straight capsule, blue = shape-1 spline, magenta = shape-2 soft envelope),
+    /// stepped in value per segment so neighbouring segments stay distinguishable, and
+    /// alpha-capped so overlapping caps remain visible. Wrong pixels by definition; the
+    /// splat path is bypassed while it is on.
+    public static func debugSegmentColors(environment: [String: String]? = nil) -> Bool {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        return env["ART_DEBUG_SEG_COLORS"] == "1"
+    }
+
     /// Composite-kernel ablation mask (`ART_LIVE_ABLATE`, 0 = off, clamped 0…31).
     /// Debug only — the pixels it produces are wrong by construction. It exists to
     /// attribute the per-tile composite's frame time on GPUs with no per-line profiling
