@@ -33,6 +33,7 @@ import SwiftUI
 import MetalKit
 import Metal
 import QuartzCore
+import CoreGraphics
 import ArtParser
 import ArtRenderLibrary
 
@@ -262,10 +263,11 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
     private var dragAnchor = CGPoint.zero
     private var lastDragLocation = CGPoint.zero
     private var dragButton: NSEvent.EventTypeMask = []
+    private var dragMonitor: Any?
     /// When the last drag event arrived; a "button not pressed" reading is only believed
     /// after a quiet spell, because a Quick Look-style host can swallow the button-down.
     private var lastDragEventTime: CFTimeInterval = CACurrentMediaTime()
-    private static let dragLapseGrace: TimeInterval = 0.35
+    private static let dragLapseGrace: TimeInterval = 1.0
 
     private enum Mode { case pan, zoom, rotate }
 
@@ -312,6 +314,7 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
         preferredFramesPerSecond = 60
         delegate = self
         isPaused = true
+        menu = Self.makeResetMenu(target: self)
     }
 
     // MARK: Draw
@@ -457,12 +460,18 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
     }
 
     override func keyDown(with event: NSEvent) {
+        let flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
         switch event.charactersIgnoringModifiers?.lowercased() {
-        case "0": commit { $0.resetAll() }
-        case "p": commit { $0.resetPan() }
-        case "z": commit { $0.resetZoom() }
-        case "r": commit { $0.resetRotation() }
-        default: super.keyDown(with: event)
+        case "0" where flags.isEmpty:
+            commit { $0.resetAll() }
+        case "p" where flags == [.command, .shift]:
+            commit { $0.resetPan() }
+        case "5" where flags.isEmpty:
+            commit { $0.resetZoom() }
+        case "r" where flags == [.command, .shift]:
+            commit { $0.resetRotation() }
+        default:
+            super.keyDown(with: event)
         }
     }
 
@@ -474,10 +483,19 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
         lastDragLocation = location
         lastDragEventTime = CACurrentMediaTime()
         NSCursor.closedHand.set()
+
+        dragMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp, .otherMouseUp, .rightMouseUp]) { [weak self] event in
+            self?.endDrag()
+            return event
+        }
     }
 
     private func drag(to location: CGPoint, mode eventMode: Mode) {
         guard isDragging else { return }
+
+        // Keep the hand cursor for the whole press.
+        NSCursor.closedHand.set()
+
         if eventMode != dragMode {
             dragMode = eventMode
             dragAnchor = location
@@ -487,10 +505,21 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
         lastDragEventTime = CACurrentMediaTime()
         let dx = location.x - lastDragLocation.x
         let dy = location.y - lastDragLocation.y
-        lastDragLocation = location
-        guard dx != 0 || dy != 0 else { return }
 
         let viewport = viewportSize
+
+        // Teleport-induced jump: re-anchor instead of applying.
+        if viewport.width > 0, (abs(dx) > viewport.width / 2 || abs(dy) > viewport.height / 2) {
+            lastDragLocation = location
+            return
+        }
+
+        lastDragLocation = location
+        guard dx != 0 || dy != 0 else {
+            warpIfNeeded(location, viewport: viewport)
+            return
+        }
+
         let pointScale = pixelScale
         switch dragMode {
         case .pan:
@@ -506,13 +535,87 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
             let centre = LiveViewSpace.centre(viewportSize: viewport)
             commit { $0.rotate(by: delta, anchor: centre, viewportSize: viewport) }
         }
+
+        warpIfNeeded(location, viewport: viewport)
     }
 
     private func endDrag() {
         guard isDragging else { return }
         isDragging = false
         dragButton = []
+        if let monitor = dragMonitor {
+            NSEvent.removeMonitor(monitor)
+            dragMonitor = nil
+        }
         NSCursor.arrow.set()
+    }
+
+    // MARK: - Cursor teleport (continuous drag past screen edges)
+
+    private func warpIfNeeded(_ location: CGPoint, viewport: CGSize) {
+        guard viewport.width > 0, viewport.height > 0 else { return }
+        let margin: CGFloat = 4
+        var nearEdge = false
+        var newLoc = location
+        if location.x < margin {
+            newLoc.x = viewport.width - margin
+            nearEdge = true
+        } else if location.x > viewport.width - margin {
+            newLoc.x = margin
+            nearEdge = true
+        }
+        if location.y < margin {
+            newLoc.y = viewport.height - margin
+            nearEdge = true
+        } else if location.y > viewport.height - margin {
+            newLoc.y = margin
+            nearEdge = true
+        }
+        guard nearEdge else { return }
+        lastDragLocation = newLoc
+        warpCursor(to: newLoc)
+    }
+
+    private func warpCursor(to viewPixelPoint: CGPoint) {
+        guard let window = window else { return }
+        let scale = pixelScale
+        let pointInWindow: NSPoint
+        if isFlipped {
+            pointInWindow = NSPoint(x: viewPixelPoint.x / scale,
+                                    y: viewPixelPoint.y / scale)
+        } else {
+            pointInWindow = NSPoint(x: viewPixelPoint.x / scale,
+                                    y: bounds.maxY - viewPixelPoint.y / scale)
+        }
+        let screenPoint = window.convertToScreen(NSRect(origin: pointInWindow, size: .zero)).origin
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? window.screen?.frame.height ?? 0
+        let quartzPoint = CGPoint(x: screenPoint.x, y: primaryHeight - screenPoint.y)
+        CGAssociateMouseAndMouseCursorPosition(0)
+        CGWarpMouseCursorPosition(quartzPoint)
+        CGAssociateMouseAndMouseCursorPosition(1)
+    }
+
+    // MARK: - Context menu
+
+    @objc func resetView() { performReset(.all) }
+    @objc func resetPanTransform() { performReset(.pan) }
+    @objc func resetZoomTransform() { performReset(.zoom) }
+    @objc func resetRotationTransform() { performReset(.rotation) }
+
+    private static func makeResetMenu(target: LiveMTKView) -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(item("Reset View", "0", #selector(LiveMTKView.resetView), target))
+        menu.addItem(item("Reset Pan", "", #selector(LiveMTKView.resetPanTransform), target))
+        menu.addItem(item("Reset Zoom", "", #selector(LiveMTKView.resetZoomTransform), target))
+        menu.addItem(item("Reset Rotation", "R", #selector(LiveMTKView.resetRotationTransform), target))
+        return menu
+    }
+
+    private static func item(_ title: String, _ key: String,
+                             _ action: Selector, _ target: LiveMTKView) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.target = target
+        return item
     }
 
     // MARK: Menu access

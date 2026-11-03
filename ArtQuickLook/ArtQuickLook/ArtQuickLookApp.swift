@@ -30,6 +30,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // .preferred + a shared tabbingIdentifier). The system default
         // ("Prefer tabs: In Full Screen") would otherwise never tab them.
         NSWindow.allowsAutomaticWindowTabbing = true
+        // Ensure the focus model (and its window observers) exist from launch.
+        _ = DocumentFocusModel.shared
         AppController.shared.showSettingsWindow(nil)
         
         // The menu bar must be in place before the app finishes launching.
@@ -403,7 +405,7 @@ extension AppController: NSMenuItemValidation {
                 #selector(resetPan(_:)),
                 #selector(resetZoom(_:)),
                 #selector(resetRotation(_:)):
-                return DocumentFocusModel.shared.hasFocusedDocument
+                return LiveMTKView.hasFocusedDocument
             case #selector(openRecentDocument(_:)):
                 return true
             case #selector(clearRecentDocuments(_:)):

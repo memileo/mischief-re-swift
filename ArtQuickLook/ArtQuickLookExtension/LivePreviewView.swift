@@ -26,6 +26,7 @@
 //
 
 import Cocoa
+import CoreGraphics
 import MetalKit
 import QuartzCore        // CACurrentMediaTime
 import ArtRenderLibrary
@@ -60,11 +61,18 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     /// The `…MouseDown` mask of the button that started the current drag, so a release
     /// outside the view can be detected from `pressedMouseButtons`.
     private var dragButtonMask: NSEvent.EventTypeMask = []
+    /// Local monitor used to notice a button release that happens outside this view
+    /// (in which case no `…MouseUp` is delivered here). Removed in `endDrag()`.
+    private var dragMonitor: Any?
     /// When the last drag event arrived — see `dragLapseGrace`.
     private var lastDragEventTime: CFTimeInterval = CACurrentMediaTime()
 
     /// Viewport (device pixels) last reported to the session.
     private var reportedViewport = CGSize.zero
+    /// Tracks the last frame we counted for the FPS readout, so a redundant
+    /// `display()` of an unchanged canvas/transform is not counted twice.
+    private var lastCountedCanvas: LiveRenderedCanvas?
+    private var lastCountedTransform = LiveViewTransform()
 
     // Gesture tuning (per **point** of mouse travel, so the feel is the same on Retina
     // and non-Retina; the transform itself works in pixels)
@@ -86,7 +94,7 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     }
 
     /// How long a drag must be silent before a "button not down" reading is believed.
-    private static let dragLapseGrace: TimeInterval = 0.35
+    private static let dragLapseGrace: TimeInterval = 1.0
 
     // MARK: - Init
 
@@ -246,7 +254,6 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         }
 
         guard let canvas = canvas, let present = present else { return }
-        let timestamp = CACurrentMediaTime()
         guard let drawable = currentDrawable else { return }
 
         // A viewport-sized canvas was rasterised for the current camera already.
@@ -254,7 +261,8 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         present(canvas, transform, drawable, clearColor)
         drawable.present()
 
-        hud.registerFrame(at: timestamp, zoomPercent: viewTransform.zoomPercent)
+        // Count this as a displayed frame update (timestamp taken after present).
+        hud.registerFrame(at: CACurrentMediaTime(), zoomPercent: viewTransform.zoomPercent)
     }
 
     // MARK: - Layout / focus
@@ -400,10 +408,19 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         lastDragEventTime = CACurrentMediaTime()
         hud.beginInteraction(mode, zoomPercent: viewTransform.zoomPercent)
         NSCursor.closedHand.set()
+
+        // Notice a release that lands outside this view (no `…MouseUp` delivered here).
+        dragMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp, .otherMouseUp, .rightMouseUp]) { [weak self] event in
+            self?.endDrag()
+            return event
+        }
     }
 
     private func drag(to location: CGPoint, mode eventMode: LiveInteractionMode) {
         guard isDragging else { return }
+
+        // Keep the hand cursor for the whole press, even if the host resets it.
+        NSCursor.closedHand.set()
 
         // Modifiers pressed/released mid-drag: re-anchor at the current location so the
         // gesture continues from where the pointer is instead of jumping.
@@ -418,10 +435,22 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         lastDragEventTime = CACurrentMediaTime()
         let dx = location.x - lastDragLocation.x
         let dy = location.y - lastDragLocation.y
-        lastDragLocation = location
-        guard dx != 0 || dy != 0 else { return }
 
         let viewport = viewportSize
+
+        // A teleport-induced jump (cursor warped to the other side) must not be
+        // applied as a giant delta — just re-anchor.
+        if viewport.width > 0, (abs(dx) > viewport.width / 2 || abs(dy) > viewport.height / 2) {
+            lastDragLocation = location
+            return
+        }
+
+        lastDragLocation = location
+        guard dx != 0 || dy != 0 else {
+            warpIfNeeded(location, viewport: viewport)
+            return
+        }
+
         // Zoom/rotate speeds are specified per point; the deltas arrive in pixels.
         let pointScale = pixelScale
         switch dragMode {
@@ -450,30 +479,67 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
             case .idle:
                 break
         }
+
+        // Teleport the cursor to the opposite edge when it reaches one, so a drag can
+        // continue past the screen edge (Blender-style).
+        warpIfNeeded(location, viewport: viewport)
+    }
+
+    // MARK: - Cursor teleport (continuous drag past screen edges)
+
+    private func warpIfNeeded(_ location: CGPoint, viewport: CGSize) {
+        guard viewport.width > 0, viewport.height > 0 else { return }
+        let margin: CGFloat = 4
+        var nearEdge = false
+        var newLoc = location
+        if location.x < margin {
+            newLoc.x = viewport.width - margin
+            nearEdge = true
+        } else if location.x > viewport.width - margin {
+            newLoc.x = margin
+            nearEdge = true
+        }
+        if location.y < margin {
+            newLoc.y = viewport.height - margin
+            nearEdge = true
+        } else if location.y > viewport.height - margin {
+            newLoc.y = margin
+            nearEdge = true
+        }
+        guard nearEdge else { return }
+        lastDragLocation = newLoc
+        warpCursor(to: newLoc)
+    }
+
+    private func warpCursor(to viewPixelPoint: CGPoint) {
+        guard let window = window else { return }
+        let scale = pixelScale
+        let pointInWindow: NSPoint
+        if isFlipped {
+            pointInWindow = NSPoint(x: viewPixelPoint.x / scale,
+                                    y: viewPixelPoint.y / scale)
+        } else {
+            pointInWindow = NSPoint(x: viewPixelPoint.x / scale,
+                                    y: bounds.maxY - viewPixelPoint.y / scale)
+        }
+        let screenPoint = window.convertToScreen(NSRect(origin: pointInWindow, size: .zero)).origin
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? window.screen?.frame.height ?? 0
+        let quartzPoint = CGPoint(x: screenPoint.x, y: primaryHeight - screenPoint.y)
+        CGAssociateMouseAndMouseCursorPosition(0)
+        CGWarpMouseCursorPosition(quartzPoint)
+        CGAssociateMouseAndMouseCursorPosition(1)
     }
 
     private func endDrag() {
         guard isDragging else { return }
         isDragging = false
         dragButtonMask = []
+        if let monitor = dragMonitor {
+            NSEvent.removeMonitor(monitor)
+            dragMonitor = nil
+        }
         NSCursor.arrow.set()
         hud.endInteraction(hold: Self.interactionHold)
-    }
-
-    // MARK: - Keyboard
-
-    /// Resets, on ⌃0 / ⌃P / ⌃Z / ⌃R — and on the bare keys too, in case they ever arrive.
-    ///
-    /// Deliberately *not* ⌘-based: ⌘O/⌘P/⌘Z/⌘R belong to the system and Finder, and never
-    /// reach a Quick Look extension at all. The context menu is the guaranteed path.
-    override func keyDown(with event: NSEvent) {
-        switch event.charactersIgnoringModifiers?.lowercased() {
-        case "0": resetView()
-        case "p": resetPanTransform()
-        case "z": resetZoomTransform()
-        case "r": resetRotationTransform()
-        default: super.keyDown(with: event)
-        }
     }
 
     // MARK: - Context menu
@@ -483,17 +549,16 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     /// with a read-only computed property).
     private static func makeResetMenu(target: LivePreviewView) -> NSMenu {
         let menu = NSMenu()
-        menu.addItem(item("Reset View", "0", #selector(LivePreviewView.resetView), target))
-        menu.addItem(item("Reset Pan", "p", #selector(LivePreviewView.resetPanTransform), target))
-        menu.addItem(item("Reset Zoom", "z", #selector(LivePreviewView.resetZoomTransform), target))
-        menu.addItem(item("Reset Rotation", "r", #selector(LivePreviewView.resetRotationTransform), target))
+        menu.addItem(item("Reset View", "", #selector(LivePreviewView.resetView), target))
+        menu.addItem(item("Reset Pan", "", #selector(LivePreviewView.resetPanTransform), target))
+        menu.addItem(item("Reset Zoom", "", #selector(LivePreviewView.resetZoomTransform), target))
+        menu.addItem(item("Reset Rotation", "", #selector(LivePreviewView.resetRotationTransform), target))
         return menu
     }
 
     private static func item(_ title: String, _ key: String,
                              _ action: Selector, _ target: LivePreviewView) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
-        item.keyEquivalentModifierMask = .control
         item.target = target
         return item
     }

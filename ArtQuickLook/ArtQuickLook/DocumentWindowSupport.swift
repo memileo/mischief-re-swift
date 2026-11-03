@@ -66,6 +66,8 @@ final class DocumentFocusModel: ObservableObject {
                            name: NSWindow.didResignKeyNotification, object: nil)
         center.addObserver(self, selector: #selector(windowStatusChanged),
                            name: NSApplication.didBecomeActiveNotification, object: nil)
+        // Seed initial state (the first document window may already be key).
+        windowStatusChanged()
     }
     
     @objc private func windowStatusChanged() {
