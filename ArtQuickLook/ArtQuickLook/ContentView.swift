@@ -1,16 +1,37 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
 final class SettingsStore: ObservableObject {
     private var settings: Settings
-    
-    @Published var previewScale: Double     { didSet { settings.previewScale = previewScale } }
-    @Published var renderPath: RenderPath   { didSet { settings.renderPath = renderPath } }
-    @Published var useCache: Bool           { didSet { settings.useCache = useCache } }
-    @Published var cacheSizeMB: Int         { didSet { settings.cacheSizeMB = cacheSizeMB } }
-    @Published var generateThumbnails: Bool { didSet { settings.generateThumbnails = generateThumbnails } }
-    @Published var liveMaxFPS: Double        { didSet { settings.liveMaxFPS = liveMaxFPS } }
-    
+
+    /// Write-backs to the backing plist (App-Group defaults via cfprefsd) are
+    /// coalesced per key: rapid changes (a slider drag fires an update per
+    /// mouse event) must not hit the defaults daemon on every tick. Each
+    /// key's write fires once changes to it have settled for `writeDelay` —
+    /// i.e. after editing ends.
+    private var pendingWrites: [String: DispatchWorkItem] = [:]
+    private static let writeDelay: TimeInterval = 0.3
+
+    @Published var previewScale: Double {
+        didSet { debouncedWrite("previewScale") { $0.settings.previewScale = $0.previewScale } }
+    }
+    @Published var renderPath: RenderPath {
+        didSet { debouncedWrite("renderPath") { $0.settings.renderPath = $0.renderPath } }
+    }
+    @Published var useCache: Bool {
+        didSet { debouncedWrite("useCache") { $0.settings.useCache = $0.useCache } }
+    }
+    @Published var cacheSizeMB: Int {
+        didSet { debouncedWrite("cacheSizeMB") { $0.settings.cacheSizeMB = $0.cacheSizeMB } }
+    }
+    @Published var generateThumbnails: Bool {
+        didSet { debouncedWrite("generateThumbnails") { $0.settings.generateThumbnails = $0.generateThumbnails } }
+    }
+    @Published var liveMaxFPS: Double {
+        didSet { debouncedWrite("liveMaxFPS") { $0.settings.liveMaxFPS = $0.liveMaxFPS } }
+    }
+
     init(settings: Settings = Settings()) {
         self.settings = settings
         // Assignments in init don't fire didSet → no write-back here.
@@ -20,6 +41,35 @@ final class SettingsStore: ObservableObject {
         cacheSizeMB = settings.cacheSizeMB
         generateThumbnails = settings.generateThumbnails
         liveMaxFPS = settings.liveMaxFPS
+        // Quitting while a write is still debounced: flush now, so the last
+        // change never dies with the process.
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(appWillTerminate),
+                                               name: NSApplication.willTerminateNotification,
+                                               object: nil)
+    }
+
+    private func debouncedWrite(_ key: String, _ apply: @escaping (SettingsStore) -> Void) {
+        pendingWrites[key]?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            apply(self)
+        }
+        pendingWrites[key] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.writeDelay, execute: work)
+    }
+
+    @objc private func appWillTerminate() {
+        flush()
+    }
+
+    /// Runs every pending write immediately.
+    func flush() {
+        for (key, work) in pendingWrites {
+            work.cancel()
+            pendingWrites[key] = nil
+            work.perform()
+        }
     }
 }
 
@@ -63,8 +113,11 @@ struct ContentView: View {
         .padding(20)
         .frame(minWidth: 600, idealWidth: 650, maxWidth: 850) // min/default window size
         .fileImporter(isPresented: $isImportingDocument,
-                      allowedContentTypes: [UTType(filenameExtension: "art") ?? .data]) { result in
-            if case .success(let url) = result { openDocument(url) }
+                      allowedContentTypes: [UTType(filenameExtension: "art") ?? .data],
+                      allowsMultipleSelection: true) { result in
+            if case .success(let urls) = result {
+                for url in urls { openDocument(url) }
+            }
         }
     }
 
@@ -177,7 +230,6 @@ struct LiveViewHelp: View {
 
 struct ScaleRow: View {
     @ObservedObject var store: SettingsStore
-    @State private var sliderID = 0
     
     static let sliderRange: ClosedRange<Double> = 0.05...2.0
     static let textRange: ClosedRange<Double> = 0.25...4.0
@@ -195,28 +247,12 @@ struct ScaleRow: View {
             Text("Preview image scale:")
             
             VStack(spacing: 1) {
-                Slider(value: sliderBinding, in: Self.sliderRange) { editing in
-                    if editing {
-                        textFocused = false
-                    } else {
-                        // After a track click the knob can rest on the raw clicked
-                        // position while the binding already holds the snapped value.
-                        // Rebuilding the control re-syncs it. No-op after a drag.
-                        DispatchQueue.main.async { sliderID += 1 }
-                    }
-                    
-//                    else {
-//                        let snapped = store.previewScale
-//                        DispatchQueue.main.async {
-//                            store.previewScale = snapped.nextUp      // invisible, forces a render
-//                            DispatchQueue.main.async {
-//                                store.previewScale = snapped         // this render re-centers the knob
-//                            }
-//                        }
-//                    }
-                }
-                .id(sliderID)               // ← new
-                .overlay(tickMarks)
+                SnappingSlider(value: sliderBinding,
+                               range: Self.sliderRange,
+                               snapPoints: Self.snapPoints,
+                               snapTolerance: Self.snapTolerance)
+                    .frame(maxWidth: .infinity)
+                    .overlay(tickMarks)
                 
                 tickLabels
             }
@@ -304,6 +340,161 @@ struct ScaleRow: View {
         }
         .frame(height: 12)
         .allowsHitTesting(false)
+    }
+}
+
+// MARK: - Snapping slider (animated snap on release)
+
+/// `NSViewRepresentable` around `NSSlider` that commits the snapped value on
+/// release instead of mid-drag.
+///
+/// All mouse interaction stays native (`NSSlider`'s own cell tracking), so the
+/// knob gets the standard pressed appearance and the standard track-click
+/// glide while the button is held. The control only adds a release step: the
+/// binding is committed with the snapped value and the knob glides any
+/// remaining distance to it. Clicking empty track therefore animates to the
+/// clicked (or snapped) position instead of teleporting, and a release before
+/// the native glide finishes never jumps.
+///
+/// Swift-land constraints that fall out of this:
+///
+/// * While the knob is actually being dragged, each action pulls the knob to
+///   the snap point (sticky, like Apple's tick-mark sliders — e.g. the Sound
+///   alert volume). The cell re-derives the value from the pointer per event,
+///   so this write cannot accumulate error.
+/// * During the track-click glide the pointer never moves; the action
+///   detector distinguishes the two by pointer movement and leaves
+///   `doubleValue` alone in the glide so the native animation is not cut.
+/// * `updateNSView` must not force values over a live knob (`isEditing`) nor
+///   over a release glide in flight (`isAnimating`).
+struct SnappingSlider: NSViewRepresentable {
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let snapPoints: [Double]
+    let snapTolerance: Double
+
+    func makeNSView(context: Context) -> SnapSliderControl {
+        let control = SnapSliderControl(value: value,
+                                        minValue: range.lowerBound,
+                                        maxValue: range.upperBound,
+                                        target: nil, action: nil)
+        control.snapPoints = snapPoints
+        control.snapTolerance = snapTolerance
+        control.onValueChange = { value = $0 }
+        // The cell's action dispatch (native tracking while pressed and the
+        // keyboard nudges) feeds the binding through one handler.
+        control.target = control
+        control.action = #selector(SnapSliderControl.sliderAction(_:))
+        return control
+    }
+
+    func updateNSView(_ control: SnapSliderControl, context: Context) {
+        guard !control.isEditing, !control.isAnimating else { return }
+        control.doubleValue = value
+    }
+}
+
+final class SnapSliderControl: NSSlider {
+
+    /// Same tolerance semantics as ScaleRow.snap.
+    var snapPoints: [Double] = []
+    var snapTolerance: Double = 0.04
+    /// Write-back to the binding while the knob moves.
+    var onValueChange: ((Double) -> Void)?
+
+    /// Native tracking (`super.mouseDown`) is in progress.
+    private(set) var isEditing = false
+    /// A release glide to a snap point is animating the knob.
+    private(set) var isAnimating = false
+    private var animationTimer: Timer?
+
+    /// Screen-space pointer position at mouse-down. A real drag keeps
+    /// producing mouse-dragged events (which update `NSEvent.mouseLocation`);
+    /// the track-click glide never does — that is how the action handler
+    /// tells them apart.
+    private var downScreen = NSPoint.zero
+    private static let dragJitter: CGFloat = 4
+    private var dragging = false
+
+    private func snapped(_ value: Double) -> Double {
+        guard let nearest = snapPoints.min(by: { abs($0 - value) < abs($1 - value) }) else {
+            return value
+        }
+        return abs(nearest - value) <= snapTolerance ? nearest : value
+    }
+
+    // MARK: Interaction
+
+    /// Only the release is custom; everything else is the cell's own tracking.
+    override func mouseDown(with event: NSEvent) {
+        stopAnimation()
+        downScreen = NSEvent.mouseLocation
+        dragging = false
+        isEditing = true
+        super.mouseDown(with: event)
+        isEditing = false
+        dragging = false
+
+        // Editing is over: commit the snapped value and glide the knob the
+        // remaining distance if the pointer landed between snap points. This
+        // also covers a click released mid-glide, which can leave the knob
+        // anywhere along the way.
+        let target = snapped(doubleValue)
+        onValueChange?(target)
+        if target != doubleValue {
+            animateKnob(from: doubleValue, to: target)
+        }
+    }
+
+    /// Continuous action dispatch while the knob moves.
+    ///
+    /// Once the pointer has moved a real distance from the press point, the
+    /// interaction is a drag: the knob becomes sticky — each update pulls it
+    /// to the snap point, matching the tick-mark sliders in Apple's own
+    /// preference panes. Before that (i.e. the whole track-click glide, whose
+    /// only "events" are animation frames while the pointer is pinned), the
+    /// handler does nothing at all: no binding commits to churn the text
+    /// field, and no `doubleValue` writes to cut the native glide short.
+    @objc func sliderAction(_ sender: NSSlider) {
+        if hypot(NSEvent.mouseLocation.x - downScreen.x,
+                 NSEvent.mouseLocation.y - downScreen.y) >= Self.dragJitter {
+            dragging = true
+        }
+        guard dragging else { return }
+
+        let value = snapped(sender.doubleValue)
+        doubleValue = value
+        onValueChange?(value)
+    }
+
+    // MARK: Release glide
+
+    /// Eases the knob to the target (display only — the binding already holds
+    /// the committed value, which the text field reflects immediately).
+    private func animateKnob(from start: Double, to target: Double) {
+        let duration = 0.18
+        let startTime = Date().timeIntervalSinceReferenceDate
+        let timer = Timer(timeInterval: 1 / 120, repeats: true) { [weak self] timer in
+            guard let self = self else { timer.invalidate(); return }
+            let progress = min((Date().timeIntervalSinceReferenceDate - startTime) / duration, 1)
+            let eased = 1 - pow(1 - progress, 3)      // ease-out cubic
+            self.doubleValue = start + (target - start) * eased
+            self.needsDisplay = true
+            if progress >= 1 {
+                timer.invalidate()
+                self.animationTimer = nil
+                self.isAnimating = false
+            }
+        }
+        animationTimer = timer
+        // .common keeps it ticking inside any active event-tracking loop.
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopAnimation() {
+        animationTimer?.invalidate()
+        animationTimer = nil
+        isAnimating = false
     }
 }
 

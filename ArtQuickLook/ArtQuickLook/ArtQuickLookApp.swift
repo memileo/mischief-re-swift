@@ -123,7 +123,13 @@ enum AppMenuBuilder {
         add(fileMenu, title: "Open .art File…",
             action: #selector(AppController.openDocument(_:)),
             key: "o",  modifiers: .command, target: AppController.shared)
-        add(fileMenu, title: "Open Recent", action: nil, target: nil)
+        
+        // Open Recent: standard items + Clear Menu, rebuilt on demand from the
+        // coordinator-fed recents list (OpenRecentMenuDelegate).
+        let recentsItem = add(fileMenu, title: "Open Recent", action: nil, target: nil)
+        let recentsMenu = NSMenu(title: "Open Recent")
+        recentsMenu.delegate = OpenRecentMenuDelegate.shared
+        recentsItem.submenu = recentsMenu
         
         fileMenu.addItem(.separator())
         add(fileMenu, title: "Close",
@@ -201,23 +207,38 @@ enum AppMenuBuilder {
         let item = menu.addItem(withTitle: title, action: action, keyEquivalent: key)
         item.keyEquivalentModifierMask = modifiers
         item.target = target                       // nil = responder chain
-        /// Generates a menu with recently opened documents from the given controller.
-        func recentDocumentsMenu(for controller: AppController) -> NSMenu? {
-            let menu = NSMenu(title: "Recent Documents")
+        return item
+    }
+}
 
-            guard !controller.recentlyOpenedDocuments.isEmpty else { return nil }
+// MARK: - Open Recent submenu
 
-            for url in controller.recentlyOpenedDocuments {
-                let item = NSMenuItem()
-                item.title = url.lastPathComponent
-//                item.action = #selector(AppController.openDocument(_:))
-                item.representedObject = url // Pass URL to the action handler
-                menu.addItem(item)
-            }
-            return menu
+/// Rebuilds the Open Recent submenu whenever it is about to open, from
+/// AppController's recents list. Items target AppController, so the standard
+/// validation path applies; the URL rides in `representedObject`.
+final class OpenRecentMenuDelegate: NSObject, NSMenuDelegate {
+    static let shared = OpenRecentMenuDelegate()
+    
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        
+        for url in AppController.shared.recentlyOpenedDocuments {
+            let item = NSMenuItem(title: url.lastPathComponent,
+                                  action: #selector(AppController.openRecentDocument(_:)),
+                                  keyEquivalent: "")
+            item.target = AppController.shared
+            item.representedObject = url
+            menu.addItem(item)
         }
         
-        return item
+        menu.addItem(.separator())
+        // Standard tail: always present, greyed out while the list is empty
+        // (validation in AppController).
+        let clear = NSMenuItem(title: "Clear Menu",
+                               action: #selector(AppController.clearRecentDocuments(_:)),
+                               keyEquivalent: "")
+        clear.target = AppController.shared
+        menu.addItem(clear)
     }
 }
 
@@ -228,23 +249,94 @@ final class AppController: NSObject {
     static let shared = AppController()
 
     private static let maxRecentItems = 10
-    private(set) var recentlyOpenedDocuments: [URL] = []
+    private static let recentsKey = "recentlyOpenedArtDocuments"
 
-    /// Adds a URL to the recent documents list.
-    func addRecentDocument(_ url: URL) {
-        // Remove existing entry if present
-        recentlyOpenedDocuments.removeAll { $0 == url }
-        
-        // Insert at the front
-        recentlyOpenedDocuments.insert(url, at: 0)
+    private struct RecentEntry {
+        let url: URL
+        /// Security-scoped bookmark. The app is sandboxed: a relaunched
+        /// process has no access to a file that is merely known by path, so
+        /// recents are persisted as bookmarks (created while this process
+        /// still had access) instead of paths.
+        let bookmark: Data
+    }
+    private var recents: [RecentEntry] = []
 
-        // Trim the list if it exceeds max count
-        if recentlyOpenedDocuments.count > Self.maxRecentItems {
-            recentlyOpenedDocuments.removeLast(recentlyOpenedDocuments.count - Self.maxRecentItems)
+    /// Bookmark-resolved URLs, for menu building and validation.
+    var recentlyOpenedDocuments: [URL] {
+        recents.map(\.url)
+    }
+
+    /// Security scopes opened and kept for the whole session (one per URL once
+    /// accessed — access starts when a recent item is opened).
+    private var activeScopes: Set<URL> = []
+
+    /// Overrides NSObject's `init()`; only `shared` constructs the controller.
+    override private init() {
+        let stored = UserDefaults.standard.array(forKey: Self.recentsKey) as? [Data] ?? []
+        // Bookmark resolution itself needs no sandbox access; recovering the
+        // URL is enough. Entries whose bookmark is obsolete are dropped.
+        recents = stored.compactMap { data in
+            var stale = false
+            guard let url = try? URL(resolvingBookmarkData: data,
+                                     options: .withoutUI,
+                                     relativeTo: nil,
+                                     bookmarkDataIsStale: &stale)
+            else { return nil }
+            return RecentEntry(url: url, bookmark: data)
         }
     }
 
-    /// Gets the list of recently opened documents.
+    /// Adds a URL to the recent documents list.
+    func addRecentDocument(_ url: URL) {
+        // Bookmark right now: this process has access to the file at this
+        // moment (dock drop, open panel, Open Recent scope). Saving at a
+        // later relaunch could not re-create bookmarks for older entries.
+        let entry = RecentEntry(url: url,
+                                bookmark: (try? url.bookmarkData()) ?? Data())
+
+        // Remove existing entry if present
+        recents.removeAll { $0.url == url }
+
+        // Insert at the front
+        recents.insert(entry, at: 0)
+
+        // Trim the list if it exceeds max count
+        if recents.count > Self.maxRecentItems {
+            recents.removeLast(recents.count - Self.maxRecentItems)
+        }
+        saveRecents()
+    }
+
+    /// Open Recent's "Clear Menu".
+    @objc func clearRecentDocuments(_ sender: Any?) {
+        recents.removeAll()
+        saveRecents()
+    }
+
+    /// An item in the Open Recent submenu; opens like any other document.
+    @objc func openRecentDocument(_ sender: NSMenuItem?) {
+        guard let url = sender?.representedObject as? URL else { return }
+        openSecurityScope(for: url)
+        DocumentWindowCoordinator.shared.open(url: url)
+    }
+
+    /// Opens (and keeps until the process ends) the security scope for a URL.
+    /// Without it, the first read after a relaunch would be denied by the
+    /// sandbox — Finder/open-panel opens are granted implicitly, recents are
+    /// not.
+    private func openSecurityScope(for url: URL) {
+        let key = url.standardizedFileURL
+        guard !activeScopes.contains(key) else { return }
+        if url.startAccessingSecurityScopedResource() {
+            activeScopes.insert(key)
+        }
+    }
+
+    private func saveRecents() {
+        UserDefaults.standard.set(recents.map(\.bookmark), forKey: Self.recentsKey)
+    }
+
+    /// .getRecentDocuments — kept for compatibility with earlier callers.
     func getRecentDocuments() -> [URL] {
         return recentlyOpenedDocuments
     }
@@ -278,14 +370,17 @@ final class AppController: NSObject {
     /// a DocumentWindowCoordinator window, same as Finder/dock opens.
     @objc func openDocument(_ sender: Any?) {
         let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = false
+        panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         panel.message = "Choose a Mischief .art document"
         panel.allowedContentTypes = [UTType(filenameExtension: "art") ?? .data]
-        panel.begin { [weak self] response in
-            guard response == .OK, let url = panel.url else { return }
-            self?.addRecentDocument(url)
-            DocumentWindowCoordinator.shared.open(url: url)
+        panel.begin { response in
+            guard response == .OK else { return }
+            // Recents are recorded centrally by DocumentWindowCoordinator.open
+            // (same as Finder/dock opens).
+            for url in panel.urls {
+                DocumentWindowCoordinator.shared.open(url: url)
+            }
         }
     }
     
@@ -309,6 +404,10 @@ extension AppController: NSMenuItemValidation {
                 #selector(resetZoom(_:)),
                 #selector(resetRotation(_:)):
                 return DocumentFocusModel.shared.hasFocusedDocument
+            case #selector(openRecentDocument(_:)):
+                return true
+            case #selector(clearRecentDocuments(_:)):
+                return !recentlyOpenedDocuments.isEmpty
             default:
                 return true
         }

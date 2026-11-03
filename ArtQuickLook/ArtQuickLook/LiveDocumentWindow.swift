@@ -588,6 +588,11 @@ final class DocumentWindowCoordinator {
             return
         }
         
+        // Only genuinely new documents enter the recents list — re-focusing an
+        // open document does not, matching standard app behaviour. This is the
+        // one open path (menu, Finder, dock drop, Open With…, Open Recent).
+        AppController.shared.addRecentDocument(key)
+        
         let controller = DocumentWindowController(url: key) { [weak self] in
             self?.controllers.removeValue(forKey: key)
         }
@@ -616,7 +621,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         super.init(window: window)
         
         // was .frame(minWidth: 480, minHeight: 360)
-        window.contentMinSize = NSSize(width: 480, height: 360)
+        window.contentMinSize = NSSize(width: 1280, height: 720)
         window.contentViewController = NSHostingController(rootView: LiveDocumentWindow(url: url))
         window.title = url.lastPathComponent
         window.isReleasedWhenClosed = false   // we own it; freed with the controller
