@@ -132,6 +132,11 @@ final class LiveDocumentSession {
         self.pacer.onStart = { [weak self] in self?.startPendingRender() }
     }
 
+    deinit {
+        // Stop a display link that is still ticking if the window closes mid-gesture.
+        pacer.invalidate()
+    }
+
     // MARK: Requests (main thread)
 
     func request(transform: LiveViewTransform, viewport: CGSize) {

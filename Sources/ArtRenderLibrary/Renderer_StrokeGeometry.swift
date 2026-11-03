@@ -420,6 +420,11 @@ func isStraightAngle(_ v1: CGPoint, _ v2: CGPoint) -> Bool {
     return dot * dot > len1Sq * len2Sq * 0.998
 }
 
+/// `ART_LIVE_SHAPE2=0` (see `LiveConfig.softEnvelopeEnabled`). Resolved once — the
+/// slider is a measurement knob, and per-segment environment lookups would tax the
+/// geometry build itself. Never set in normal runs, so selection is unchanged.
+private let softEnvelopeSelectionEnabled = LiveConfig.softEnvelopeEnabled()
+
 internal func flattenAndBuild(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRScalarSpan, seed: UInt32, depth: Int = 0, into segments: inout [GPUSplineSegment], isPolyline: Bool, isMarker: Bool) {
     
     if isPolyline {
@@ -467,7 +472,7 @@ internal func flattenAndBuild(span: CRPointSpan, rSpan: CRScalarSpan, oSpan: CRS
         )
         
         var segmentType: UInt32 = 0
-        if h_chord <= shape2_max_len || h_chord < 1.0 {
+        if softEnvelopeSelectionEnabled && (h_chord <= shape2_max_len || h_chord < 1.0) {
             segmentType = 2
         } else if isStraightAngle(v0, v1) && isStraightAngle(v1, v2) {
             segmentType = 0

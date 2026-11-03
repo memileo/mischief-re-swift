@@ -588,6 +588,17 @@ public enum LiveConfig {
         let env = environment ?? ProcessInfo.processInfo.environment
         return env["ART_LIVE_SATURATE"] != "0"
     }
+
+    /// Shape-2 soft envelope selection (`ART_LIVE_SHAPE2=0` disables it, default on).
+    ///
+    /// Measurement knob for the shape-1 vs shape-2 A/B: with shape 2 off, the spans the
+    /// picker would send to `sdSoftEnvelopeSpline` fall through to the shape-1/shape-0
+    /// decision, so the two builds differ only in the evaluator used for those spans.
+    /// This changes pixels by definition; the default is the shipping selection.
+    public static func softEnvelopeEnabled(environment: [String: String]? = nil) -> Bool {
+        let env = environment ?? ProcessInfo.processInfo.environment
+        return env["ART_LIVE_SHAPE2"] != "0"
+    }
 }
 
 // MARK: - GPU tile binning spec (platform-independent; unit-tested on Linux)

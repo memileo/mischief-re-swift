@@ -69,6 +69,8 @@ public final class LiveDisplayTickSource: LiveFrameTickSource {
     // pending tick before hopping to the main queue.
     private let lock = NSLock()
     private var pendingTickTime: TimeInterval?
+    private var pendingTickGeneration: UInt64 = 0
+    private var generation: UInt64 = 0
     private var tickQueued = false
 
     /// - Parameter forceTimer: skip the display link and report unavailable, which is
@@ -100,6 +102,11 @@ public final class LiveDisplayTickSource: LiveFrameTickSource {
     public func start() {
         guard !isRunning else { return }
         isRunning = true
+        lock.lock()
+        generation &+= 1
+        pendingTickTime = nil
+        tickQueued = false
+        lock.unlock()
         if let displayLink, CVDisplayLinkStart(displayLink) == kCVReturnSuccess {
             return
         }
@@ -118,6 +125,7 @@ public final class LiveDisplayTickSource: LiveFrameTickSource {
             CVDisplayLinkStop(displayLink)
         }
         lock.lock()
+        generation &+= 1
         pendingTickTime = nil
         tickQueued = false
         lock.unlock()
@@ -127,6 +135,7 @@ public final class LiveDisplayTickSource: LiveFrameTickSource {
     fileprivate func displayLinkFired(at time: TimeInterval) {
         lock.lock()
         pendingTickTime = time
+        pendingTickGeneration = generation
         if tickQueued {
             lock.unlock()
             return
@@ -138,10 +147,14 @@ public final class LiveDisplayTickSource: LiveFrameTickSource {
             guard let self else { return }
             self.lock.lock()
             let time = self.pendingTickTime
+            let tickGeneration = self.pendingTickGeneration
+            let currentGeneration = self.generation
             self.pendingTickTime = nil
             self.tickQueued = false
             self.lock.unlock()
-            guard self.isRunning, let time else { return }
+            // A tick posted before the latest start/stop belongs to the previous run:
+            // delivering it would make the pacer believe a cold link is warm.
+            guard self.isRunning, tickGeneration == currentGeneration, let time else { return }
             self.onTick?(time)
         }
     }
@@ -182,16 +195,24 @@ public enum LiveFramePacingMode: String {
 /// starts it immediately or waits for the next display tick; when a render finishes,
 /// `renderFinished()` starts a pending request or goes idle.
 ///
-/// Two details keep the cadence right:
+/// Three details keep the cadence right:
 ///
-/// * **A slow frame does not wait for a tick.** Once the throttle slot has elapsed,
-///   starting immediately is never worse than waiting: the frame has already missed
-///   the refresh it could have caught, and an extra wait only adds latency/throughput
-///   loss. Only frames that finish *inside* their slot wait for the next flip.
-/// * **The slot is anchored to the flip time, not to the moment the main queue got
-///   around to it.** At 60 fps on a 60 Hz panel the next tick is then exactly one
-///   interval later; without that (or a tiny tolerance) jitter would make the next
-///   tick land a hair early and halve the rate.
+/// * **A frame that fits waits for the next flip.** At 60 fps on a 60 Hz panel the next
+///   tick is exactly one slot later, so starts are phase-locked to the panel instead of
+///   drifting. The slot is anchored to the **flip time** (the tick's `inOutputTime`), not
+///   to when the main-queue block ran; a 1 ms tolerance covers a tick that lands a hair
+///   early. Without that, the 60 fps cap periodically skipped a tick and halved to 30 fps.
+/// * **A frame that does not fit starts immediately.** Once the slot has elapsed, the
+///   frame has already missed the refresh it could have caught; starting on finish is
+///   never worse than adding another wait, and it keeps slow documents (robotcrab layer 2
+///   is ~57 ms at zoom 3) at render throughput instead of quantising them to the next
+///   refresh. Only frames that finish inside their slot wait.
+/// * **A cold display link does not stall the first frames.** `CVDisplayLinkStart` takes
+///   ~40 ms to deliver its first tick on macOS. The pacer therefore starts the link in the
+///   background and runs the old one-shot timer until the first tick proves the link is
+///   warm; from then on it switches to tick-driven starts. The link is stopped after a
+///   short idle grace so a stationary window does not keep waking the main queue; the next
+///   gesture starts on the timer again while the link warms.
 public final class LiveFramePacer {
     /// Main-thread monotonic time on the same timebase as the display link.
     public static func currentTime() -> TimeInterval {
@@ -206,26 +227,50 @@ public final class LiveFramePacer {
     public var onStart: (() -> Void)?
 
     private let throttle: LiveFrameThrottle
-    private let mode: LiveFramePacingMode
+    private var mode: LiveFramePacingMode
     private let ticker: LiveFrameTickSource
     private let now: () -> TimeInterval
+    private let timerScheduler: (TimeInterval, @escaping () -> Void) -> Void
 
     private var pending = false
     private var rendering = false
     private var lastStarted: TimeInterval
     private var invalidated = false
+
+    /// The link has delivered at least one tick since it was last started. Until then the
+    /// one-shot timer covers starts; a stopped link is no longer warm.
+    private var tickerWarm = false
     private var timerScheduled = false
+    /// Generation counter for the idle stop: a newer request invalidates older work.
+    private var idleGeneration = 0
 
     /// Ticks arrive at the flip time; allow this much slack when comparing against the
     /// slot so 16.667 ms is not rounded just short of 16.667 ms.
     private static let tickTolerance: TimeInterval = 0.001
+    /// Keep the warm link around briefly so a pause inside a gesture does not pay the
+    /// display link's startup cost again.
+    private static let idleGrace: TimeInterval = 2.0
 
-    public init(maxFPS: Double,
-                mode requestedMode: LiveFramePacingMode? = nil,
-                tickSource: LiveFrameTickSource? = nil,
-                now: @escaping () -> TimeInterval = LiveFramePacer.currentTime) {
+    public convenience init(maxFPS: Double,
+                            mode requestedMode: LiveFramePacingMode? = nil,
+                            tickSource: LiveFrameTickSource? = nil,
+                            now: @escaping () -> TimeInterval = LiveFramePacer.currentTime) {
+        self.init(maxFPS: maxFPS, mode: requestedMode, tickSource: tickSource, now: now,
+                  timerScheduler: { delay, work in
+                      DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+                  })
+    }
+
+    /// Designated initialiser with an injectable timer, so tests can drive both the
+    /// display-link and the timer path without sleeping.
+    init(maxFPS: Double,
+         mode requestedMode: LiveFramePacingMode?,
+         tickSource: LiveFrameTickSource?,
+         now: @escaping () -> TimeInterval,
+         timerScheduler: @escaping (TimeInterval, @escaping () -> Void) -> Void) {
         self.throttle = LiveFrameThrottle(maxFPS: maxFPS)
         self.now = now
+        self.timerScheduler = timerScheduler
 
         let source = tickSource ?? LiveDisplayTickSource(
             forceTimer: requestedMode == .timer
@@ -254,7 +299,14 @@ public final class LiveFramePacer {
     /// A new request is pending. The owner has already stored it (newest wins).
     public func request() {
         guard !invalidated else { return }
+        cancelIdleStop()
         pending = true
+
+        // Warm the link even when this request starts immediately: the next frame is the
+        // one that would otherwise pay the startup cost.
+        if mode == .displayLink, !throttle.isUncapped {
+            _ = startTicker()
+        }
         guard !rendering else { return }
         schedule()
     }
@@ -264,7 +316,7 @@ public final class LiveFramePacer {
         guard !invalidated else { return }
         rendering = false
         guard pending else {
-            stopTicker()
+            scheduleIdleStop()
             return
         }
         schedule()
@@ -276,6 +328,7 @@ public final class LiveFramePacer {
         pending = false
         rendering = false
         timerScheduled = false
+        cancelIdleStop()
         stopTicker()
     }
 
@@ -291,34 +344,41 @@ public final class LiveFramePacer {
             return
         }
 
-        switch mode {
-        case .displayLink:
-            // If the slot has already elapsed, start now: waiting for a flip would
-            // only add latency to a frame that has already missed one.
+        if mode == .displayLink {
+            _ = startTicker()
+        }
+
+        if mode == .displayLink, tickerWarm {
+            // If the slot has already elapsed, start now: waiting for a flip would only
+            // add latency to a frame that has already missed one. Otherwise the next tick
+            // starts it.
             let wait = throttle.waitTime(now: t + Self.tickTolerance,
                                          lastStarted: lastStarted)
             if wait <= 0 {
                 start(at: t)
-            } else {
-                startTicker()
             }
+            return
+        }
 
-        case .timer:
-            // The pre-display-link path: sleep out the remainder of the slot, then
-            // start. A slow frame is started as soon as it finishes.
-            let wait = throttle.waitTime(now: t, lastStarted: lastStarted)
-            if wait <= 0 {
-                start(at: t)
-                return
-            }
-            guard !timerScheduled else { return }
-            timerScheduled = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
-                guard let self else { return }
-                self.timerScheduled = false
-                guard !self.invalidated, self.pending, !self.rendering else { return }
-                self.schedule()
-            }
+        // No link, or still warming: the pre-display-link one-shot timer. This is what
+        // keeps the first frames after a cold start from stalling for ~40 ms.
+        scheduleTimer(now: t)
+    }
+
+    /// One-shot timer for the timer mode and for a display link that is still warming.
+    private func scheduleTimer(now t: TimeInterval) {
+        let wait = throttle.waitTime(now: t, lastStarted: lastStarted)
+        if wait <= 0 {
+            start(at: t)
+            return
+        }
+        guard !timerScheduled else { return }
+        timerScheduled = true
+        timerScheduler(wait) { [weak self] in
+            guard let self else { return }
+            self.timerScheduled = false
+            guard !self.invalidated, self.pending, !self.rendering else { return }
+            self.schedule()
         }
     }
 
@@ -328,13 +388,12 @@ public final class LiveFramePacer {
             stopTicker()
             return
         }
+        tickerWarm = true
+
         // A tick during a render is not a start opportunity: exactly one render is in
         // flight. Keep ticking so the frame after it can align.
         guard !rendering else { return }
-        guard pending else {
-            stopTicker()
-            return
-        }
+        guard pending else { return }
         let wait = throttle.waitTime(now: time + Self.tickTolerance,
                                      lastStarted: lastStarted)
         guard wait <= 0 else { return }
@@ -350,13 +409,45 @@ public final class LiveFramePacer {
         onStart?()
     }
 
-    private func startTicker() {
-        guard mode == .displayLink, ticker.isAvailable, !ticker.isRunning else { return }
-        ticker.start()
+    @discardableResult
+    private func startTicker() -> Bool {
+        guard mode == .displayLink else { return false }
+        if !ticker.isRunning {
+            guard ticker.isAvailable else {
+                mode = .timer
+                return false
+            }
+            tickerWarm = false
+            ticker.start()
+            guard ticker.isRunning else {
+                // Creation succeeded but starting did not (display asleep, host
+                // limitation, ...). Fall back to the timer instead of stalling.
+                mode = .timer
+                return false
+            }
+        }
+        return true
     }
 
     private func stopTicker() {
+        cancelIdleStop()
+        tickerWarm = false
         guard ticker.isRunning else { return }
         ticker.stop()
+    }
+
+    private func scheduleIdleStop() {
+        guard ticker.isRunning else { return }
+        idleGeneration += 1
+        let generation = idleGeneration
+        timerScheduler(Self.idleGrace) { [weak self] in
+            guard let self, generation == self.idleGeneration else { return }
+            guard !self.pending, !self.rendering, !self.invalidated else { return }
+            self.stopTicker()
+        }
+    }
+
+    private func cancelIdleStop() {
+        idleGeneration += 1
     }
 }

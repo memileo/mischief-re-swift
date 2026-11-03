@@ -1205,6 +1205,16 @@ final class GpuBinSpecTests: XCTestCase {
                                                           isMarker: true), 7)
     }
 
+    func testSoftEnvelopeSelectionConfig() {
+        // Shipping default picks shape 2 where it always did.
+        XCTAssertTrue(LiveConfig.softEnvelopeEnabled(environment: [:]))
+        XCTAssertTrue(LiveConfig.softEnvelopeEnabled(environment: ["ART_LIVE_SHAPE2": "1"]))
+        // The A/B knob turns it off; only the exact "0" is special.
+        XCTAssertFalse(LiveConfig.softEnvelopeEnabled(environment: ["ART_LIVE_SHAPE2": "0"]))
+        XCTAssertTrue(LiveConfig.softEnvelopeEnabled(environment: ["ART_LIVE_SHAPE2": ""]))
+        XCTAssertTrue(LiveConfig.softEnvelopeEnabled(environment: ["ART_LIVE_SHAPE2": "off"]))
+    }
+
     func testSplatConfigDefaultsAndClamps() {
         XCTAssertTrue(LiveConfig.splatEnabled(environment: [:]))
         XCTAssertFalse(LiveConfig.splatEnabled(environment: ["ART_LIVE_SPLAT": "0"]))

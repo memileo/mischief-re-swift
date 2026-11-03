@@ -153,8 +153,9 @@ inline float2 getSplineAcceleration(float2 p0, float2 p1, float2 p2, float2 p3, 
 // MARK: - Shape 1: Variable-Radius Envelope Spline
 
 inline SDFResult sdSplineSegment(float2 p, float2 p0, float2 p1, float2 p2, float2 p3, float ra, float rb) {
-    const int PRE_SAMPLES = 6; // 6-8
-    const int NEWTON_STEPS = 4;
+    // PRE_SAMPLES = 7 NEWTON_STEPS = 5 or PRE_SAMPLES = 8 NEWTON_STEPS = 4? or lower and dynamically switch shape based on zoom.
+    const int PRE_SAMPLES = 7; // 6-8
+    const int NEWTON_STEPS = 5;
     
     float best_t = 0.0f;
     float best_f = 1e20f;

@@ -112,6 +112,11 @@ final class LivePreviewSession {
         }
     }
 
+    deinit {
+        // Stop a display link that is still ticking when the preview goes away.
+        pacer.invalidate()
+    }
+
     // MARK: - Requests (main thread)
 
     /// Something changed: make the document look like this.

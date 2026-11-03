@@ -1646,8 +1646,9 @@ bin/cull/prefix above and never touches spline math.
 
 ### Still open, in order
 
-1. **Display-link frame pacing** (above) — the remaining stutter/latency item; needs an
-   interactive A/B and a `CVDisplayLink` shim for the macOS 12 target.
+1. **Display-link frame pacing** (above) — implemented in Round 21
+   (`LiveFramePacer`); the remaining gate is an interactive A/B on real hardware
+   (`ART_LIVE_PACING=timer` switches back to the old timer path for comparison).
 2. **Spline coefficients in the stage** — exact, ~1–2 ms of kaos' 14 ms; byte-gated.
 3. **Heavier real documents** — `LiveRenderCache` declines any layer with cut/paste
    (`needsRebuild`/`hasCut`), which is what pushes real artwork onto the slow path. That is
@@ -1901,8 +1902,8 @@ kernels and the installed metallib matches a fresh build of the sources.
 2. **`cutpaste` paste overdraw** — 541 k dispatched tiles / 6.9 G SDF evaluations for
    2 047 pastes. Merging non-overlapping pastes per destination box, or tightening the
    per-dispatch box, is the lever; it is a synthetic stress document.
-3. **Display-link frame pacing** (Round 14, item 1) — unchanged, still needs an
-   interactive A/B and a `CVDisplayLink` shim for the macOS 12 target.
+3. **Display-link frame pacing** (Round 14, item 1) — done in Round 21
+   (`LiveFramePacer`; `ART_LIVE_PACING=timer` selects the old timer path for A/B).
 4. **SDF approximations** — only with an accepted tolerance.
 
 ## Round 17 — the merge pass pays for merges, not for tiles
@@ -2033,8 +2034,8 @@ round changes the shape of the sort tables and the memory movement, not what is 
 2. **CPU `bin` prefix scales with the tile count** — logo at zoom 0.5: 10 ms on 10 596
    tiles vs 3 ms on 2 857. A prefix/scatter pass that does not walk every tile on the CPU
    is the prerequisite for a fine default grid on multi-layer art.
-3. **Display-link frame pacing** (Round 14, item 1) — unchanged, still needs an
-   interactive A/B and a `CVDisplayLink` shim for the macOS 12 target.
+3. **Display-link frame pacing** (Round 14, item 1) — done in Round 21
+   (`LiveFramePacer`; `ART_LIVE_PACING=timer` selects the old timer path for A/B).
 4. **SDF approximations** — only with an accepted tolerance.
 5. **`cutpaste` paste overdraw** — 541 k dispatched tiles / 6.9 G SDF evaluations for
    2 047 pastes. Merging non-overlapping pastes per destination box, or tightening the
@@ -2174,7 +2175,7 @@ skipped / 0 failures; Xcode `ArtQuickLook` app + extension build; `build-metalli
 
 1. **Robotcrab zoom 3 is still ~81 ms**, 59 ms of it `render+comp` (Round 18). The remaining
    cost is genuine magnified coverage, not skippable entries.
-2. **Display-link frame pacing** — unchanged (Round 14, item 1).
+2. **Display-link frame pacing** — done in Round 21 (`LiveFramePacer`).
 3. **`cutpaste` paste overdraw** — deliberately still last priority.
 
 
@@ -2329,7 +2330,150 @@ shape-2 refinement was reverted); Xcode `ArtQuickLook` app build succeeds;
    would have sent to shape 2 keeps shape 1, and its mid-section/cap junction shows a
    crease. Test case:
    `ART_DEBUG_SEG_COLORS=1 .build/release/art2png --live-view --viewport 1920x1080 --zoom 500 --pan 200500,-174500 art/doodle.art`.
-   Options, best first: fix the shape-1 SDF, re-run the shape cache at the new zoom on
-   mouse release and switch if it finishes before the next view action, or cap the zoom.
-3. **Display-link frame pacing** — unchanged (Round 14, item 1).
+   The `d390ffe` rework improves taper and zoom behaviour, but the seam is still visible;
+   Round 21's `PRE_SAMPLES` A/B (6/7/8) leaves it unchanged, so it is not search
+   resolution. Options, best first: re-run the shape cache at the new zoom on mouse
+   release and switch if it finishes before the next view action, cap the zoom, or keep
+   working on the shape-1 SDF.
+3. **Display-link frame pacing** — done in Round 21 (`LiveFramePacer`;
+   `ART_LIVE_PACING=timer` for the A/B).
 4. **`cutpaste` paste overdraw** — deliberately still last priority.
+
+## Round 21 — display-link frame pacing
+
+Round 14 identified the last latency item: the live view started a render when the input
+event arrived, not when the display flipped, so a frame could wait up to a whole refresh
+before its present was even scheduled. The 60 fps cap was start-to-start (Round 14), but it
+was a main-queue timer whose nominal period matched the panel; its phase drifted slowly and
+periodically cost one extra refresh. This round replaces that timer with a display-driven
+start and keeps the cap as a minimum interval.
+
+### Shape of the change
+
+`LiveFramePacing.swift` (in `ArtRenderLibrary`, so the app and the extension share it):
+
+* `LiveDisplayTickSource` wraps `CVDisplayLink`. The link is created with
+  `CVDisplayLinkCreateWithActiveCGDisplays` and its callback only posts a **coalesced**
+  tick (with the flip time) to the main queue; a busy main thread drops older ticks instead
+  of building a queue. macOS 12 has no `NSView.displayLink` (macOS 14), so `CVDisplayLink`
+  is the only option; it is deprecated in macOS 15 but functional.
+* `LiveFramePacer` owns the policy. The session records the newest request and calls
+  `request()`; the pacer either starts it or waits for a tick, and `renderFinished()` starts
+  a pending request or goes idle.
+* The old timer path is retained as a mode. `ART_LIVE_PACING=timer` forces it for an
+  interactive A/B; it is also the fallback when `CVDisplayLink` cannot be created or
+  started (headless machines, a host that forbids it), so a request can never stall on a
+  link that will never fire.
+
+The policy has three details that matter:
+
+* **A frame that fits waits for the next flip.** At 60 fps on a 60 Hz panel the next tick is
+  exactly one slot later, so starts are phase-locked to the panel instead of drifting.
+  The slot is anchored to the **flip time** (the tick's `inOutputTime`), not to the moment
+  the main-queue block ran; a 1 ms tolerance covers the difference between "16.667 ms" and
+  a tick that is a hair earlier. Without that, the 60 fps cap periodically skipped a tick
+  and halved to 30 fps.
+* **A frame that does not fit does not wait for a tick.** Once the slot has elapsed, the
+  frame has already missed the refresh it could have caught; starting immediately on
+  finish is never worse than adding another wait, and it keeps slow documents
+  (robotcrab layer 2 is ~57 ms at zoom 3) at their render throughput instead of
+  quantising them to the next refresh. Only frames that finish inside their slot wait.
+* **A cold display link does not stall the first frames.** Measured locally,
+  `CVDisplayLinkStart` takes ~40 ms to deliver its first tick (then a steady 16.67 ms on a
+  60 Hz panel). Starting the link on demand and waiting for that tick would therefore add a
+  visible hitch to the second frame of every gesture. The pacer starts the link in the
+  background and keeps using the one-shot timer until the first tick proves it is warm;
+  only then do starts move to the tick. The link is stopped after a 2 s idle grace, so a
+  stationary window costs no main-queue wake-ups, while a pause inside a gesture reuses the
+  warm link. A link that cannot start at all leaves the pacer permanently on the timer
+  path.
+
+The first request after idle starts immediately (there is no slot to align to yet).
+`maxFPS == 0` keeps the old "as fast as the renderer allows" path: no link, no interval.
+
+Both sessions now delegate to the pacer: the app's `LiveDocumentSession` and the
+extension's `LivePreviewSession` keep only `latestRequest` and hand finished frames back on
+the main thread. The extension deliberately does **not** use MTKView's `CADisplayLink`
+(which is unreliable inside the Quick Look host); the link lives in the session, and MTKView
+still only draws when a canvas arrives. `deinit` invalidates the pacer so a window or
+preview that closes mid-gesture stops the link.
+
+### Tests and gates
+
+`LiveFramePacingTests` injects a manual tick source, a fake clock and a manual timer, so
+the policy is deterministic: first request starts immediately and warms the link; a fast
+frame waits and coalesces multiple requests; a slow frame starts on finish; 60 fps starts
+on consecutive ticks; 30 fps skips every other tick; a cold link falls back to the timer
+until its first tick; uncapped never starts the link; idle stops it after the grace period
+and a new request cancels that stop; a tick during a render is ignored; `invalidate()`
+stops ticks and ignores later requests. `swift test` is 121 tests / 4 skipped / 0 failures.
+
+Gates for this round: `swift build -c release` (package + `art2png`) succeeds;
+`xcodebuild -project ArtQuickLook/ArtQuickLook.xcodeproj -scheme ArtQuickLook` builds the
+app and embeds/builds the extension; the pacing code is UI-only, so `art2png` output is
+untouched. A local `CVDisplayLink` smoke test (not kept — it depends on a real display)
+confirmed 16.67 ms steady ticks and the ~40 ms cold-start.
+
+The remaining gate is **interactive**: drag/zoom `robotcrab-layer2` and `doodle` in the app
+with `ART_LIVE_PACING=timer` and without it, and compare cadence and drag feel. The
+`timer` mode reproduces the previous schedule; the default mode is display-link paced.
+
+### Shape-1 vs shape-2 A/B, and `PRE_SAMPLES`
+
+`ART_LIVE_SHAPE2=0` (`LiveConfig.softEnvelopeEnabled`) makes the shape picker fall through
+to the shape-1/shape-0 decision for exactly the spans it currently gives to
+`sdSoftEnvelopeSpline`. Normal runs never set it, so shipping pixels are unchanged (checked
+byte-identical on `robotcrab-layer2`). Paired A/B, 1920×1080, release, `--warmup 2`,
+`ART_LIVE_BINTIME=1`, median of three:
+
+| view | shape 2 on (shipping) | shape 2 off (`sdSplineSegment`) | entries on / off |
+|---|---|---|---|
+| robotcrab-layer2 z1 | 15.0–15.6 ms | 16.4–16.7 ms (+8–10 %) | 695 053 / 694 866 |
+| robotcrab-layer2 z3 | 66.4–66.8 ms | 71.6–72.0 ms (+7.8 %) | 3 486 805 / 3 486 233 |
+
+So `sdSplineSegment` is **not** faster for the spans shape 2 owns: it is ~8 % slower,
+despite 7 pre-samples and up to four Newton steps with backtracking versus shape 2's 10
+uniform samples. The binned entry counts are almost identical, so this is evaluator cost,
+not a pruning difference. It also explains why forcing every stroke to shape 1 showed
+little change on `robotcrab`: at z3 the bin/walk and the rest of the SDF work dominate the
+frame, so the whole-frame delta is only ~5 ms.
+
+Shape 2 is not visually redundant either:
+
+| view | pixels differing | max channel | mean (over differing) |
+|---|---|---|---|
+| robotcrab-layer2 z1 | 11 191 (0.54 %) | 5 | 1.05 |
+| robotcrab-layer2 z3 | 37 564 (1.81 %) | 13 | 1.07 |
+| `doodle-zoom.art` z1 | 2 832 (0.14 %) | 41 | 7.4 |
+| `doodle-zoom.art` z3 | 3 412 (0.16 %) | 96 | 16.9 |
+| dots z1 / z3 | 0 | 0 | — |
+
+On `robotcrab` the difference is edge AA (≈1 LSB). On `doodle-zoom` the shape-1 build has
+ragged edges and small notches at segment joins where shape 2 is smooth; enlarged crops at
+the largest-diff points show the shape-1 boundary stepping in/out by ~1 px. `dots.art`
+(degenerate zero-length spans) is byte-identical because both evaluators reduce to the same
+disk. **Keep shape 2.**
+
+`PRE_SAMPLES` was then A/B'd at 6 (shipping), 7 and 8, with a 32-sample build as a
+convergence reference. On `kaos.art` z3 (321 611 segments, shape-1 heavy) the distance to
+the 32-sample build shrinks as expected — 6: 296 px / max 197; 7: 203 px / max 125;
+8: 153 px / max 71 — but the documented high-zoom views that motivated the check
+(`doodle.art --zoom 500 --pan 200500,-174500` and `doodle-zoom.art --zoom 50`) are
+effectively identical for 6, 7 and 8 (≤28 px, ≤1 LSB). The visible join crease in the
+z500 view is unchanged by sample count: it is the deferred Round 20 shape-1 join, not a
+search-resolution miss. Cost at 8 is ~+5 % on kaos z3 (18.5–19.9 → 20.0–21.0 ms), +0.9 %
+on shipping `robotcrab` z3 (66.5 → 67.1 ms) and +4 % with shape 2 off (72.3 → 75.1 ms).
+So **keep `PRE_SAMPLES = 6`**: the extra steps move ~0.015 % of pixels on the densest
+shape-1 document, miss the known artifact, and cost up to ~5 % there. If an artifact is
+later traced to the initial-search bracket, 8 is the converged ceiling; widening the
+Newton bracket to ±2 samples instead was tried and made joins worse (960 px / max 206
+against the 32-sample build) at the same cost as 6, so it was not kept.
+
+### Next
+
+* The **interactive pacing A/B** above (human at the display: timer vs display link).
+* The Round 20 deferred **shape-1 join crease** at extreme zoom
+  (`doodle.art --zoom 500`). The `d390ffe` rework improves taper/zoom behaviour but does
+  not remove this seam, and `PRE_SAMPLES` is not the lever (6/7/8 agree there). The Round 20
+  options still stand: re-run the shape cache at the new zoom on mouse release, or cap the
+  zoom.
