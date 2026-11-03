@@ -17,7 +17,7 @@ final class AppMain {
         let app = NSApplication.shared
         let delegate = AppDelegate()          // stays alive: main() never returns
         app.delegate = delegate
-        app.run() // Runtime warning: Cannot use Scene methods for URL, NSUserActivity, and other External Events without using SwiftUI Lifecycle. Without SwiftUI Lifecycle, advertising and handling External Events wastes resources, and will have unpredictable results.
+        app.run()
     }
 }
 
@@ -265,7 +265,7 @@ final class AppController: NSObject {
             window.tabbingMode = .disallowed          // never joins document tab groups
             window.isReleasedWhenClosed = false       // reuse on next open
             window.setFrameAutosaveName("ArtQuickLookSettings")
-            window.contentView = NSHostingView(rootView: ContentView()) // Runtime warning: Cannot use Scene methods for URL, NSUserActivity, and other External Events without using SwiftUI Lifecycle. Without SwiftUI Lifecycle, advertising and handling External Events wastes resources, and will have unpredictable results.
+            window.contentView = NSHostingView(rootView: ContentView())
             settingsWindow = window
         }
         NSApp.activate(ignoringOtherApps: true)

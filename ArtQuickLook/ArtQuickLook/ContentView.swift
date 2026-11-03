@@ -66,7 +66,6 @@ struct ContentView: View {
                       allowedContentTypes: [UTType(filenameExtension: "art") ?? .data]) { result in
             if case .success(let url) = result { openDocument(url) }
         }
-        .onOpenURL { url in openDocument(url) }
     }
 
     /// macOS 12 replacement for `openWindow(id:value:)`.
