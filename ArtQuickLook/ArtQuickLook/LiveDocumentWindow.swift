@@ -267,7 +267,7 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
     /// When the last drag event arrived; a "button not pressed" reading is only believed
     /// after a quiet spell, because a Quick Look-style host can swallow the button-down.
     private var lastDragEventTime: CFTimeInterval = CACurrentMediaTime()
-    private static let dragLapseGrace: TimeInterval = 1.0
+    private static let dragLapseGrace: TimeInterval = 3.0
 
     private enum Mode { case pan, zoom, rotate }
 
@@ -388,6 +388,17 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
         }
     }
 
+    // MARK: - Cursor
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if isDragging {
+            addCursorRect(bounds, cursor: .closedHand)
+        } else {
+            addCursorRect(bounds, cursor: .arrow)
+        }
+    }
+
     // MARK: Input
 
     private var pixelScale: CGFloat { max(window?.backingScaleFactor ?? 1, 1) }
@@ -483,6 +494,8 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
         lastDragLocation = location
         lastDragEventTime = CACurrentMediaTime()
         NSCursor.closedHand.set()
+        NSCursor.closedHand.push()
+        window?.invalidateCursorRects(for: self)
 
         dragMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp, .otherMouseUp, .rightMouseUp]) { [weak self] event in
             self?.endDrag()
@@ -547,7 +560,9 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
             NSEvent.removeMonitor(monitor)
             dragMonitor = nil
         }
+        NSCursor.pop()
         NSCursor.arrow.set()
+        window?.invalidateCursorRects(for: self)
     }
 
     // MARK: - Cursor teleport (continuous drag past screen edges)
@@ -579,14 +594,10 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
     private func warpCursor(to viewPixelPoint: CGPoint) {
         guard let window = window else { return }
         let scale = pixelScale
-        let pointInWindow: NSPoint
-        if isFlipped {
-            pointInWindow = NSPoint(x: viewPixelPoint.x / scale,
-                                    y: viewPixelPoint.y / scale)
-        } else {
-            pointInWindow = NSPoint(x: viewPixelPoint.x / scale,
-                                    y: bounds.maxY - viewPixelPoint.y / scale)
-        }
+        let pointInView = NSPoint(x: viewPixelPoint.x / scale,
+                                  y: isFlipped ? viewPixelPoint.y / scale
+                                               : bounds.maxY - viewPixelPoint.y / scale)
+        let pointInWindow = convert(pointInView, to: nil)
         let screenPoint = window.convertToScreen(NSRect(origin: pointInWindow, size: .zero)).origin
         let primaryHeight = NSScreen.screens.first?.frame.height ?? window.screen?.frame.height ?? 0
         let quartzPoint = CGPoint(x: screenPoint.x, y: primaryHeight - screenPoint.y)
@@ -604,16 +615,17 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
 
     private static func makeResetMenu(target: LiveMTKView) -> NSMenu {
         let menu = NSMenu()
-        menu.addItem(item("Reset View", "0", #selector(LiveMTKView.resetView), target))
-        menu.addItem(item("Reset Pan", "", #selector(LiveMTKView.resetPanTransform), target))
-        menu.addItem(item("Reset Zoom", "", #selector(LiveMTKView.resetZoomTransform), target))
-        menu.addItem(item("Reset Rotation", "R", #selector(LiveMTKView.resetRotationTransform), target))
+        menu.addItem(item("Reset View", "0", [], #selector(LiveMTKView.resetView), target))
+        menu.addItem(item("Reset Pan", "p", [.command, .shift], #selector(LiveMTKView.resetPanTransform), target))
+        menu.addItem(item("Reset Zoom", "5", [], #selector(LiveMTKView.resetZoomTransform), target))
+        menu.addItem(item("Reset Rotation", "r", [.command, .shift], #selector(LiveMTKView.resetRotationTransform), target))
         return menu
     }
 
-    private static func item(_ title: String, _ key: String,
+    private static func item(_ title: String, _ key: String, _ modifiers: NSEvent.ModifierFlags = [],
                              _ action: Selector, _ target: LiveMTKView) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.keyEquivalentModifierMask = modifiers
         item.target = target
         return item
     }

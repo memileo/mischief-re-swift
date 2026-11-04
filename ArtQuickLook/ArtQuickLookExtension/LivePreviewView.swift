@@ -261,8 +261,14 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         present(canvas, transform, drawable, clearColor)
         drawable.present()
 
-        // Count this as a displayed frame update (timestamp taken after present).
-        hud.registerFrame(at: CACurrentMediaTime(), zoomPercent: viewTransform.zoomPercent)
+        // Only count a frame when the displayed content actually changed, so a
+        // redundant `display()` of an unchanged canvas/transform does not inflate
+        // the FPS readout (and it stays at the render cap).
+        if canvas !== lastCountedCanvas || transform != lastCountedTransform {
+            lastCountedCanvas = canvas
+            lastCountedTransform = transform
+            hud.registerFrame(at: CACurrentMediaTime(), zoomPercent: viewTransform.zoomPercent)
+        }
     }
 
     // MARK: - Layout / focus
@@ -446,10 +452,7 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         }
 
         lastDragLocation = location
-        guard dx != 0 || dy != 0 else {
-            warpIfNeeded(location, viewport: viewport)
-            return
-        }
+        guard dx != 0 || dy != 0 else { return }
 
         // Zoom/rotate speeds are specified per point; the deltas arrive in pixels.
         let pointScale = pixelScale
@@ -479,55 +482,6 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
             case .idle:
                 break
         }
-
-        // Teleport the cursor to the opposite edge when it reaches one, so a drag can
-        // continue past the screen edge (Blender-style).
-        warpIfNeeded(location, viewport: viewport)
-    }
-
-    // MARK: - Cursor teleport (continuous drag past screen edges)
-
-    private func warpIfNeeded(_ location: CGPoint, viewport: CGSize) {
-        guard viewport.width > 0, viewport.height > 0 else { return }
-        let margin: CGFloat = 4
-        var nearEdge = false
-        var newLoc = location
-        if location.x < margin {
-            newLoc.x = viewport.width - margin
-            nearEdge = true
-        } else if location.x > viewport.width - margin {
-            newLoc.x = margin
-            nearEdge = true
-        }
-        if location.y < margin {
-            newLoc.y = viewport.height - margin
-            nearEdge = true
-        } else if location.y > viewport.height - margin {
-            newLoc.y = margin
-            nearEdge = true
-        }
-        guard nearEdge else { return }
-        lastDragLocation = newLoc
-        warpCursor(to: newLoc)
-    }
-
-    private func warpCursor(to viewPixelPoint: CGPoint) {
-        guard let window = window else { return }
-        let scale = pixelScale
-        let pointInWindow: NSPoint
-        if isFlipped {
-            pointInWindow = NSPoint(x: viewPixelPoint.x / scale,
-                                    y: viewPixelPoint.y / scale)
-        } else {
-            pointInWindow = NSPoint(x: viewPixelPoint.x / scale,
-                                    y: bounds.maxY - viewPixelPoint.y / scale)
-        }
-        let screenPoint = window.convertToScreen(NSRect(origin: pointInWindow, size: .zero)).origin
-        let primaryHeight = NSScreen.screens.first?.frame.height ?? window.screen?.frame.height ?? 0
-        let quartzPoint = CGPoint(x: screenPoint.x, y: primaryHeight - screenPoint.y)
-        CGAssociateMouseAndMouseCursorPosition(0)
-        CGWarpMouseCursorPosition(quartzPoint)
-        CGAssociateMouseAndMouseCursorPosition(1)
     }
 
     private func endDrag() {
