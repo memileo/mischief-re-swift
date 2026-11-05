@@ -24,7 +24,9 @@
 //    shift → rotate), the scroll wheel zooms at the pointer, and 0/P/Z/R + the context menu
 //    do the resets.
 //  - A drag teleports the cursor to the opposite edge when it reaches one, so a gesture can
-//    continue past the screen edge (Blender-style).
+//    continue past the screen edge (Blender-style). Movement is integrated from the event
+//    deltas, not from absolute cursor positions, so a warp (or a delayed/queued event
+//    position) cannot stall the gesture for a frame or two.
 //
 
 import Cocoa
@@ -76,6 +78,14 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     /// The last event handled through either the monitor or the view override, so the
     /// same physical event is not applied twice.
     private var lastHandledDrag: (eventNumber: Int, timestamp: TimeInterval)?
+    /// AppKit does not document the units or the y direction of `event.deltaX/deltaY`.
+    /// Each axis is calibrated once per gesture from the first drag event whose actual
+    /// cursor travel is measurable; `nil` means "not measured yet".
+    private var deltaScaleX: CGFloat?
+    private var deltaScaleY: CGFloat?
+    /// The last cursor warp: a queued drag event can still report the side the pointer
+    /// came from, and must not be used to warp straight back.
+    private var recentWarp: (source: CGPoint, target: CGPoint, until: CFTimeInterval)?
     /// Window notifications that re-assert focus after a full-screen transition.
     private var windowObservers: [NSObjectProtocol] = []
 
@@ -482,6 +492,9 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         lastDragLocation = location
         lastDragEventTime = CACurrentMediaTime()
         lastHandledDrag = nil
+        deltaScaleX = nil
+        deltaScaleY = nil
+        recentWarp = nil
         hud.beginInteraction(mode, zoomPercent: viewTransform.zoomPercent)
         NSCursor.closedHand.set()
 
@@ -514,17 +527,20 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
             return
         }
         lastHandledDrag = (event.eventNumber, event.timestamp)
-        drag(to: pixelLocation(of: event), mode: mode(for: event.modifierFlags))
+        drag(to: pixelLocation(of: event),
+             delta: CGVector(dx: event.deltaX, dy: event.deltaY),
+             mode: mode(for: event.modifierFlags))
     }
 
-    private func drag(to location: CGPoint, mode eventMode: LiveInteractionMode) {
+    private func drag(to location: CGPoint, delta: CGVector,
+                      mode eventMode: LiveInteractionMode) {
         guard isDragging else { return }
 
         // Keep the hand cursor for the whole press, even if the host resets it.
         NSCursor.closedHand.set()
 
         // Modifiers pressed/released mid-drag: re-anchor at the current location so the
-        // gesture continues from where the pointer is instead of jumping.
+        // zoom anchor follows the pointer. Deltas are relative, so no motion is lost.
         if eventMode != dragMode {
             dragMode = eventMode
             dragAnchor = location
@@ -534,19 +550,33 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         }
 
         lastDragEventTime = CACurrentMediaTime()
-        let dx = location.x - lastDragLocation.x
-        let dy = location.y - lastDragLocation.y
-
         let viewport = viewportSize
 
-        // A teleport-induced jump (cursor warped to the other side) must not be
-        // applied as a giant delta — just re-anchor.
-        if viewport.width > 0, (abs(dx) > viewport.width / 2 || abs(dy) > viewport.height / 2) {
-            lastDragLocation = location
-            return
+        // Movement comes from the event deltas, so a cursor warp during the gesture (or a
+        // drag event whose absolute position is still on the old side) cannot produce a
+        // giant false delta. Calibrate the raw delta scale against the actual cursor
+        // travel the first time it is measurable — see `deltaScale(raw:pixels:)`.
+        let pixelDX = location.x - lastDragLocation.x
+        let pixelDY = location.y - lastDragLocation.y
+        if deltaScaleX == nil, abs(delta.dx) > 0.5, abs(pixelDX) > 0.5 {
+            deltaScaleX = Self.deltaScale(raw: delta.dx, pixels: pixelDX, pixelScale: pixelScale)
+        }
+        if deltaScaleY == nil, abs(delta.dy) > 0.5, abs(pixelDY) > 0.5 {
+            deltaScaleY = Self.deltaScale(raw: delta.dy, pixels: pixelDY, pixelScale: pixelScale)
+        }
+        var dx = delta.dx * (deltaScaleX ?? pixelScale)
+        var dy = delta.dy * (deltaScaleY ?? -pixelScale)
+        lastDragLocation = location
+
+        // A warp is not supposed to produce a delta (the association guard around it
+        // prevents that), but a host that ignores the guard can feed the whole jump back
+        // as one event. No real drag moves half the view in a single event.
+        if viewport.width > 0,
+           abs(dx) > viewport.width / 2 || abs(dy) > viewport.height / 2 {
+            dx = 0
+            dy = 0
         }
 
-        lastDragLocation = location
         guard dx != 0 || dy != 0 else {
             // Holding still at an edge still teleports, so the next movement comes
             // from the opposite side.
@@ -603,8 +633,31 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
 
     // MARK: - Cursor teleport (continuous drag past screen edges)
 
+    /// Snap the raw-delta-to-cursor-pixels ratio to the only two plausible units
+    /// (1 = device pixels, `pixelScale` = points) and keep its sign. The ratio comes from
+    /// one event where both the raw delta and the actual cursor travel are measurable.
+    private static func deltaScale(raw: CGFloat, pixels: CGFloat,
+                                   pixelScale: CGFloat) -> CGFloat {
+        let magnitude: CGFloat = abs(pixels / raw) > 1.5 ? pixelScale : 1
+        return pixels * raw < 0 ? -magnitude : magnitude
+    }
+
     private func warpIfNeeded(_ location: CGPoint, viewport: CGSize) {
         guard viewport.width > 0, viewport.height > 0 else { return }
+
+        // A drag event queued before a warp can still report the old side. Warping on it
+        // would send the pointer straight back; ignore it until the stream catches up.
+        let now = CACurrentMediaTime()
+        if let warp = recentWarp {
+            if now <= warp.until {
+                let toSource = hypot(location.x - warp.source.x, location.y - warp.source.y)
+                let toTarget = hypot(location.x - warp.target.x, location.y - warp.target.y)
+                if toSource < toTarget { return }
+            } else {
+                recentWarp = nil
+            }
+        }
+
         let margin: CGFloat = 4
         var nearEdge = false
         var newLoc = location
@@ -623,6 +676,7 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
             nearEdge = true
         }
         guard nearEdge else { return }
+        recentWarp = (source: location, target: newLoc, until: now + 0.1)
         lastDragLocation = newLoc
         warpCursor(to: newLoc)
     }
