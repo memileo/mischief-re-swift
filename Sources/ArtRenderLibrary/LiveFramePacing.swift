@@ -322,6 +322,26 @@ public final class LiveFramePacer {
         schedule()
     }
 
+    /// Recover after the host changed the view's window/display state (entering or
+    /// leaving full screen, moving to another screen, a backing-scale change).
+    ///
+    /// A `CVDisplayLink` can go quiet across such a transition. Because a *warm* link
+    /// is trusted completely (the pacer waits for its next tick and schedules no timer),
+    /// a link that never comes back would otherwise leave a pending request waiting
+    /// forever — the gesture would work for a frame or two and then stop. Restart the
+    /// link and force the timer path for the current request, so it either starts now
+    /// (slot already elapsed) or after a known delay, not on a tick that may not arrive.
+    public func resumeAfterDisplayChange() {
+        guard !invalidated else { return }
+        let wasRunning = ticker.isRunning
+        stopTicker()
+        if wasRunning, mode == .displayLink {
+            _ = startTicker()
+        }
+        guard pending, !rendering else { return }
+        schedule()
+    }
+
     /// The view is going away: stop all timers/ticks and ignore future requests.
     public func invalidate() {
         invalidated = true

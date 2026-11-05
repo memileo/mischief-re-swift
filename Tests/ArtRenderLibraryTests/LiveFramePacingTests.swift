@@ -115,6 +115,23 @@ final class LiveFramePacingTests: XCTestCase {
         XCTAssertEqual(starts, 2)
     }
 
+    /// A full-screen transition can stop the host's display link. A warm link that never
+    /// ticks must not leave the next request waiting forever.
+    func testResumeAfterDisplayChangeStartsAStalledWarmRequest() {
+        warmUp()
+
+        pacer.request()
+        now = 0.010
+        pacer.renderFinished()
+        XCTAssertEqual(starts, 1)
+        XCTAssertEqual(timer.count, 0, "a warm link waits for its tick")
+
+        now = 1.0                           // no tick arrived
+        pacer.resumeAfterDisplayChange()
+        XCTAssertEqual(starts, 2, "the request must not wait for a dead link")
+        XCTAssertTrue(ticker.isRunning)
+    }
+
     /// A frame slower than its slot starts immediately when it finishes: it has already
     /// missed the refresh it could have caught, so waiting for a flip only loses time.
     func testSlowFrameStartsImmediatelyAfterFinish() {

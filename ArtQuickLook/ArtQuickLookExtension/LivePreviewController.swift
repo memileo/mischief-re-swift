@@ -110,6 +110,11 @@ final class LivePreviewSession {
                                        transform: transform,
                                        clearColor: clearColor)
         }
+        // A full-screen transition can pause the host's display link; re-arm the pacer
+        // before the view reports the new viewport.
+        view.onWindowStateChange = { [weak self] in
+            self?.pacer.resumeAfterDisplayChange()
+        }
     }
 
     deinit {

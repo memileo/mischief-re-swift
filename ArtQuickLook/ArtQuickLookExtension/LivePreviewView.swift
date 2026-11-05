@@ -23,6 +23,8 @@
 //  - Bindings: left drag pans (shift → rotate, cmd → zoom), middle drag pans (cmd → zoom,
 //    shift → rotate), the scroll wheel zooms at the pointer, and 0/P/Z/R + the context menu
 //    do the resets.
+//  - A drag teleports the cursor to the opposite edge when it reaches one, so a gesture can
+//    continue past the screen edge (Blender-style).
 //
 
 import Cocoa
@@ -40,6 +42,10 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     var onRenderRequest: ((LiveViewTransform, CGSize) -> Void)?
     /// Draw a canvas into a drawable. The transform is the one to present with.
     var present: ((LiveRenderedCanvas, LiveViewTransform, MTLDrawable, MTLClearColor) -> Void)?
+    /// The window entered/left full screen (or moved screens / changed backing scale).
+    /// The session uses this to re-arm frame pacing after the host's display link was
+    /// paused by the transition.
+    var onWindowStateChange: (() -> Void)?
 
     // MARK: - Model
 
@@ -61,11 +67,17 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     /// The `…MouseDown` mask of the button that started the current drag, so a release
     /// outside the view can be detected from `pressedMouseButtons`.
     private var dragButtonMask: NSEvent.EventTypeMask = []
-    /// Local monitor used to notice a button release that happens outside this view
-    /// (in which case no `…MouseUp` is delivered here). Removed in `endDrag()`.
+    /// Local monitor used to notice drag events and button releases outside this view
+    /// (in which case no `…MouseUp`/`…MouseDragged` is delivered here). Removed in
+    /// `endDrag()`.
     private var dragMonitor: Any?
     /// When the last drag event arrived — see `dragLapseGrace`.
     private var lastDragEventTime: CFTimeInterval = CACurrentMediaTime()
+    /// The last event handled through either the monitor or the view override, so the
+    /// same physical event is not applied twice.
+    private var lastHandledDrag: (eventNumber: Int, timestamp: TimeInterval)?
+    /// Window notifications that re-assert focus after a full-screen transition.
+    private var windowObservers: [NSObjectProtocol] = []
 
     /// Viewport (device pixels) last reported to the session.
     private var reportedViewport = CGSize.zero
@@ -126,6 +138,11 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         menu = Self.makeResetMenu(target: self)
         addSubview(hudView)
         hud.onChange = { [weak self] state in self?.hudView.state = state }
+    }
+
+    deinit {
+        removeWindowObservers()
+        if let monitor = dragMonitor { NSEvent.removeMonitor(monitor) }
     }
 
     // MARK: - Canvas
@@ -276,10 +293,12 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         configure()                     // no-op when built through make(device:)
+        observeWindow(window)
         guard window != nil else {
             hud.reset()
             return
         }
+        window?.acceptsMouseMovedEvents = true
         window?.makeFirstResponder(self)
         // The viewport is only known now: ask for the first frame.
         refreshFrameSoon()
@@ -293,6 +312,52 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
             refreshFrameSoon()
             if canvas != nil { reportChange() }
         }
+    }
+
+    // MARK: - Window state / full screen
+
+    private func observeWindow(_ window: NSWindow?) {
+        removeWindowObservers()
+        guard let window = window else { return }
+        let center = NotificationCenter.default
+        let names: [Notification.Name] = [
+            NSWindow.didEnterFullScreenNotification,
+            NSWindow.didExitFullScreenNotification,
+            NSWindow.didChangeScreenNotification,
+            NSWindow.didChangeBackingPropertiesNotification
+        ]
+        for name in names {
+            windowObservers.append(center.addObserver(forName: name, object: window,
+                                                      queue: .main) { [weak self] _ in
+                self?.windowStateDidChange()
+            })
+        }
+    }
+
+    private func removeWindowObservers() {
+        let center = NotificationCenter.default
+        for observer in windowObservers { center.removeObserver(observer) }
+        windowObservers.removeAll()
+    }
+
+    /// Full-screen transitions can move the view into another window (and reset the
+    /// host's focus). Re-assert it, and re-anchor a drag that was in flight so it does
+    /// not jump when the window geometry changes.
+    private func windowStateDidChange() {
+        guard let window = window else { return }
+        window.acceptsMouseMovedEvents = true
+        window.makeFirstResponder(self)
+
+        if isDragging {
+            let windowPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+            lastDragLocation = pixelLocation(ofViewPoint: convert(windowPoint, from: nil))
+            lastDragEventTime = CACurrentMediaTime()
+        }
+
+        // Tell the session to re-arm pacing (a CVDisplayLink can go quiet across a
+        // full-screen transition), then report the new viewport.
+        onWindowStateChange?()
+        reportChange()
     }
 
     // MARK: - Pointer interaction
@@ -321,7 +386,11 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     /// here — but only when the receiver is actually not flipped (`MTKView`'s flippedness
     /// differs between OS/SDK versions, so ask instead of assuming).
     private func pixelLocation(of event: NSEvent) -> CGPoint {
-        let point = convert(event.locationInWindow, from: nil)
+        pixelLocation(ofViewPoint: convert(event.locationInWindow, from: nil))
+    }
+
+    /// View point → **screen pixels, y down** (the same space as `pixelLocation(of:)`).
+    private func pixelLocation(ofViewPoint point: CGPoint) -> CGPoint {
         let scale = pixelScale
         let y = isFlipped ? point.y : (bounds.maxY - point.y)
         return CGPoint(x: point.x * scale, y: y * scale)
@@ -356,7 +425,7 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        drag(to: pixelLocation(of: event), mode: mode(for: event.modifierFlags))
+        handleDrag(event)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -372,7 +441,7 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     }
 
     override func otherMouseDragged(with event: NSEvent) {
-        drag(to: pixelLocation(of: event), mode: mode(for: event.modifierFlags))
+        handleDrag(event)
     }
 
     override func otherMouseUp(with event: NSEvent) {
@@ -412,14 +481,40 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         dragAnchor = location
         lastDragLocation = location
         lastDragEventTime = CACurrentMediaTime()
+        lastHandledDrag = nil
         hud.beginInteraction(mode, zoomPercent: viewTransform.zoomPercent)
         NSCursor.closedHand.set()
 
-        // Notice a release that lands outside this view (no `…MouseUp` delivered here).
-        dragMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp, .otherMouseUp, .rightMouseUp]) { [weak self] event in
-            self?.endDrag()
+        // Notice a release (or, in a full-screen host, drags that are routed around the
+        // view) anywhere in this process. The view's own overrides deduplicate by event.
+        dragMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDragged, .otherMouseDragged,
+                       .leftMouseUp, .otherMouseUp, .rightMouseUp]
+        ) { [weak self] event in
+            guard let self = self else { return event }
+            switch event.type {
+                case .leftMouseDragged, .otherMouseDragged:
+                    self.handleDrag(event)
+                default:
+                    self.endDrag()
+            }
             return event
         }
+    }
+
+    /// The one entry point for a drag event, whether it arrived through the view override
+    /// or through the local monitor (which runs first). Called twice for a normal event,
+    /// hence the event-number/timestamp check.
+    private func handleDrag(_ event: NSEvent) {
+        guard isDragging else { return }
+        if let eventWindow = event.window, eventWindow !== window { return }
+        if let last = lastHandledDrag,
+           last.eventNumber == event.eventNumber,
+           last.timestamp == event.timestamp {
+            return
+        }
+        lastHandledDrag = (event.eventNumber, event.timestamp)
+        drag(to: pixelLocation(of: event), mode: mode(for: event.modifierFlags))
     }
 
     private func drag(to location: CGPoint, mode eventMode: LiveInteractionMode) {
@@ -452,7 +547,12 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         }
 
         lastDragLocation = location
-        guard dx != 0 || dy != 0 else { return }
+        guard dx != 0 || dy != 0 else {
+            // Holding still at an edge still teleports, so the next movement comes
+            // from the opposite side.
+            warpIfNeeded(location, viewport: viewport)
+            return
+        }
 
         // Zoom/rotate speeds are specified per point; the deltas arrive in pixels.
         let pointScale = pixelScale
@@ -482,18 +582,67 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
             case .idle:
                 break
         }
+
+        // Teleport the cursor to the opposite edge when it reaches one, so a drag can
+        // continue past the screen edge (Blender-style).
+        warpIfNeeded(location, viewport: viewport)
     }
 
     private func endDrag() {
         guard isDragging else { return }
         isDragging = false
         dragButtonMask = []
+        lastHandledDrag = nil
         if let monitor = dragMonitor {
             NSEvent.removeMonitor(monitor)
             dragMonitor = nil
         }
         NSCursor.arrow.set()
         hud.endInteraction(hold: Self.interactionHold)
+    }
+
+    // MARK: - Cursor teleport (continuous drag past screen edges)
+
+    private func warpIfNeeded(_ location: CGPoint, viewport: CGSize) {
+        guard viewport.width > 0, viewport.height > 0 else { return }
+        let margin: CGFloat = 4
+        var nearEdge = false
+        var newLoc = location
+        if location.x < margin {
+            newLoc.x = viewport.width - margin
+            nearEdge = true
+        } else if location.x > viewport.width - margin {
+            newLoc.x = margin
+            nearEdge = true
+        }
+        if location.y < margin {
+            newLoc.y = viewport.height - margin
+            nearEdge = true
+        } else if location.y > viewport.height - margin {
+            newLoc.y = margin
+            nearEdge = true
+        }
+        guard nearEdge else { return }
+        lastDragLocation = newLoc
+        warpCursor(to: newLoc)
+    }
+
+    /// Warps in Quartz display coordinates. Association is switched off for the warp so
+    /// the system does not feed the jump back as pointer movement.
+    private func warpCursor(to viewPixelPoint: CGPoint) {
+        guard let window = window else { return }
+        let scale = pixelScale
+        let pointInView = NSPoint(x: viewPixelPoint.x / scale,
+                                  y: isFlipped ? viewPixelPoint.y / scale
+                                               : bounds.maxY - viewPixelPoint.y / scale)
+        let pointInWindow = convert(pointInView, to: nil)
+        let screenPoint = window.convertToScreen(NSRect(origin: pointInWindow, size: .zero)).origin
+        let primaryHeight = NSScreen.screens.first?.frame.height
+            ?? window.screen?.frame.height ?? 0
+        let quartzPoint = CGPoint(x: screenPoint.x, y: primaryHeight - screenPoint.y)
+        CGAssociateMouseAndMouseCursorPosition(0)
+        CGWarpMouseCursorPosition(quartzPoint)
+        CGAssociateMouseAndMouseCursorPosition(1)
     }
 
     // MARK: - Context menu
