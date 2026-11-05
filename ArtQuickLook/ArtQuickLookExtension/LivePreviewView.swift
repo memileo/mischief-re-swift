@@ -566,6 +566,7 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         }
         var dx = delta.dx * (deltaScaleX ?? pixelScale)
         var dy = delta.dy * (deltaScaleY ?? -pixelScale)
+        let previous = lastDragLocation
         lastDragLocation = location
 
         // A warp is not supposed to produce a delta (the association guard around it
@@ -600,14 +601,22 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
                     viewTransform.zoom(by: factor, anchor: anchor, viewportSize: viewport)
                 }
             case .rotate:
-                // Rotation is about the middle of the view, not the pointer: rotating from
-                // an edge then moves a lot, rotating near the centre almost not at all,
-                // which makes it far easier to line a shape up. No y sign flip needed here —
-                // see LiveViewSpace.
-                let delta = (dx / pointScale) * Self.rotateSensitivity
+                // Mirror LiveDocumentWindow.swift
                 let centre = LiveViewSpace.centre(viewportSize: viewport)
+                guard
+                    let from = dragAngle(at: previous, around: centre),
+                    let to = dragAngle(at: location, around: centre)
+                else {
+                    // Pointer is parked in the hub dead zone; lastDragLocation is
+                    // already updated, so the next event re-anchors cleanly.
+                    return
+                }
+                var delta = to - from
+                if delta > .pi { delta -= 2 * .pi }
+                if delta < -.pi { delta += 2 * .pi }
+                
                 commitTransform(mode: .rotate) { viewTransform in
-                    viewTransform.rotate(by: delta, anchor: centre, viewportSize: viewport)
+                    viewTransform.rotate(by: -delta, anchor: centre, viewportSize: viewport)
                 }
             case .idle:
                 break
@@ -616,6 +625,17 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         // Teleport the cursor to the opposite edge when it reaches one, so a drag can
         // continue past the screen edge (Blender-style).
         warpIfNeeded(location, viewport: viewport)
+    }
+    
+    let minRotateRadius = 16.0
+    
+    /// Angle of a drag location around the view centre, in drag coordinates.
+    /// Returns nil inside the hub dead zone, where the angle is unstable.
+    private func dragAngle(at point: CGPoint, around centre: CGPoint) -> CGFloat? {
+        let vx = point.x - centre.x
+        let vy = point.y - centre.y
+        guard hypot(vx, vy) > minRotateRadius else { return nil }
+        return atan2(vy, vx)
     }
 
     private func endDrag() {
@@ -643,6 +663,7 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     }
 
     private func warpIfNeeded(_ location: CGPoint, viewport: CGSize) {
+        guard dragMode != .rotate else { return } // Disable warp for rotation
         guard viewport.width > 0, viewport.height > 0 else { return }
 
         // A drag event queued before a warp can still report the old side. Warping on it

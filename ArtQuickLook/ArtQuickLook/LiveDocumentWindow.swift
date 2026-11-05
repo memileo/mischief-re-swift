@@ -505,10 +505,10 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
 
     private func drag(to location: CGPoint, mode eventMode: Mode) {
         guard isDragging else { return }
-
+        
         // Keep the hand cursor for the whole press.
         NSCursor.closedHand.set()
-
+        
         if eventMode != dragMode {
             dragMode = eventMode
             dragAnchor = location
@@ -518,38 +518,61 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
         lastDragEventTime = CACurrentMediaTime()
         let dx = location.x - lastDragLocation.x
         let dy = location.y - lastDragLocation.y
-
+        
         let viewport = viewportSize
-
+        
         // Teleport-induced jump: re-anchor instead of applying.
         if viewport.width > 0, (abs(dx) > viewport.width / 2 || abs(dy) > viewport.height / 2) {
             lastDragLocation = location
             return
         }
-
+        
+        let previous = lastDragLocation
         lastDragLocation = location
         guard dx != 0 || dy != 0 else {
             warpIfNeeded(location, viewport: viewport)
             return
         }
-
+        
         let pointScale = pixelScale
         switch dragMode {
-        case .pan:
-            // y negated: screen is y-down, view space is y-up (LiveViewSpace).
-            commit { $0.pan(by: LiveViewSpace.delta(CGPoint(x: dx, y: dy))) }
-        case .zoom:
-            let factor = exp(-(dy / pointScale) * Self.zoomSensitivity)
-            let anchor = viewSpacePoint(dragAnchor)
-            commit { $0.zoom(by: factor, anchor: anchor, viewportSize: viewport) }
-        case .rotate:
-            // About the view centre, not the pointer — see the extension's LivePreviewView.
-            let delta = (dx / pointScale) * Self.rotateSensitivity
-            let centre = LiveViewSpace.centre(viewportSize: viewport)
-            commit { $0.rotate(by: delta, anchor: centre, viewportSize: viewport) }
+            case .pan:
+                commit { $0.pan(by: LiveViewSpace.delta(CGPoint(x: dx, y: dy))) }
+            case .zoom:
+                let factor = exp(-(dy / pointScale) * Self.zoomSensitivity)
+                let anchor = viewSpacePoint(dragAnchor)
+                commit { $0.zoom(by: factor, anchor: anchor, viewportSize: viewport) }
+            case .rotate:
+                // Angular drag: the pointer pushes a disk pinned at the view centre.
+                // Angular travel per pixel shrinks with radius, so edge drags are finer.
+                let centre = LiveViewSpace.centre(viewportSize: viewport)
+                guard
+                    let from = dragAngle(at: previous, around: centre),
+                    let to = dragAngle(at: location, around: centre)
+                else {
+                    // Pointer is parked in the hub dead zone; lastDragLocation is
+                    // already updated, so the next event re-anchors cleanly.
+                    return
+                }
+                var delta = to - from
+                // Normalise to (-π, π] so crossing the atan2 seam doesn't spin the view.
+                if delta > .pi { delta -= 2 * .pi }
+                if delta < -.pi { delta += 2 * .pi }
+                commit { $0.rotate(by: -delta, anchor: centre, viewportSize: viewport) }
         }
-
+        
         warpIfNeeded(location, viewport: viewport)
+    }
+    
+    let minRotateRadius = 16.0
+    
+    /// Angle of a drag location around the view centre, in drag coordinates.
+    /// Returns nil inside the hub dead zone, where the angle is unstable.
+    private func dragAngle(at point: CGPoint, around centre: CGPoint) -> CGFloat? {
+        let vx = point.x - centre.x
+        let vy = point.y - centre.y
+        guard hypot(vx, vy) > minRotateRadius else { return nil }
+        return atan2(vy, vx)
     }
 
     private func endDrag() {
@@ -568,6 +591,7 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
     // MARK: - Cursor teleport (continuous drag past screen edges)
 
     private func warpIfNeeded(_ location: CGPoint, viewport: CGSize) {
+        guard dragMode != .rotate else { return } // Disable warp for rotation
         guard viewport.width > 0, viewport.height > 0 else { return }
         let margin: CGFloat = 4
         var nearEdge = false
