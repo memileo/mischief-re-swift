@@ -112,6 +112,10 @@ public enum LiveViewSpace {
     public static func centre(viewportSize: CGSize) -> CGPoint {
         CGPoint(x: viewportSize.width / 2, y: viewportSize.height / 2)
     }
+
+    /// Radius of the rotation dead zone ("hub") in view pixels. Shared by every
+    /// live view so the gesture and its visual ring agree.
+    public static let minRotateRadius: CGFloat = 32
 }
 
 /// Rate limiter for the interactive path, shared by the Quick Look preview and the app's
@@ -149,6 +153,9 @@ public struct LiveFrameThrottle {
 public struct LiveViewTransform: Equatable {
     /// Zoom clamps. 100% == the file's own view matrix (aspect fitted to the view).
     public static let zoomRange: ClosedRange<CGFloat> = 0.001...4096
+
+    /// Radius of the rotation dead zone ("hub") in view pixels.
+    public static let minRotateRadius: CGFloat = LiveViewSpace.minRotateRadius
 
     /// Pan offset in view pixels (y down).
     public private(set) var pan: CGPoint = .zero
@@ -239,9 +246,48 @@ public struct LiveViewTransform: Equatable {
         return self
     }
 
+    /// Reset the zoom component only, keeping the canvas point currently under the
+    /// view centre pinned so the artwork does not jump out of frame.
+    @discardableResult
+    public mutating func resetZoom(viewportSize: CGSize) -> LiveViewTransform {
+        resetZoom(anchor: LiveViewSpace.centre(viewportSize: viewportSize),
+                  viewportSize: viewportSize)
+    }
+
+    /// Reset the zoom component only, keeping the canvas point currently under
+    /// `anchor` pinned so the artwork does not jump out of frame.
+    @discardableResult
+    public mutating func resetZoom(anchor: CGPoint, viewportSize: CGSize) -> LiveViewTransform {
+        let current = zoom
+        if current != 1 {
+            zoom(by: 1 / current, anchor: anchor, viewportSize: viewportSize)
+        }
+        zoom = 1
+        return self
+    }
+
     /// Reset the rotation component only.
     @discardableResult
     public mutating func resetRotation() -> LiveViewTransform {
+        rotation = 0
+        return self
+    }
+
+    /// Reset the rotation component only, keeping the canvas point currently under
+    /// the view centre pinned so the artwork does not jump out of frame.
+    @discardableResult
+    public mutating func resetRotation(viewportSize: CGSize) -> LiveViewTransform {
+        resetRotation(anchor: LiveViewSpace.centre(viewportSize: viewportSize),
+                      viewportSize: viewportSize)
+    }
+
+    /// Reset the rotation component only, keeping the canvas point currently under
+    /// `anchor` pinned so the artwork does not jump out of frame.
+    @discardableResult
+    public mutating func resetRotation(anchor: CGPoint, viewportSize: CGSize) -> LiveViewTransform {
+        if rotation != 0 {
+            rotate(by: -rotation, anchor: anchor, viewportSize: viewportSize)
+        }
         rotation = 0
         return self
     }

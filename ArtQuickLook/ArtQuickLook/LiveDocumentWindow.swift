@@ -251,6 +251,11 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
 
     private var canvas: LiveRenderedCanvas?
     private var viewTransform = LiveViewTransform()
+
+    // Overlay ring around the rotation dead zone.
+    private var rotateRingContainer: CALayer?
+    private var rotateRingInner: CAShapeLayer?
+    private var rotateRingOuter: CAShapeLayer?
     private var session: LiveDocumentSession?
     private var lastReportedViewport = CGSize.zero
     /// Set together with `canvas`; owned by the render queue, only used to present.
@@ -381,6 +386,8 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
 
     override func layout() {
         super.layout()
+        ensureRotateRing()
+        updateRotateRing()
         guard viewportSize != lastReportedViewport else { return }
         DispatchQueue.main.async { [weak self] in
             self?.drawFrame()
@@ -490,6 +497,8 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
         isDragging = true
         dragMode = mode
         dragButton = button
+        ensureRotateRing()
+        rotateRingContainer?.isHidden = (mode != .rotate)
         dragAnchor = location
         lastDragLocation = location
         lastDragEventTime = CACurrentMediaTime()
@@ -513,6 +522,7 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
             dragMode = eventMode
             dragAnchor = location
             lastDragLocation = location
+            rotateRingContainer?.isHidden = (dragMode != .rotate)
             return
         }
         lastDragEventTime = CACurrentMediaTime()
@@ -564,21 +574,59 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
         warpIfNeeded(location, viewport: viewport)
     }
     
-    let minRotateRadius = 16.0
-    
     /// Angle of a drag location around the view centre, in drag coordinates.
     /// Returns nil inside the hub dead zone, where the angle is unstable.
     private func dragAngle(at point: CGPoint, around centre: CGPoint) -> CGFloat? {
         let vx = point.x - centre.x
         let vy = point.y - centre.y
-        guard hypot(vx, vy) > minRotateRadius else { return nil }
+        guard hypot(vx, vy) > LiveViewSpace.minRotateRadius else { return nil }
         return atan2(vy, vx)
+    }
+
+    private func ensureRotateRing() {
+        guard rotateRingContainer == nil else { return }
+        guard let hostLayer = self.layer else { return }
+        let container = CALayer()
+        let inner = CAShapeLayer()
+        let outer = CAShapeLayer()
+        inner.fillColor = CGColor.clear
+        inner.strokeColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+        inner.lineWidth = 1.5
+        outer.fillColor = CGColor.clear
+        outer.strokeColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+        outer.lineWidth = 1.5
+        container.opacity = 0.5
+        container.addSublayer(inner)
+        container.addSublayer(outer)
+        hostLayer.addSublayer(container)
+        rotateRingContainer = container
+        rotateRingInner = inner
+        rotateRingOuter = outer
+        container.isHidden = true
+    }
+
+    private func updateRotateRing() {
+        guard let container = rotateRingContainer,
+              let inner = rotateRingInner,
+              let outer = rotateRingOuter else { return }
+        container.frame = bounds
+        let scale = pixelScale
+        let radius = LiveViewSpace.minRotateRadius / scale
+        let centre = CGPoint(x: bounds.midX, y: bounds.midY)
+        let innerRect = CGRect(x: centre.x - radius, y: centre.y - radius,
+                               width: radius * 2, height: radius * 2)
+        inner.path = CGPath(ellipseIn: innerRect, transform: nil)
+        let outerRadius = radius + (2.0 / scale)
+        let outerRect = CGRect(x: centre.x - outerRadius, y: centre.y - outerRadius,
+                               width: outerRadius * 2, height: outerRadius * 2)
+        outer.path = CGPath(ellipseIn: outerRect, transform: nil)
     }
 
     private func endDrag() {
         guard isDragging else { return }
         isDragging = false
         dragButton = []
+        rotateRingContainer?.isHidden = true
         if let monitor = dragMonitor {
             NSEvent.removeMonitor(monitor)
             dragMonitor = nil
@@ -687,8 +735,8 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
         switch kind {
         case .all:      commit { $0.resetAll() }
         case .pan:      commit { $0.resetPan() }
-        case .zoom:     commit { $0.resetZoom() }
-        case .rotation: commit { $0.resetRotation() }
+        case .zoom:     commit { $0.resetZoom(viewportSize: self.viewportSize) }
+        case .rotation: commit { $0.resetRotation(viewportSize: self.viewportSize) }
         }
     }
 
