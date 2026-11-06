@@ -20,7 +20,7 @@ enum RenderPath: String, CaseIterable, Identifiable {
             case .gpuSegments: return "GPU SDF segments"
             case .gpuStamps:   return "GPU stamps"
             case .cpuStamps:   return "CPU stamps"
-            case .liveMetal:   return "GPU Live Metal view (pan / zoom / rotate) (Default)"
+            case .liveMetal:   return "GPU Live Metal view (Default)"
         }
     }
     

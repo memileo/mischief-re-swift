@@ -195,12 +195,11 @@ struct LiveViewHelp: View {
     @ObservedObject var store: SettingsStore
 
     private let rows: [(String, String)] = [
-        ("Drag (LMB or MMB)", "Pan"),
-        ("+ ⇧ drag", "Rotate"),
-        ("+ ⌘ drag", "Zoom"),
+        ("LMB or MMB", "Pan"),
+        ("⇧ + LMB or ⇧ + MMB", "Rotate"),
+        ("⌘ + LMB or ⌘ + MMB", "Zoom"),
         ("Scroll wheel", "Zoom at the pointer"),
-        ("Right click", "Reset menu"),
-        ("⌃0 / ⌃P / ⌃Z / ⌃R", "Reset view / pan / zoom / rotation")
+        ("Right click", "Reset menu")
     ]
     
     var body: some View {
@@ -208,21 +207,21 @@ struct LiveViewHelp: View {
             ForEach(rows, id: \.0) { keys, action in
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(keys)
-                        .font(.caption.monospaced())
-                        .frame(width: 130, alignment: .leading)
+                        .font(.caption) // .font(.caption.monospaced())
+                        .frame(width: 108, alignment: .leading)
                     Text(action)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
-            Text("""
-                 The document is re-rendered on the GPU for the current view, so zooming in \
-                 keeps full detail. “Preview image scale” sets the geometry cache's resolution.
-                 """)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.top, 4)
+//            Text("""
+//                 The document is re-rendered on the GPU for the current view, so zooming in \
+//                 keeps full detail. “Preview image scale” sets the geometry cache's resolution.
+//                 """)
+//                .font(.caption2)
+//                .foregroundStyle(.secondary)
+//                .fixedSize(horizontal: false, vertical: true)
+//                .padding(.top, 4)
 
         }
     }
