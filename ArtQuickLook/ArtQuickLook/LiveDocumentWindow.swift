@@ -140,6 +140,10 @@ final class LiveDocumentSession {
 
     // MARK: Requests (main thread)
 
+    func invalidateCache() {
+        cache = nil
+    }
+
     func request(transform: LiveViewTransform, viewport: CGSize) {
         guard viewport.width >= 1, viewport.height >= 1 else { return }
         latestRequest = Request(transform: transform, viewport: viewport)
@@ -935,6 +939,9 @@ extension LiveMTKView {
 
     /// Re-render after a layer visibility/opacity edit.
     func reportChangeAfterLayerEdit() { reportChange() }
+
+    /// Drop the live geometry cache so a newly un-hidden layer gets rebuilt.
+    func invalidateLiveCache() { session?.invalidateCache() }
 }
 
 final class LayerStackModel: ObservableObject {
@@ -972,9 +979,8 @@ final class LayerStackModel: ObservableObject {
             guard idx < art.layers.count else { continue }
             let layer = art.layers[idx]
             let name = (layer["name"] as? String) ?? "Layer \(idx + 1)"
-            // Exclude hidden Sketch layers (free transform pastes).
-            if name == "Sketch Layer" { continue }
-            // Also exclude layers not reachable in the normal layer list? keep all others.
+            // Hidden Sketch layers (free transform pastes) are not part of
+            // art.layerOrder, so iterating layerOrder already excludes them.
             let visible = (layer["visible"] as? Int ?? 1) != 0
             let opacity = Double(layer["opacity"] as? Float ?? 1.0)
             rows.append(LayerRow(id: idx, name: name, isVisible: visible, opacity: opacity))
@@ -992,7 +998,11 @@ final class LayerStackModel: ObservableObject {
         guard let view = LiveMTKView.frontmostDocumentView, let art = view.currentArt else { return }
         guard id < art.layers.count else { return }
         let current = (view.currentArt?.layers[id]["visible"] as? Int ?? 1) != 0
+        let turningVisible = !current
         view.setLayerVisible(id, !current)
+        if turningVisible {
+            view.invalidateLiveCache()
+        }
         if let i = layers.firstIndex(where: { $0.id == id }) {
             layers[i].isVisible = !current
             layers = layers
@@ -1065,7 +1075,7 @@ struct LayerStackView: View {
                 }
             }
         }
-        .frame(minWidth: 148, minHeight: 148)
+        .frame(minWidth: 148, idealWidth: 164, minHeight: 148, idealHeight: 182)
     }
 }
 
