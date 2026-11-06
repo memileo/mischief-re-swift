@@ -613,13 +613,37 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
         let scale = pixelScale
         let radius = LiveViewSpace.minRotateRadius / scale
         let centre = CGPoint(x: bounds.midX, y: bounds.midY)
-        let innerRect = CGRect(x: centre.x - radius, y: centre.y - radius,
-                               width: radius * 2, height: radius * 2)
-        inner.path = CGPath(ellipseIn: innerRect, transform: nil)
+        let segments = 128
+        let twoPi: CGFloat = 2.0 * .pi
+
+        let innerPath = CGMutablePath()
+        for i in 0...segments {
+            let t = CGFloat(i) / CGFloat(segments) * twoPi
+            let px = centre.x + radius * cos(t)
+            let py = centre.y + radius * sin(t)
+            if i == 0 {
+                innerPath.move(to: CGPoint(x: px, y: py))
+            } else {
+                innerPath.addLine(to: CGPoint(x: px, y: py))
+            }
+        }
+        innerPath.closeSubpath()
+        inner.path = innerPath
+
         let outerRadius = radius + (2.0 / scale)
-        let outerRect = CGRect(x: centre.x - outerRadius, y: centre.y - outerRadius,
-                               width: outerRadius * 2, height: outerRadius * 2)
-        outer.path = CGPath(ellipseIn: outerRect, transform: nil)
+        let outerPath = CGMutablePath()
+        for i in 0...segments {
+            let t = CGFloat(i) / CGFloat(segments) * twoPi
+            let px = centre.x + outerRadius * cos(t)
+            let py = centre.y + outerRadius * sin(t)
+            if i == 0 {
+                outerPath.move(to: CGPoint(x: px, y: py))
+            } else {
+                outerPath.addLine(to: CGPoint(x: px, y: py))
+            }
+        }
+        outerPath.closeSubpath()
+        outer.path = outerPath
     }
 
     private func endDrag() {
