@@ -61,6 +61,8 @@ struct LiveStrokeParams {
     var penColorB: Float
     var penColorA: Float
     var noiseScale: Float
+    var noiseOffsetX: Float = 0
+    var noiseOffsetY: Float = 0
     var flags: UInt32
 }
 
@@ -73,6 +75,9 @@ struct PerTileParams {
     var tileSize: UInt32
     /// `ART_LIVE_ABLATE` mask — 0 in normal use (see `LiveConfig.ablate`).
     var ablate: UInt32
+    /// Noise sampling offset so the grain follows the view (viewport pixels).
+    var noiseOffsetX: Float = 0
+    var noiseOffsetY: Float = 0
     /// bit0 = per-pixel stroke-saturation skip (`ART_LIVE_SATURATE=0` A/Bs it off).
     /// Exact by construction: a pixel's coverage for a stroke is a max over its segments
     /// of `cov · opacity`, and both factors are ≤ 1, so once the running max reaches 1 the
@@ -1493,6 +1498,8 @@ extension MetalRenderer {
             stampCount: UInt32(bin.segmentCount),
             penColor: bin.color,
             noiseScale: 0.4,
+            noiseOffsetX: Float(self.liveNoiseOffset.x),
+            noiseOffsetY: Float(self.liveNoiseOffset.y),
             isEraser: bin.isEraser,
             isMarker: bin.isMarker,
             debugSegmentColors: LiveConfig.debugSegmentColors())
@@ -1734,6 +1741,8 @@ extension MetalRenderer {
                                    tileArrayBase: UInt32(tileArrayBase),
                                    strokeLo: UInt32(strokeLo),
                                    strokeHi: UInt32(strokeHi))
+        params.noiseOffsetX = Float(self.liveNoiseOffset.x)
+        params.noiseOffsetY = Float(self.liveNoiseOffset.y)
         if containsNoise {
             guard let pipeline = livePerTileNoiseCompositePipeline else {
                 throw MetalRendererError.pipelineMissing("livePerTileNoiseCompositeKernel")
@@ -3005,6 +3014,8 @@ extension MetalRenderer {
             penColorR: bin.color.x, penColorG: bin.color.y,
             penColorB: bin.color.z, penColorA: bin.color.w,
             noiseScale: 0.4,
+            noiseOffsetX: Float(self.liveNoiseOffset.x),
+            noiseOffsetY: Float(self.liveNoiseOffset.y),
             flags: flags)
         
         encoder.setComputePipelineState(pipeline)

@@ -17,6 +17,8 @@ struct Params {
     uint32_t stampCount;
     float4 penColor;
     float noiseScale;
+    float noiseOffsetX;
+    float noiseOffsetY;
     bool isEraser;
     bool isMarker;
     // `ART_DEBUG_SEG_COLORS`: paint each segment with its shape-type colour and composite

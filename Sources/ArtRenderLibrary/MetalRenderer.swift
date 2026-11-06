@@ -35,6 +35,8 @@ struct Params {
     var stampCount: UInt32
     var penColor: SIMD4<Float>
     var noiseScale: Float
+    var noiseOffsetX: Float = 0
+    var noiseOffsetY: Float = 0
     var isEraser: Bool
     var isMarker: Bool
     /// `ART_DEBUG_SEG_COLORS` — see `LiveConfig.debugSegmentColors()`.
@@ -239,6 +241,9 @@ internal final class LiveBinRefLayer {
     
     // Textures and buffers
     internal var noiseTexture: MTLTexture?
+    /// View-space pan offset (in viewport pixels) applied to stroke-noise sampling so the
+    /// noise follows the view instead of staying pinned to the screen. Interactive mode only.
+    internal var liveNoiseOffset: CGPoint = .zero
     /// 1×1 stand-in for the splat composite's noise binding when a layer has no noisy
     /// strokes (never sampled — the kernel's noise flag is 0 — but a valid texture must
     /// still be bound, and the real target may not be bound as both writable and read).

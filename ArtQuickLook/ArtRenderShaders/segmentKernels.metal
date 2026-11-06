@@ -578,7 +578,7 @@ kernel void segmentNoiseCompositeKernel(
     // per segment and the normal path uses it once at the end.
     float noiseVal = 1.0f;
     if (noiseTex.get_width() > 0) {
-        float2 noiseUV = fract(float2(gid) / (float(noiseTex.get_width()) * params.noiseScale));
+        float2 noiseUV = fract((float2(gid) - float2(params.noiseOffsetX, -params.noiseOffsetY)) / (float(noiseTex.get_width()) * params.noiseScale));
         noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
     }
     
@@ -964,7 +964,7 @@ kernel void segmentPasteLayerNoiseCompositeKernel(
     
     float noiseVal = 1.0f;
     if (noiseTex.get_width() > 0) {
-        float2 noiseUV = fract(float2(px) / (float(noiseTex.get_width()) * params.noiseScale));
+        float2 noiseUV = fract((float2(px) - float2(params.noiseOffsetX, -params.noiseOffsetY)) / (float(noiseTex.get_width()) * params.noiseScale));
         noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
     }
     
@@ -1158,6 +1158,8 @@ struct LiveStrokeParams {
     float penColorB;
     float penColorA;
     float noiseScale;
+    float noiseOffsetX;
+    float noiseOffsetY;
     uint  flags;
 };
 
@@ -1418,7 +1420,7 @@ kernel void liveSegmentNoiseCompositeKernel(
 
     float noiseVal = 1.0f;
     if (noiseTex.get_width() > 0) {
-        float2 noiseUV = fract(float2(pixel) / (float(noiseTex.get_width()) * params.noiseScale));
+        float2 noiseUV = fract((float2(pixel) - float2(params.noiseOffsetX, -params.noiseOffsetY)) / (float(noiseTex.get_width()) * params.noiseScale));
         noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
     }
 
@@ -1475,6 +1477,8 @@ struct PerTileParams {
     uint boxTilesPerCol;
     uint tileSize;
     uint ablate;            // ART_LIVE_ABLATE — counting/time attribution only (0 = normal)
+    float noiseOffsetX;
+    float noiseOffsetY;
     uint flags;             // bit0 = saturation skip (ART_LIVE_SATURATE=0 turns it off)
     uint tileGridStride;    // tiles per row of `tileStartCount` (wider than the dispatch
                             // box when a mixed layer's stroke run renders a sub-box of the
@@ -1867,7 +1871,7 @@ kernel void livePerTileNoiseCompositeKernel(
     // Same sampling as liveSegmentNoiseCompositeKernel (noiseScale 0.4).
     float noiseVal = 1.0f;
     if (noiseTex.get_width() > 0) {
-        float2 noiseUV = fract(float2(pixel) / (float(noiseTex.get_width()) * 0.4f));
+        float2 noiseUV = fract((float2(pixel) - float2(params.noiseOffsetX, -params.noiseOffsetY)) / (float(noiseTex.get_width()) * 0.4f));
         noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
     }
 
@@ -2140,6 +2144,8 @@ struct LiveSplatParams {
     uint boxTilesPerRow;
     uint boxTilesPerCol;
     uint flags;             // bit0 = noise enabled (sample the noise texture)
+    float noiseOffsetX;
+    float noiseOffsetY;
     int  originPxX;         // boxMinTileX * tileSize (left edge of the splat box)
     int  originPxY;
     int  boxPixW;           // boxTilesPerRow * tileSize
@@ -2228,7 +2234,7 @@ kernel void liveSplatKernel(
 // stroke order into the persistent per-pixel accumulator, then zeroes each slot so the
 // next batch's splat writes start clean (one clear total, not one per batch).
 kernel void liveSplatCompositeKernel(
-    constant LiveSplatParams &p [[buffer(0)]],
+    constant LiveSplatParams &params [[buffer(0)]],
     device uint *splatMax [[buffer(1)]],                   // non-atomic read + clear
     const device uint *visStrokeIDs [[buffer(2)]],         // ordinal -> stroke id
     const device float4 *strokeColor [[buffer(3)]],
@@ -2238,27 +2244,27 @@ kernel void liveSplatCompositeKernel(
     sampler noiseSampler [[sampler(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    if (gid.x >= uint(p.boxPixW) || gid.y >= uint(p.boxPixH)) return;
-    uint idx = gid.y * uint(p.boxPixW) + gid.x;
-    int px = p.originPxX + int(gid.x);
-    int py = p.originPxY + int(gid.y);
+    if (gid.x >= uint(params.boxPixW) || gid.y >= uint(params.boxPixH)) return;
+    uint idx = gid.y * uint(params.boxPixW) + gid.x;
+    int px = params.originPxX + int(gid.x);
+    int py = params.originPxY + int(gid.y);
 
     float noiseVal = 1.0f;
-    if ((p.flags & 0x1u) != 0u && noiseTex.get_width() > 0) {
-        float2 noiseUV = fract(float2(float(px), float(py)) / (float(noiseTex.get_width()) * 0.4f));
+    if ((params.flags & 0x1u) != 0u && noiseTex.get_width() > 0) {
+        float2 noiseUV = fract((float2(float(px), float(py)) - float2(params.noiseOffsetX, -params.noiseOffsetY)) / (float(noiseTex.get_width()) * 0.4f));
         noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
     }
 
     float4 acc = splatAcc[idx];
-    uint pixelCount = uint(p.boxPixW) * uint(p.boxPixH);
+    uint pixelCount = uint(params.boxPixW) * uint(params.boxPixH);
     device uint *slots = splatMax + idx;              // slot-major: slot * pixelCount + idx
-    for (uint k = 0; k < p.slotsPerPixel; ++k) {
+    for (uint k = 0; k < params.slotsPerPixel; ++k) {
         uint bits = slots[k * pixelCount];
         slots[k * pixelCount] = 0u;                   // consumed: next batch starts clean
         if (bits == 0u) continue;
         float v = as_type<float>(bits);
         if (v < 0.001f) continue;             // walk's per-stroke threshold
-        uint stroke = visStrokeIDs[p.batchStart + k];
+        uint stroke = visStrokeIDs[params.batchStart + k];
         float4 col = strokeColor[stroke];
         uint fl = strokeFlags[stroke];
         if ((fl & 0x2u) != 0u) {

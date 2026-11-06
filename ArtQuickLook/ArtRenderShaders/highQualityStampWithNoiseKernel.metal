@@ -71,7 +71,7 @@ kernel void highQualityStampWithNoiseKernel(
         
         if (noiseTex.get_width() > 0) {
             // Scale: texture size * noiseScale
-            float2 noiseUV = fract(float2(gid) / (float(noiseTex.get_width()) * params.noiseScale));
+            float2 noiseUV = fract((float2(gid) - float2(params.noiseOffsetX, -params.noiseOffsetY)) / (float(noiseTex.get_width()) * params.noiseScale));
             noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
         }
         

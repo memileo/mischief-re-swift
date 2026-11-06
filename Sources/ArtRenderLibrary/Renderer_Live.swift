@@ -198,6 +198,10 @@ extension Renderer {
                                                               height: canvasSize.height * scale),
                                        viewportSize: viewport)
         let cameraTransform = viewMatrix.affineTransform
+        // Offset stroke noise so it follows the view instead of staying pinned to
+        // the screen. camera.pan is in view space (y up); the noise sampling grid
+        // runs in viewport pixels (y down), so flip the y component.
+        mr.liveNoiseOffset = CGPoint(x: camera.pan.x, y: -camera.pan.y)
         mr.liveTiming = LiveFrameTiming()
         let frameStart = DispatchTime.now().uptimeNanoseconds
         
