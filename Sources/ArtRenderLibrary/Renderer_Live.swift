@@ -218,6 +218,9 @@ extension Renderer {
             
             // ── Layers, in stack order.
             for (position, layer) in cache.layers.enumerated() {
+                let artLayer = (layer.layerIndex < art.layers.count) ? art.layers[layer.layerIndex] : nil
+                guard (artLayer?["visible"] as? Int ?? 1) != 0 else { continue }
+                let layerOpacity = artLayer?["opacity"] as? Float ?? layer.opacity
                 if layer.needsRebuild {
                     // Uncached path: full action walk + the untouched dispatch pipeline.
                     mr.liveTiming.rebuiltLayers += 1
@@ -232,7 +235,7 @@ extension Renderer {
                     try mr.renderLayerIntoLiveCanvas(layerOps: operations,
                                                       width: width, height: height,
                                                       artToDevice: artToDevice,
-                                                      opacity: layer.opacity)
+                                                      opacity: layerOpacity)
                     continue
                 }
                 
@@ -245,7 +248,7 @@ extension Renderer {
                 if mr.renderCachedLayerGPU(cache: cache, position: position,
                                            camera: cameraTransform, viewport: viewportRect,
                                            width: width, height: height,
-                                           opacity: layer.opacity) {
+                                           opacity: layerOpacity) {
                     continue
                 }
                 guard let deviceOps = cache.deviceOps(forLayerAt: position,
@@ -263,11 +266,11 @@ extension Renderer {
                                                                 camera: cameraTransform,
                                                                 viewport: viewportRect,
                                                                 width: width, height: height,
-                                                                opacity: layer.opacity)
+                                                                opacity: layerOpacity)
                 } else {
                     try mr.renderCachedLayerIntoLiveCanvas(layerOps: deviceOps,
                                                            width: width, height: height,
-                                                           opacity: layer.opacity)
+                                                           opacity: layerOpacity)
                 }
             }
             

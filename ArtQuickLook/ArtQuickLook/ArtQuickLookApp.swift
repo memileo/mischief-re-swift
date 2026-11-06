@@ -170,6 +170,17 @@ enum AppMenuBuilder {
         add(viewMenu, title: "Reset Rotation",
             action: #selector(AppController.resetRotation(_:)),
             key: "r", modifiers: [.command, .shift], target: AppController.shared)
+        viewMenu.addItem(.separator())
+        add(viewMenu, title: "Flip Horizontal",
+            action: #selector(AppController.flipHorizontal(_:)),
+            key: "h", modifiers: [.command, .option], target: AppController.shared)
+        add(viewMenu, title: "Flip Vertical",
+            action: #selector(AppController.flipVertical(_:)),
+            key: "v", modifiers: [.command, .option], target: AppController.shared)
+        viewMenu.addItem(.separator())
+        add(viewMenu, title: "Layer Stack",
+            action: #selector(AppController.showLayerStack(_:)),
+            key: "l", modifiers: [.command, .option], target: AppController.shared)
         
         // MARK: Window menu (Minimize / Zoom / Bring All to Front + list)
         let windowItem = NSMenuItem()
@@ -392,6 +403,11 @@ final class AppController: NSObject {
     @objc func resetPan(_ sender: NSMenuItem?)      { LiveMTKView.resetFocused(.pan) }
     @objc func resetZoom(_ sender: NSMenuItem?)     { LiveMTKView.resetFocused(.zoom) }
     @objc func resetRotation(_ sender: NSMenuItem?) { LiveMTKView.resetFocused(.rotation) }
+
+    @objc func flipHorizontal(_ sender: NSMenuItem?) { LiveMTKView.flipFocusedHorizontal() }
+    @objc func flipVertical(_ sender: NSMenuItem?) { LiveMTKView.flipFocusedVertical() }
+
+    @objc func showLayerStack(_ sender: Any?) { LayerStackPanelController.shared.toggle() }
 }
 
 extension AppController: NSMenuItemValidation {
@@ -404,7 +420,14 @@ extension AppController: NSMenuItemValidation {
             case #selector(resetView(_:)),
                 #selector(resetPan(_:)),
                 #selector(resetZoom(_:)),
-                #selector(resetRotation(_:)):
+                #selector(resetRotation(_:)),
+                #selector(flipHorizontal(_:)),
+                #selector(flipVertical(_:)):
+                if menuItem.action == #selector(flipHorizontal(_:)) {
+                    menuItem.state = LiveMTKView.focusedFlipHorizontal ? .on : .off
+                } else if menuItem.action == #selector(flipVertical(_:)) {
+                    menuItem.state = LiveMTKView.focusedFlipVertical ? .on : .off
+                }
                 return LiveMTKView.hasFocusedDocument
             case #selector(openRecentDocument(_:)):
                 return true

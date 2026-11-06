@@ -163,6 +163,10 @@ public struct LiveViewTransform: Equatable {
     public private(set) var zoom: CGFloat = 1
     /// Rotation in radians, around the view centre.
     public private(set) var rotation: CGFloat = 0
+    /// Mirror the canvas horizontally.
+    public private(set) var flipHorizontal: Bool = false
+    /// Mirror the canvas vertically.
+    public private(set) var flipVertical: Bool = false
 
     public init() {}
 
@@ -173,7 +177,26 @@ public struct LiveViewTransform: Equatable {
     /// True when nothing is applied on top of the file's view matrix, i.e. a redraw
     /// request with this transform is a no-op.
     public var isNeutral: Bool {
-        pan == .zero && zoom == 1 && rotation == 0
+        pan == .zero && zoom == 1 && rotation == 0 && !flipHorizontal && !flipVertical
+    }
+
+    // MARK: - Flip aliases (kept for callers/tests that use other names)
+
+    public var flippedHorizontally: Bool {
+        get { flipHorizontal }
+        set { flipHorizontal = newValue }
+    }
+    public var flippedVertically: Bool {
+        get { flipVertical }
+        set { flipVertical = newValue }
+    }
+    public var flipH: Bool {
+        get { flipHorizontal }
+        set { flipHorizontal = newValue }
+    }
+    public var flipV: Bool {
+        get { flipVertical }
+        set { flipVertical = newValue }
     }
 
     // MARK: Gestures
@@ -220,6 +243,52 @@ public struct LiveViewTransform: Equatable {
         return self
     }
 
+    // MARK: Flip
+
+    /// Toggle the horizontal flip.
+    @discardableResult
+    public mutating func flipHorizontally() -> LiveViewTransform {
+        flipHorizontal.toggle()
+        return self
+    }
+
+    /// Toggle the vertical flip.
+    @discardableResult
+    public mutating func flipVertically() -> LiveViewTransform {
+        flipVertical.toggle()
+        return self
+    }
+
+    /// Toggle horizontal flip (alias).
+    @discardableResult
+    public mutating func toggleFlipHorizontal() -> LiveViewTransform { flipHorizontal.toggle(); return self }
+
+    /// Toggle vertical flip (alias).
+    @discardableResult
+    public mutating func toggleFlipVertical() -> LiveViewTransform { flipVertical.toggle(); return self }
+
+    /// Toggle horizontal flip (alias).
+    @discardableResult
+    public mutating func toggleHorizontalFlip() -> LiveViewTransform { flipHorizontal.toggle(); return self }
+
+    /// Toggle vertical flip (alias).
+    @discardableResult
+    public mutating func toggleVerticalFlip() -> LiveViewTransform { flipVertical.toggle(); return self }
+
+    /// Set the flip state explicitly.
+    @discardableResult
+    public mutating func setFlip(horizontal: Bool? = nil, vertical: Bool? = nil) -> LiveViewTransform {
+        if let h = horizontal { flipHorizontal = h }
+        if let v = vertical { flipVertical = v }
+        return self
+    }
+
+    /// Set the flip state explicitly (alias).
+    @discardableResult
+    public mutating func setFlipped(horizontal: Bool? = nil, vertical: Bool? = nil) -> LiveViewTransform {
+        setFlip(horizontal: horizontal, vertical: vertical)
+    }
+
     // MARK: Resets
 
     /// Full reset: back to the view matrix stored in the file (zoom 100%, no pan,
@@ -229,6 +298,8 @@ public struct LiveViewTransform: Equatable {
         pan = .zero
         zoom = 1
         rotation = 0
+        flipHorizontal = false
+        flipVertical = false
         return self
     }
 
@@ -310,9 +381,13 @@ public struct LiveViewTransform: Equatable {
         let s = zoom * fit
         let (sr, cr) = (sin(rotation) * s, cos(rotation) * s)
 
-        // Linear part: [a b; c d] = s·R  (R = rotation by `rotation`).
-        let a =  cr, b = sr
-        let c = -sr, d = cr
+        // Flip factors in canvas space: a horizontal flip mirrors the canvas x axis.
+        let fx: CGFloat = flipHorizontal ? -1 : 1
+        let fy: CGFloat = flipVertical ? -1 : 1
+
+        // Linear part: [a b; c d] = s·R·F  (F = flip).
+        let a =  cr * fx, b = sr * fx
+        let c = -sr * fy, d = cr * fy
 
         // Translation so that the canvas centre lands on viewCentre + pan.
         let canvasCentre = CGPoint(x: cw / 2, y: ch / 2)

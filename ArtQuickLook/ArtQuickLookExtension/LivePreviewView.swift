@@ -150,7 +150,9 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         preferredFramesPerSecond = 60
         delegate = self
         isPaused = true                    // nothing redraws unless something asks
-        menu = Self.makeResetMenu(target: self)
+        let resetMenu = Self.makeResetMenu(target: self)
+        resetMenu.delegate = self
+        menu = resetMenu
         addSubview(hudView)
         hud.onChange = { [weak self] state in self?.hudView.state = state }
     }
@@ -202,6 +204,19 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
     @objc func resetZoomTransform() { performReset(.zoom) }
     /// Rotation only.
     @objc func resetRotationTransform() { performReset(.rotation) }
+
+    /// Flip horizontally.
+    @objc func flipHorizontalTransform() {
+        commitTransform(mode: .idle) { $0.flipHorizontally() }
+        hud.announce(viewTransform.flipHorizontal ? "Flip horizontal: on" : "Flip horizontal: off",
+                    zoomPercent: viewTransform.zoomPercent, hold: Self.resetHold)
+    }
+    /// Flip vertically.
+    @objc func flipVerticalTransform() {
+        commitTransform(mode: .idle) { $0.flipVertically() }
+        hud.announce(viewTransform.flipVertical ? "Flip vertical: on" : "Flip vertical: off",
+                    zoomPercent: viewTransform.zoomPercent, hold: Self.resetHold)
+    }
 
     private func performReset(_ kind: LiveResetKind) {
         commitTransform(mode: .idle) { viewTransform in
@@ -803,6 +818,13 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         menu.addItem(item("Reset Pan", "", #selector(LivePreviewView.resetPanTransform), target))
         menu.addItem(item("Reset Zoom", "", #selector(LivePreviewView.resetZoomTransform), target))
         menu.addItem(item("Reset Rotation", "", #selector(LivePreviewView.resetRotationTransform), target))
+        menu.addItem(.separator())
+        let flipH = item("Flip Horizontal", "", #selector(LivePreviewView.flipHorizontalTransform), target)
+        flipH.tag = 1001
+        menu.addItem(flipH)
+        let flipV = item("Flip Vertical", "", #selector(LivePreviewView.flipVerticalTransform), target)
+        flipV.tag = 1002
+        menu.addItem(flipV)
         return menu
     }
 
@@ -811,5 +833,17 @@ final class LivePreviewView: MTKView, MTKViewDelegate {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
         item.target = target
         return item
+    }
+}
+
+extension LivePreviewView: NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) {
+        for item in menu.items {
+            if item.tag == 1001 {
+                item.state = viewTransform.flipHorizontal ? .on : .off
+            } else if item.tag == 1002 {
+                item.state = viewTransform.flipVertical ? .on : .off
+            }
+        }
     }
 }

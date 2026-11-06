@@ -84,7 +84,7 @@ private final class DocumentStatus: ObservableObject {
 final class LiveDocumentSession {
     private let renderQueue = DispatchQueue(label: "org.potato.ArtQuickLook.document",
                                            qos: .userInitiated)
-    private let art: ArtParser
+    var art: ArtParser
     private let canvasSize: CGSize
     private let scale: CGFloat
 
@@ -319,7 +319,9 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
         preferredFramesPerSecond = 60
         delegate = self
         isPaused = true
-        menu = Self.makeResetMenu(target: self)
+        let resetMenu = Self.makeResetMenu(target: self)
+        resetMenu.delegate = self
+        menu = resetMenu
     }
 
     // MARK: Draw
@@ -709,12 +711,26 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
     @objc func resetZoomTransform() { performReset(.zoom) }
     @objc func resetRotationTransform() { performReset(.rotation) }
 
+    @objc func flipHorizontalTransform() {
+        commit { $0.flipHorizontally() }
+    }
+    @objc func flipVerticalTransform() {
+        commit { $0.flipVertically() }
+    }
+
     private static func makeResetMenu(target: LiveMTKView) -> NSMenu {
         let menu = NSMenu()
         menu.addItem(item("Reset View", "0", [], #selector(LiveMTKView.resetView), target))
         menu.addItem(item("Reset Pan", "p", [.command, .shift], #selector(LiveMTKView.resetPanTransform), target))
         menu.addItem(item("Reset Zoom", "5", [], #selector(LiveMTKView.resetZoomTransform), target))
         menu.addItem(item("Reset Rotation", "r", [.command, .shift], #selector(LiveMTKView.resetRotationTransform), target))
+        menu.addItem(.separator())
+        let flipH = item("Flip Horizontal", "", [], #selector(LiveMTKView.flipHorizontalTransform), target)
+        flipH.tag = 2001
+        menu.addItem(flipH)
+        let flipV = item("Flip Vertical", "", [], #selector(LiveMTKView.flipVerticalTransform), target)
+        flipV.tag = 2002
+        menu.addItem(flipV)
         return menu
     }
 
@@ -735,9 +751,31 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
     enum ResetKind { case all, pan, zoom, rotation }
 
     /// The live view in the key window, if any.
+    static weak var lastFocusedDocumentView: LiveMTKView?
     static var focusedDocumentView: LiveMTKView? {
         guard let content = NSApp.keyWindow?.contentView else { return nil }
-        return findLiveMTKView(in: content)
+        if let found = findLiveMTKView(in: content) {
+            lastFocusedDocumentView = found
+            return found
+        }
+        return nil
+    }
+
+    /// The front-most document view, falling back to the only open document
+    /// when nothing is key (so the layer panel keeps showing its contents).
+    static var frontmostDocumentView: LiveMTKView? {
+        if let focused = focusedDocumentView { return focused }
+        if let last = lastFocusedDocumentView, last.window != nil {
+            return last
+        }
+        // Collect document views across all windows.
+        var candidates: [LiveMTKView] = []
+        for window in NSApp.windows {
+            if let cv = window.contentView, let v = findLiveMTKView(in: cv) { candidates.append(v) }
+        }
+        if candidates.count == 1 { return candidates.first }
+        if let main = NSApp.mainWindow, let cv = main.contentView, let v = findLiveMTKView(in: cv) { return v }
+        return candidates.first
     }
 
     static var hasFocusedDocument: Bool { focusedDocumentView != nil }
@@ -745,6 +783,20 @@ final class LiveMTKView: MTKView, MTKViewDelegate {
     static func resetFocused(_ kind: ResetKind) {
         guard let view = focusedDocumentView else { return }
         view.performReset(kind)
+    }
+
+    static func flipFocusedHorizontal() {
+        focusedDocumentView?.flipHorizontalTransform()
+    }
+    static func flipFocusedVertical() {
+        focusedDocumentView?.flipVerticalTransform()
+    }
+
+    static var focusedFlipHorizontal: Bool {
+        focusedDocumentView?.viewTransform.flipHorizontal ?? false
+    }
+    static var focusedFlipVertical: Bool {
+        focusedDocumentView?.viewTransform.flipVertical ?? false
     }
 
     private static func findLiveMTKView(in view: NSView) -> LiveMTKView? {
@@ -850,5 +902,197 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     
     @objc override func newWindowForTab(_ sender: Any?) {
         AppController.shared.openDocument(sender)
+    }
+}
+
+extension LiveMTKView: NSMenuDelegate {
+    public func menuWillOpen(_ menu: NSMenu) {
+        for item in menu.items {
+            if item.tag == 2001 {
+                item.state = viewTransform.flipHorizontal ? .on : .off
+            } else if item.tag == 2002 {
+                item.state = viewTransform.flipVertical ? .on : .off
+            }
+        }
+    }
+}
+
+// MARK: - Layer stack (app only)
+
+extension LiveMTKView {
+    /// The parsed document currently shown by this view, if any.
+    var currentArt: ArtParser? { session?.art }
+
+    /// Mutate a layer's stored visibility/opacity in the underlying document.
+    func setLayerVisible(_ id: Int, _ visible: Bool) {
+        guard let session = session, id < session.art.layers.count else { return }
+        session.art.layers[id]["visible"] = visible ? 1 : 0
+    }
+    func setLayerOpacity(_ id: Int, _ opacity: Float) {
+        guard let session = session, id < session.art.layers.count else { return }
+        session.art.layers[id]["opacity"] = opacity
+    }
+
+    /// Re-render after a layer visibility/opacity edit.
+    func reportChangeAfterLayerEdit() { reportChange() }
+}
+
+final class LayerStackModel: ObservableObject {
+    static let shared = LayerStackModel()
+
+    struct LayerRow: Identifiable {
+        let id: Int
+        var name: String
+        var isVisible: Bool
+        var opacity: Double
+    }
+
+    @Published var layers: [LayerRow] = []
+    @Published var selectedLayerIndex: Int?
+
+    private var observer: NSObjectProtocol?
+
+    private init() {
+        observer = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.refresh()
+        }
+        refresh()
+    }
+
+    func refresh() {
+        guard let view = LiveMTKView.frontmostDocumentView, let art = view.currentArt else {
+            layers = []
+            selectedLayerIndex = nil
+            return
+        }
+        let order = art.layerOrder.isEmpty ? Array(art.layers.indices) : art.layerOrder.reversed()
+        var rows: [LayerRow] = []
+        for idx in order {
+            guard idx < art.layers.count else { continue }
+            let layer = art.layers[idx]
+            let name = (layer["name"] as? String) ?? "Layer \(idx + 1)"
+            // Exclude hidden Sketch layers (free transform pastes).
+            if name == "Sketch Layer" { continue }
+            // Also exclude layers not reachable in the normal layer list? keep all others.
+            let visible = (layer["visible"] as? Int ?? 1) != 0
+            let opacity = Double(layer["opacity"] as? Float ?? 1.0)
+            rows.append(LayerRow(id: idx, name: name, isVisible: visible, opacity: opacity))
+        }
+        let previous = selectedLayerIndex
+        layers = rows
+        if let previous, rows.contains(where: { $0.id == previous }) {
+            selectedLayerIndex = previous
+        } else {
+            selectedLayerIndex = rows.first?.id
+        }
+    }
+
+    func toggleVisibility(_ id: Int) {
+        guard let view = LiveMTKView.frontmostDocumentView, let art = view.currentArt else { return }
+        guard id < art.layers.count else { return }
+        let current = (view.currentArt?.layers[id]["visible"] as? Int ?? 1) != 0
+        view.setLayerVisible(id, !current)
+        if let i = layers.firstIndex(where: { $0.id == id }) {
+            layers[i].isVisible = !current
+            layers = layers
+        }
+        view.reportChangeAfterLayerEdit()
+    }
+
+    func setOpacity(_ id: Int, _ value: Double) {
+        guard let view = LiveMTKView.frontmostDocumentView, let art = view.currentArt else { return }
+        guard id < art.layers.count else { return }
+        view.setLayerOpacity(id, Float(value))
+        if let i = layers.firstIndex(where: { $0.id == id }) {
+            layers[i].opacity = value
+            layers = layers
+        }
+        view.reportChangeAfterLayerEdit()
+    }
+}
+
+struct LayerStackView: View {
+    @ObservedObject var model: LayerStackModel
+
+    var body: some View {
+        VStack(spacing: 2) {
+            if model.layers.isEmpty {
+                Text("No document")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(selection: $model.selectedLayerIndex) {
+                    ForEach(model.layers) { row in
+                        HStack {
+                            Button(action: { model.toggleVisibility(row.id) }) {
+                                Image(systemName: row.isVisible ? "eye" : "eye.slash")
+                                    .opacity(row.isVisible ? 1.0 : 0.4)
+                            }
+                            .buttonStyle(.borderless)
+                            Text(row.name)
+                                .foregroundStyle(row.isVisible ? .primary : .secondary)
+                                .opacity(row.isVisible ? 1.0 : 0.4)
+                            if row.opacity < 0.999 {
+                                Text(String(format: "%.0f%%", row.opacity * 100))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                        }
+                        .tag(row.id)
+                    }
+                }
+                .listStyle(.inset)
+
+                if let sel = model.selectedLayerIndex,
+                   let row = model.layers.first(where: { $0.id == sel }) {
+                    VStack(alignment: .leading) {
+                        HStack {
+                            Text("Opacity")
+//                                .font(.caption)
+                            Text(String(format: "%.0f%%", row.opacity * 100))
+//                                .font(.caption)
+//                                .foregroundStyle(.secondary)
+                        }
+                        Slider(value: Binding(
+                            get: { row.opacity },
+                            set: { model.setOpacity(sel, $0) }
+                        ), in: 0...1)
+                    }
+                    .padding(.horizontal)
+                    .padding(.bottom, 4)
+                }
+            }
+        }
+        .frame(minWidth: 148, minHeight: 148)
+    }
+}
+
+final class LayerStackPanelController {
+    static let shared = LayerStackPanelController()
+    private var panel: NSPanel?
+
+    func toggle() {
+        if panel == nil { create() }
+        guard let panel = panel else { return }
+        if panel.isVisible {
+            panel.orderOut(nil)
+        } else {
+            LayerStackModel.shared.refresh()
+            panel.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    private func create() {
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 260, height: 420),
+                            styleMask: [.titled, .closable, .resizable, .utilityWindow, .hudWindow, .unifiedTitleAndToolbar],
+                            backing: .buffered, defer: false)
+        panel.title = "Layers"
+        panel.contentViewController = NSHostingController(rootView: LayerStackView(model: LayerStackModel.shared))
+        panel.isFloatingPanel = true
+        panel.becomesKeyOnlyIfNeeded = false
+//        panel.hidesOnDeactivate = false
+        self.panel = panel
     }
 }
