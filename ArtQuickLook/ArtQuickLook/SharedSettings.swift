@@ -17,10 +17,10 @@ enum RenderPath: String, CaseIterable, Identifiable {
     
     var label: String {
         switch self {
-            case .gpuSegments: return "GPU SDF segments (Default)"
+            case .gpuSegments: return "GPU SDF segments"
             case .gpuStamps:   return "GPU stamps"
             case .cpuStamps:   return "CPU stamps"
-            case .liveMetal:   return "Live Metal view (pan / zoom / rotate)"
+            case .liveMetal:   return "GPU Live Metal view (pan / zoom / rotate) (Default)"
         }
     }
     
@@ -50,7 +50,7 @@ struct Settings {
         set { d.set(newValue, forKey: Keys.previewScale) }
     }
     var renderPath: RenderPath {
-        get { RenderPath(rawValue: d.string(forKey: Keys.renderPath) ?? "") ?? .gpuSegments }
+        get { RenderPath(rawValue: d.string(forKey: Keys.renderPath) ?? "") ?? .liveMetal }
         set { d.set(newValue.rawValue, forKey: Keys.renderPath) }
     }
     var useCache: Bool {
