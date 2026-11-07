@@ -578,7 +578,7 @@ kernel void segmentNoiseCompositeKernel(
     // per segment and the normal path uses it once at the end.
     float noiseVal = 1.0f;
     if (noiseTex.get_width() > 0) {
-        float2 noiseUV = fract((float2(gid) - float2(params.noiseOffsetX, -params.noiseOffsetY)) / (float(noiseTex.get_width()) * params.noiseScale));
+        float2 noiseUV = fract((float2(gid) - float2(params.noiseOffsetX, params.noiseOffsetY)) / (float(noiseTex.get_width()) * params.noiseScale));
         noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
     }
     
@@ -964,7 +964,7 @@ kernel void segmentPasteLayerNoiseCompositeKernel(
     
     float noiseVal = 1.0f;
     if (noiseTex.get_width() > 0) {
-        float2 noiseUV = fract((float2(px) - float2(params.noiseOffsetX, -params.noiseOffsetY)) / (float(noiseTex.get_width()) * params.noiseScale));
+        float2 noiseUV = fract((float2(px) - float2(params.noiseOffsetX, params.noiseOffsetY)) / (float(noiseTex.get_width()) * params.noiseScale));
         noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
     }
     
@@ -1420,7 +1420,7 @@ kernel void liveSegmentNoiseCompositeKernel(
 
     float noiseVal = 1.0f;
     if (noiseTex.get_width() > 0) {
-        float2 noiseUV = fract((float2(pixel) - float2(params.noiseOffsetX, -params.noiseOffsetY)) / (float(noiseTex.get_width()) * params.noiseScale));
+        float2 noiseUV = fract((float2(pixel) - float2(params.noiseOffsetX, params.noiseOffsetY)) / (float(noiseTex.get_width()) * params.noiseScale));
         noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
     }
 
@@ -1871,7 +1871,7 @@ kernel void livePerTileNoiseCompositeKernel(
     // Same sampling as liveSegmentNoiseCompositeKernel (noiseScale 0.4).
     float noiseVal = 1.0f;
     if (noiseTex.get_width() > 0) {
-        float2 noiseUV = fract((float2(pixel) - float2(params.noiseOffsetX, -params.noiseOffsetY)) / (float(noiseTex.get_width()) * 0.4f));
+        float2 noiseUV = fract((float2(pixel) - float2(params.noiseOffsetX, params.noiseOffsetY)) / (float(noiseTex.get_width()) * 0.4f));
         noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
     }
 
@@ -2251,7 +2251,7 @@ kernel void liveSplatCompositeKernel(
 
     float noiseVal = 1.0f;
     if ((params.flags & 0x1u) != 0u && noiseTex.get_width() > 0) {
-        float2 noiseUV = fract((float2(float(px), float(py)) - float2(params.noiseOffsetX, -params.noiseOffsetY)) / (float(noiseTex.get_width()) * 0.4f));
+        float2 noiseUV = fract((float2(float(px), float(py)) - float2(params.noiseOffsetX, params.noiseOffsetY)) / (float(noiseTex.get_width()) * 0.4f));
         noiseVal = noiseTex.sample(noiseSampler, noiseUV).r;
     }
 
