@@ -149,6 +149,8 @@ struct LiveSplatParams {
     var boxTilesPerRow: UInt32
     var boxTilesPerCol: UInt32
     var flags: UInt32
+    var noiseOffsetX: Float = 0
+    var noiseOffsetY: Float = 0
     var originPxX: Int32
     var originPxY: Int32
     var boxPixW: Int32
@@ -2138,6 +2140,8 @@ extension MetalRenderer {
                 batchStart: 0, batchCount: 0, tileSize: UInt32(liveTile),
                 boxTilesPerRow: UInt32(boxW), boxTilesPerCol: UInt32(boxH),
                 flags: needsNoise ? 1 : 0,
+                noiseOffsetX: Float(self.liveNoiseOffset.x),
+                noiseOffsetY: Float(self.liveNoiseOffset.y),
                 originPxX: Int32(box.minX * liveTile), originPxY: Int32(box.minY * liveTile),
                 boxPixW: Int32(splatBoxPixW), boxPixH: Int32(splatBoxPixH))
             let visCount = visStrokeIDs.count
