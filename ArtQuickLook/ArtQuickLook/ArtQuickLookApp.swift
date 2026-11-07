@@ -181,6 +181,7 @@ enum AppMenuBuilder {
         add(viewMenu, title: "Layer Stack",
             action: #selector(AppController.showLayerStack(_:)),
             key: "l", modifiers: [.command, .option], target: AppController.shared)
+        viewMenu.addItem(.separator())
         
         // MARK: Window menu (Minimize / Zoom / Bring All to Front + list)
         let windowItem = NSMenuItem()

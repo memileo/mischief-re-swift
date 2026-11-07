@@ -1026,7 +1026,7 @@ struct LayerStackView: View {
     @ObservedObject var model: LayerStackModel
 
     var body: some View {
-        VStack(spacing: 2) {
+        VStack(spacing: 4) {
             if model.layers.isEmpty {
                 Text("No document")
                     .foregroundStyle(.secondary)
@@ -1057,7 +1057,7 @@ struct LayerStackView: View {
 
                 if let sel = model.selectedLayerIndex,
                    let row = model.layers.first(where: { $0.id == sel }) {
-                    VStack(alignment: .leading) {
+                    VStack(alignment: .leading, spacing: 2) {
                         HStack {
                             Text("Opacity")
 //                                .font(.caption)
@@ -1072,10 +1072,11 @@ struct LayerStackView: View {
                     }
                     .padding(.horizontal)
                     .padding(.bottom, 4)
+                    .padding(.top, 4)
                 }
             }
         }
-        .frame(minWidth: 148, idealWidth: 164, minHeight: 148, idealHeight: 182)
+        .frame(minWidth: 164, idealWidth: 180, minHeight: 164, idealHeight: 200)
     }
 }
 
@@ -1095,14 +1096,14 @@ final class LayerStackPanelController {
     }
 
     private func create() {
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 260, height: 420),
-                            styleMask: [.titled, .closable, .resizable, .utilityWindow, .hudWindow, .unifiedTitleAndToolbar],
+        let panel = NSPanel(contentRect: NSRect(x: 25, y: 50, width: 260, height: 420),
+                            styleMask: [.titled, .closable, .resizable, .utilityWindow],
                             backing: .buffered, defer: false)
         panel.title = "Layers"
         panel.contentViewController = NSHostingController(rootView: LayerStackView(model: LayerStackModel.shared))
         panel.isFloatingPanel = true
         panel.becomesKeyOnlyIfNeeded = false
-//        panel.hidesOnDeactivate = false
+        panel.titlebarAppearsTransparent = true
         self.panel = panel
     }
 }
