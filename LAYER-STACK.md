@@ -24,18 +24,3 @@ Add a layer-stack panel to the ArtQuickLook app (not the Quick Look extension):
 - Renderer interactive path reads current visibility/opacity from `art.layers`
   instead of the cached values, so toggles take effect without rebuilding cache.
 - `LiveDocumentSession.art` made mutable so layer edits persist.
-
-## Todo checklist
-
-- [ ] Auto-refresh panel contents when the active document changes without a
-      key-window notification gap (currently relies on `NSWindow.didBecomeKey`).
-- [ ] Show layer thumbnails/previews in the panel.
-- [ ] Reorder layers (drag to change `art.layerOrder`) — not yet supported.
-- [ ] Persist visibility/opacity edits back to the `.art` file (currently session-only).
-- [ ] Add keyboard shortcuts and accessibility labels to toggle buttons.
-- [ ] Handle documents with zero layers / missing layer names gracefully (done for names).
-- [ ] Verify opacity slider does not conflict with cached-layer rendering edge cases.
-- [ ] Add unit tests for layer filtering (exclude Sketch layers).
-- [ ] Polish panel sizing, selection highlight, and empty state.
-- [ ] Ensure panel hides/clears when no document window is focused.
-"
