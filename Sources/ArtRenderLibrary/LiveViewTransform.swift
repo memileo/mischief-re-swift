@@ -244,50 +244,58 @@ public struct LiveViewTransform: Equatable {
     }
 
     // MARK: Flip
+    //
+    // The projection applies flip in view space (`F·s·R`, "last"), mirroring the image
+    // around the viewport centre. Compensate `pan` on toggle so the canvas point under
+    // the viewport centre stays pinned: with view-space flip, that is just negating the
+    // flipped pan component.
 
-    /// Toggle the horizontal flip.
+    /// Toggle the horizontal flip, keeping the current view centre pinned.
     @discardableResult
     public mutating func flipHorizontally() -> LiveViewTransform {
         flipHorizontal.toggle()
+        pan.x = -pan.x
         return self
     }
 
-    /// Toggle the vertical flip.
+    /// Toggle the vertical flip, keeping the current view centre pinned.
     @discardableResult
     public mutating func flipVertically() -> LiveViewTransform {
         flipVertical.toggle()
+        pan.y = -pan.y
         return self
     }
 
-    /// Toggle horizontal flip (alias).
+    /// Toggle horizontal flip (alias), keeping the current view centre pinned.
     @discardableResult
-    public mutating func toggleFlipHorizontal() -> LiveViewTransform { flipHorizontal.toggle(); return self }
+    public mutating func toggleFlipHorizontal() -> LiveViewTransform { flipHorizontally() }
 
-    /// Toggle vertical flip (alias).
+    /// Toggle vertical flip (alias), keeping the current view centre pinned.
     @discardableResult
-    public mutating func toggleFlipVertical() -> LiveViewTransform { flipVertical.toggle(); return self }
+    public mutating func toggleFlipVertical() -> LiveViewTransform { flipVertically() }
 
-    /// Toggle horizontal flip (alias).
+    /// Toggle horizontal flip (alias), keeping the current view centre pinned.
     @discardableResult
-    public mutating func toggleHorizontalFlip() -> LiveViewTransform { flipHorizontal.toggle(); return self }
+    public mutating func toggleHorizontalFlip() -> LiveViewTransform { flipHorizontally() }
 
-    /// Toggle vertical flip (alias).
+    /// Toggle vertical flip (alias), keeping the current view centre pinned.
     @discardableResult
-    public mutating func toggleVerticalFlip() -> LiveViewTransform { flipVertical.toggle(); return self }
+    public mutating func toggleVerticalFlip() -> LiveViewTransform { flipVertically() }
 
     /// Set the flip state explicitly.
-    @discardableResult
-    public mutating func setFlip(horizontal: Bool? = nil, vertical: Bool? = nil) -> LiveViewTransform {
-        if let h = horizontal { flipHorizontal = h }
-        if let v = vertical { flipVertical = v }
-        return self
-    }
+//    @discardableResult
+//    public mutating func setFlip(horizontal: Bool? = nil, vertical: Bool? = nil) -> LiveViewTransform {
+//        if let h = horizontal { flipHorizontal = h }
+//        if let v = vertical { flipVertical = v }
+//        return self
+//    }
 
     /// Set the flip state explicitly (alias).
-    @discardableResult
-    public mutating func setFlipped(horizontal: Bool? = nil, vertical: Bool? = nil) -> LiveViewTransform {
-        setFlip(horizontal: horizontal, vertical: vertical)
-    }
+    // Unused?
+//    @discardableResult
+//    public mutating func setFlipped(horizontal: Bool? = nil, vertical: Bool? = nil) -> LiveViewTransform {
+//        setFlip(horizontal: horizontal, vertical: vertical)
+//    }
 
     // MARK: Resets
 
@@ -385,9 +393,9 @@ public struct LiveViewTransform: Equatable {
         let fx: CGFloat = flipHorizontal ? -1 : 1
         let fy: CGFloat = flipVertical ? -1 : 1
 
-        // Linear part: [a b; c d] = s·R·F  (F = flip).
-        let a =  cr * fx, b = sr * fx
-        let c = -sr * fy, d = cr * fy
+        // Linear part: [a b; c d] = s·R·F  (F = flip). flip applied last
+        let a =  cr * fx, b = sr * fy
+        let c = -sr * fx, d = cr * fy
 
         // Translation so that the canvas centre lands on viewCentre + pan.
         let canvasCentre = CGPoint(x: cw / 2, y: ch / 2)

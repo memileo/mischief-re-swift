@@ -338,4 +338,72 @@ final class LiveViewTransformTests: XCTestCase {
     func testDegenerateMatrixHasNoInverse() {
         XCTAssertNil(LiveViewMatrix(a: 0, b: 0, c: 0, d: 0, tx: 0, ty: 0).inverted())
     }
+
+    // MARK: - Flips
+
+    /// Flipping is applied in view space and must keep the canvas point currently under
+    /// the viewport centre pinned there (a "flip current view" around its centre).
+    func testFlipHorizontalKeepsViewportCentrePinned() {
+        var t = LiveViewTransform()
+        t.pan(by: CGPoint(x: 80, y: -35))
+        t.zoom(by: 1.8, anchor: CGPoint(x: 120, y: 90), viewportSize: viewport)
+        t.rotate(by: 0.35, anchor: CGPoint(x: 700, y: 110), viewportSize: viewport)
+
+        let canvasAtCentre = t.matrix(canvasPixelSize: canvas, viewportSize: viewport)
+            .inverted()!.applying(center)
+        t.flipHorizontally()
+        assertPoint(t.matrix(canvasPixelSize: canvas, viewportSize: viewport)
+                        .applying(canvasAtCentre),
+                    center, accuracy: 1e-4,
+                    "viewport centre must stay pinned after horizontal flip")
+        XCTAssertTrue(t.flipHorizontal)
+        XCTAssertFalse(t.isNeutral)
+
+        // A second toggle restores the state.
+        t.flipHorizontally()
+        XCTAssertFalse(t.flipHorizontal)
+    }
+
+    func testFlipVerticalKeepsViewportCentrePinned() {
+        var t = LiveViewTransform()
+        t.pan(by: CGPoint(x: -55, y: 70))
+        t.zoom(by: 2.2, anchor: CGPoint(x: 60, y: 500), viewportSize: viewport)
+        t.rotate(by: -0.6, anchor: CGPoint(x: 200, y: 50), viewportSize: viewport)
+
+        let canvasAtCentre = t.matrix(canvasPixelSize: canvas, viewportSize: viewport)
+            .inverted()!.applying(center)
+        t.flipVertically()
+        assertPoint(t.matrix(canvasPixelSize: canvas, viewportSize: viewport)
+                        .applying(canvasAtCentre),
+                    center, accuracy: 1e-4,
+                    "viewport centre must stay pinned after vertical flip")
+        XCTAssertTrue(t.flipVertical)
+
+        t.flipVertically()
+        XCTAssertFalse(t.flipVertical)
+    }
+
+    /// Flipping a neutral transform mirrors around the viewport centre: the canvas centre
+    /// is already at the viewport centre, so pan stays zero and edges swap.
+    func testNeutralHorizontalFlipMirrorsAroundViewportCentre() {
+        var t = LiveViewTransform()
+        t.flipHorizontally()
+        XCTAssertEqual(t.pan, .zero)
+        let m = t.matrix(canvasPixelSize: canvas, viewportSize: viewport)
+        assertPoint(m.applying(canvasCenter), center)
+        // canvas top-left (0,0) mapped to view (0,100) neutrally -> mirrored to (800,100)
+        assertPoint(m.applying(CGPoint(x: 0, y: 0)), CGPoint(x: 800, y: 100), accuracy: 1e-6,
+                    "left edge should mirror to the right")
+        assertPoint(m.applying(CGPoint(x: 2000, y: 0)), CGPoint(x: 0, y: 100), accuracy: 1e-6,
+                    "right edge should mirror to the left")
+    }
+
+    func testResetAllClearsFlips() {
+        var t = LiveViewTransform()
+        t.pan(by: CGPoint(x: 30, y: 10))
+        t.flipHorizontally()
+        t.flipVertically()
+        t.resetAll()
+        XCTAssertEqual(t, LiveViewTransform())
+    }
 }
