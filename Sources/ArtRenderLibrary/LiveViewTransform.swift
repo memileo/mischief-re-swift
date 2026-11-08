@@ -228,18 +228,22 @@ public struct LiveViewTransform: Equatable {
         return self
     }
 
-    /// Rotate by `delta` radians around `anchor` (view pixels).
+    /// Rotate by `delta` radians around `anchor` (view pixels). `delta` is the
+    /// visual/gesture rotation; a single view-space flip mirrors the image, so the
+    /// stored canvas rotation advances by `fx·fy·delta` to keep the on-screen direction
+    /// consistent. Anchor pinning uses `F·Rot(fx·fy·delta)·F = Rot(delta)`.
     @discardableResult
     public mutating func rotate(by delta: CGFloat, anchor: CGPoint, viewportSize: CGSize) -> LiveViewTransform {
         guard delta.isFinite, delta != 0 else { return self }
         let centre = CGPoint(x: viewportSize.width / 2, y: viewportSize.height / 2)
         let rel = CGPoint(x: anchor.x - centre.x - pan.x,
                           y: anchor.y - centre.y - pan.y)
+        let flipSign: CGFloat = (flipHorizontal != flipVertical) ? -1 : 1
         let (s, c) = (sin(delta), cos(delta))
         // pan' = anchor - centre - Rot(delta)·(anchor - centre - pan)
         pan = CGPoint(x: anchor.x - centre.x - (c * rel.x - s * rel.y),
                       y: anchor.y - centre.y - (s * rel.x + c * rel.y))
-        rotation += delta
+        rotation += delta * flipSign
         return self
     }
 
@@ -365,7 +369,8 @@ public struct LiveViewTransform: Equatable {
     @discardableResult
     public mutating func resetRotation(anchor: CGPoint, viewportSize: CGSize) -> LiveViewTransform {
         if rotation != 0 {
-            rotate(by: -rotation, anchor: anchor, viewportSize: viewportSize)
+            let flipSign: CGFloat = (flipHorizontal != flipVertical) ? -1 : 1
+            rotate(by: -rotation * flipSign, anchor: anchor, viewportSize: viewportSize)
         }
         rotation = 0
         return self

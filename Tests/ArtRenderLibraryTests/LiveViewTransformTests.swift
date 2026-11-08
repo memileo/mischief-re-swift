@@ -406,4 +406,25 @@ final class LiveViewTransformTests: XCTestCase {
         t.resetAll()
         XCTAssertEqual(t, LiveViewTransform())
     }
+
+    /// Rotation anchoring uses F·Rot(delta)·F to match the view-space flip; a single
+    /// flip reverses that conjugation, so the anchor must still stay pinned.
+    func testRotateAnchorStaysPinnedWhenFlipped() {
+        for flips: (Bool, Bool) in [(true, false), (false, true), (true, true)] {
+            var t = LiveViewTransform()
+            if flips.0 { t.flipHorizontally() }
+            if flips.1 { t.flipVertically() }
+            t.pan(by: CGPoint(x: -45, y: 20))
+            t.zoom(by: 1.6, anchor: CGPoint(x: 500, y: 80), viewportSize: viewport)
+
+            let anchor = CGPoint(x: 130, y: 470)
+            let canvasBefore = t.matrix(canvasPixelSize: canvas, viewportSize: viewport)
+                .inverted()!.applying(anchor)
+            t.rotate(by: 0.7, anchor: anchor, viewportSize: viewport)
+            assertPoint(t.matrix(canvasPixelSize: canvas, viewportSize: viewport)
+                            .applying(canvasBefore),
+                        anchor, accuracy: 1e-4,
+                        "anchor must stay pinned while flipped \(flips)")
+        }
+    }
 }
