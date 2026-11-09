@@ -38,12 +38,27 @@ struct LivePaperParams {
     float paperStrength;
     float bgR, bgG, bgB;
     float hasTexture;    // 1 = art.paperTextureId != 0
-    float tileW, tileH;  // paper tile size in canvas points (0.666 * image size)
+    float tileW, tileH;  // base paper tile size in canvas points
     float canvasW, canvasH;
-    // canvas pixels -> canvas points, so the paper is anchored to the page and pans /
-    // zooms with the view instead of sitting on the glass.
+    // canvas pixels -> canvas points. *Full matrix, translation included*
+    // (m02/m12): the pattern is anchored to the document space, so it translates
+    // with the view and zooms around the camera's zoom point, exactly like the
+    // strokes. Callers add offset below as a phase nudge.
     float m00, m01, m02;
     float m10, m11, m12;
+    // Recursive tile blending: the fine level's apparent screen size is
+    // referenceScale * (paper tile) at the reference state (viewRelZoom == 0), and
+    // sweeps minScale..maxScale per octave of magnification by crossfading two
+    // tile levels one octave apart (B is the finer one, half the fine tile, so
+    // consecutive bands hand off on the same grid with no pop).
+    float minScale, maxScale;
+    float referenceScale;
+    // log2 of the document's on-screen magnification relative to the reference
+    // state (0 == saved view baked at 1:1).
+    float viewRelZoom;
+    // Pattern offset in document points. Tunable only - never derived from a view
+    // translation.
+    float offsetX, offsetY;
 };
 
 // MARK: - Layer stacking
@@ -80,28 +95,72 @@ kernel void liveCompositeLayerKernel(
 ///
 /// The tile pattern is evaluated in canvas space (canvas px -> canvas points via the
 /// supplied matrix), so it is anchored to the page and pans/zooms with the view.
+/// To keep the texture's apparent screen size within [minScale, maxScale] of its
+/// base size (recursive / LOD blending), two power-of-two tile
+/// levels are sampled and crossfaded based on the current view scale.
 kernel void livePaperBackgroundKernel(
                                         const device LivePaperParams &params [[buffer(0)]],
                                         texture2d<float, access::sample>   paper   [[texture(0)]],
                                         texture2d<float, access::read_write> target [[texture(1)]],
-                                        sampler linearClamp [[sampler(0)]],
+                                        sampler paperSampler [[sampler(0)]],
                                         uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
 
-    float2 px = float2(gid) + 0.5f;   // canvas pixel position, y down
+    // Canvas pixel position, y down. The +1/3 doc phase lands the tile-boundary
+    // column on its texel centre (full depth, as in the refs) while dash lines
+    // straddle between texels (half depth, as in the refs).
+    float2 px = float2(gid) + (1.0f / 3.0f);
 
     if (params.hasTexture > 0.5f)
     {
         // paper colour first, then the tiled texture over it at paperStrength
         float3 colour = float3(params.paperR, params.paperG, params.paperB);
 
+        // Document position: full mapping (translation included, so the pattern is
+        // glued to the page) + tunable offset.
         float2 doc = float2(params.m00 * px.x + params.m01 * px.y + params.m02,
-                            params.m10 * px.x + params.m11 * px.y + params.m12);
+                            params.m10 * px.x + params.m11 * px.y + params.m12)
+                   + float2(params.offsetX, params.offsetY);
 
-        float2 tile = max(float2(params.tileW, params.tileH), float2(1.0f));
-        float2 tileUV = fract(doc / tile);
-        float4 texel = paper.sample(linearClamp, tileUV);
+        float2 baseTile = max(float2(params.tileW, params.tileH), float2(1.0f));
+
+        // Recursive tile blending. The fine level's apparent size
+        // sweeps [minScale, maxScale] of its base size once per octave of view
+        // magnification: at band position f it is minScale * (maxScale/minScale)^f.
+        // Two doc-anchored levels one octave apart are sampled at that apparent
+        // size and crossfaded by f; the finer level (half the fine tile) carries
+        // the larger weight as f grows, and because maxS == 2*minS the handoff
+        // between bands lands exactly on the resumed level's grid.
+        float minS = max(params.minScale, 1e-4f);
+        float maxS = max(params.maxScale, minS * 1.001f);
+        float L  = log2(maxS / minS);           // one blend band, in log2 units
+        float u  = params.viewRelZoom;          // log2 magnification since reference
+        float t  = log2(max(params.referenceScale, 1e-6f) / minS) / L + u / L;
+        float band = floor(t);
+        float f = t - band;                     // 0 -> minScale, 1 -> maxScale
+
+        float fineRatio = exp2(L * f) * minS;   // apparent tile size / paper width
+
+        // Screen pixels per canvas point (uniform scale of the mapping).
+        float docPerPx = max(length(float2(params.m00, params.m10)), 1e-6f);
+
+        // Tile sizes in document points such that the fine level appears at
+        // fineRatio * paperW screen pixels at the current mapping. Level B is the
+        // next *finer* octave (half the fine tile): every band then hands off on
+        // the same grid as the band it replaces, so zooming through a band
+        // boundary never pops the pattern (zoom in: B(b) == A(b+1); zoom out:
+        // A(b) == B(b-1)).
+        float2 tileA = fineRatio * baseTile * docPerPx;
+        float2 tileB = tileA * 0.5f;
+
+        // Sample with repeat wrap. Tile sizes are document-anchored (mag cancels
+        // inside a band), so the sampled grid is frozen while zooming and does not
+        // shimmer; base-level linear sampling matches the reference render's
+        // feature depths (trilinear mip blending washed dash/seam contrast out).
+        float4 texelA = paper.sample(paperSampler, doc / tileA);
+        float4 texelB = paper.sample(paperSampler, doc / tileB);
+        float4 texel  = mix(texelA, texelB, f);
 
         colour = mix(colour, texel.rgb, saturate(params.paperStrength) * texel.a);
 

@@ -88,19 +88,33 @@ extension Renderer {
                                                   opacity: layerOpacity)
             }
             
-            // ── Paper / background, baked in one compute pass. Identity camera:
-            //    canvas pixels *are* document-canvas pixels here.
+            // ── Paper / background, baked in one compute pass. The pattern is
+            //    anchored to the document: it translates and zooms with the view
+            //    like the strokes (full camera inverse, translation included). The
+            //    kernel's offsetX/Y is the only phase nudge. The baked canvas *is*
+            //    the saved view at 1:1, so viewRelZoom == 0.
             if art.paperTextureId != 0 {
                 _ = mr.uploadLivePaperTexture(data: art.paperTextureData)
             }
+            let linearInverted = baseTransform.inverted()
+            let paperLinearScale = hypot(linearInverted.a, linearInverted.b)
+            // Full inverse maps render pixels -> canvas points, translation
+            // included: the paper is glued to the document.
+            let paperDocumentFromCanvas = linearInverted
+            // LOD: log2 device pixels per document point == magnification relative
+            // to the state referenceScale was calibrated at (1 doc pt = 1 px), i.e.
+            // the saved view's zoom for this bake.
+            let viewRelZoom = Float(log2(max(1 / max(abs(paperLinearScale), 1e-9), 1e-9)))
             try mr.renderLivePaperBackground(
                 paperColor: getPaperColor(for: art.paperTextureId),
                 paperStrength: art.paperStrength,
                 backgroundColor: art.backgroundColor,
                 paperTextureData: art.paperTextureData,
-                tileScale: scale,
-                documentFromCanvas: .identity,
-                width: width, height: height)
+                // baseTransform.inverted() maps render pixels -> canvas points.
+                tileScale: 1,
+                documentFromCanvas: paperDocumentFromCanvas,
+                width: width, height: height,
+                viewRelZoom: viewRelZoom)
             
             try mr.generateLiveCanvasMipmaps()
             
@@ -273,25 +287,29 @@ extension Renderer {
                 }
             }
             
-            // ── Paper / background. Tiled in *canvas* space (like the CoreGraphics path):
-            //   viewport px → canvas px via the inverse camera, then ÷ scale → canvas points,
-            //   so the pattern is anchored to the canvas and pans/zooms with the view.
+            // ── Paper / background. The pattern is anchored to the document: it
+            //    translates with the view (paper shifts by exactly tx, like the
+            //    strokes) and zooms around the camera's zoom point. LOD tracks the
+            //    user's magnification, passed as log2 to the kernel.
             if art.paperTextureId != 0, mr.livePaperTexture == nil {
                 _ = mr.uploadLivePaperTexture(data: art.paperTextureData)
             }
             let documentUnits = scale != 0 ? 1 / scale : 1
-            let documentFromCanvas: CGAffineTransform
+            var documentFromCanvas = CGAffineTransform(scaleX: documentUnits, y: documentUnits)
             if cameraTransform.isInvertible {
-                // viewport px → canvas px via the inverse camera, then ÷ scale → canvas
-                // points (`a.concatenating(b)` applies a first). The ÷scale must come
-                // *after* the camera inverse: `cameraTransform` works in reference
-                // canvas pixels, and dividing before it would bake the raster scale
-                // into the camera, making the paper shift `scale`-times per pan pixel.
+                // Full viewport px -> canvas px inverse (translation included),
+                // then ÷ scale into document points: the paper is glued to the
+                // document and follows the camera exactly.
                 documentFromCanvas = cameraTransform.inverted()
                     .concatenating(CGAffineTransform(scaleX: documentUnits, y: documentUnits))
-            } else {
-                documentFromCanvas = .identity
             }
+            // LOD: log2 device pixels per document point, i.e. magnification
+            // relative to the state referenceScale was calibrated at (1 doc pt =
+            // 1 px, the file's saved view rendered at 1:1). Camera zoom == 1,
+            // pan == 0 == the saved view, so only user magnification advances it.
+            let fitScale = min(viewport.width / max(canvasSize.width * scale, 1),
+                               viewport.height / max(canvasSize.height * scale, 1))
+            let viewRelZoom = Float(log2(max(fitScale * camera.zoom * scale, 1e-9)))
             let paperStart = DispatchTime.now().uptimeNanoseconds
             try mr.renderLivePaperBackground(
                 paperColor: getPaperColor(for: art.paperTextureId),
@@ -302,7 +320,8 @@ extension Renderer {
                 // instead because it works directly in canvas pixels.
                 tileScale: 1,
                 documentFromCanvas: documentFromCanvas,
-                width: width, height: height)
+                width: width, height: height,
+                viewRelZoom: viewRelZoom)
             mr.liveTiming.paperMilliseconds += MetalRenderer.milliseconds(since: paperStart)
             
             guard let device = mr.device,

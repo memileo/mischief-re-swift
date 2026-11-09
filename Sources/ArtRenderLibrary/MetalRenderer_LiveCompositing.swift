@@ -39,9 +39,21 @@ struct LivePaperParams {
     var hasTexture: Float
     var tileW: Float, tileH: Float          // paper tile size in *document* units
     var canvasW: Float, canvasH: Float
-    // canvas pixels -> document units, so the paper is pinned to the document
+    // canvas pixels -> document units, *full camera mapping (translation
+    // included)*: the pattern is anchored to the document, so it translates with
+    // the view and zooms around the camera's zoom point like the strokes
     var m00: Float, m01: Float, m02: Float
     var m10: Float, m11: Float, m12: Float
+    // Recursive tile blending range: the fine level's apparent
+    // size sweeps [minScale, maxScale] per octave of magnification. referenceScale
+    // is that ratio at the reference state (the file's saved view at 1:1).
+    var minScale: Float
+    var maxScale: Float
+    var referenceScale: Float
+    // log2 magnification relative to the reference state (0 == saved view)
+    var viewRelZoom: Float
+    // Pattern offset in document points; tunable only, never view-derived
+    var offsetX: Float, offsetY: Float
 }
 
 // Must match `LiveStrokeParams` in segmentKernels.metal byte for byte. Scalars only: an
@@ -3107,17 +3119,26 @@ extension MetalRenderer {
     ///
     /// - Parameters:
     ///   - documentFromCanvas: canvas pixels → canvas points (identity for the raster
-    ///     path, `camera⁻¹ ∘ scale⁻¹` when the canvas *is* the viewport). The paper is
-    ///     tiled in canvas space so it is anchored to the page, not to the glass.
+    ///     path, `camera⁻¹ ∘ scale⁻¹` when the canvas *is* the viewport). The full
+    ///     matrix, translation included, so the paper is tiled in document space:
+    ///     anchored to the page, not to the glass. Phase nudges go through `offsetX/Y`.
     ///   - tileScale: extra multiplier on the tile size; pass the render `scale` for
     ///     the legacy (canvas-space) tiling, 1 for document-space tiling.
+    ///   - viewRelZoom: log2 of the document's on-screen magnification relative to
+    ///     the reference state the `referenceScale` was calibrated at (0 for bakes).
     func renderLivePaperBackground(paperColor: (r: CGFloat, g: CGFloat, b: CGFloat),
                                    paperStrength: Float,
                                    backgroundColor: [UInt8],
                                    paperTextureData: [UInt8],
                                    tileScale: CGFloat,
                                    documentFromCanvas: CGAffineTransform,
-                                   width: Int, height: Int) throws {
+                                   width: Int, height: Int,
+                                   minScale: Float = 0.75,
+                                   maxScale: Float = 1.5,
+                                   referenceScale: Float = 2 / 3,
+                                   viewRelZoom: Float = 0,
+                                   offsetX: Float = 0,
+                                   offsetY: Float = 0) throws {
         guard let pipeline = livePaperBackgroundPipeline else {
             throw MetalRendererError.pipelineMissing("livePaperBackgroundKernel")
         }
@@ -3132,9 +3153,8 @@ extension MetalRenderer {
         var tileW: Float = 0, tileH: Float = 0
         
         if hasTexture, let paper = livePaperTexture {
-            // Same tile size as the CoreGraphics path: image size × 0.666 × tileScale.
-            tileW = Float(paper.width) * 0.666 * Float(tileScale)
-            tileH = Float(paper.height) * 0.666 * Float(tileScale)
+            tileW = Float(paper.width) * Float(tileScale)
+            tileH = Float(paper.height) * Float(tileScale)
         } else if !paperTextureData.isEmpty {
             print("Live view: paper texture could not be decoded — using flat paper colour")
         }
@@ -3149,7 +3169,9 @@ extension MetalRenderer {
             tileW: tileW, tileH: tileH,
             canvasW: Float(width), canvasH: Float(height),
             m00: Float(documentFromCanvas.a), m01: Float(documentFromCanvas.c), m02: Float(documentFromCanvas.tx),
-            m10: Float(documentFromCanvas.b), m11: Float(documentFromCanvas.d), m12: Float(documentFromCanvas.ty))
+            m10: Float(documentFromCanvas.b), m11: Float(documentFromCanvas.d), m12: Float(documentFromCanvas.ty),
+            minScale: minScale, maxScale: maxScale, referenceScale: referenceScale,
+            viewRelZoom: viewRelZoom, offsetX: offsetX, offsetY: offsetY)
         
         encoder.setComputePipelineState(pipeline)
         encoder.setBytes(&params, length: MemoryLayout<LivePaperParams>.stride, index: 0)
@@ -3160,7 +3182,7 @@ extension MetalRenderer {
         } else if let placeholder = Self.makePlaceholderTexture(device: device) {
             encoder.setTexture(placeholder, index: 0)
         }
-        if let sampler = linearSampler { encoder.setSamplerState(sampler, index: 0) }
+        if let sampler = paperSampler { encoder.setSamplerState(sampler, index: 0) }
         encoder.setTexture(target, index: 1)
         
         encoder.dispatchThreadgroups(Self.liveGroups(width: width, height: height),
@@ -3173,7 +3195,8 @@ extension MetalRenderer {
     }
     
     /// Decodes the art file's embedded paper JPEG into a texture (CPU decoding only —
-    /// tiling and compositing happen in the shader).
+    /// tiling and compositing happen in the shader, sampled at base level with
+    /// repeat wrap).
     @discardableResult
     func uploadLivePaperTexture(data: [UInt8]) -> Bool {
         guard !data.isEmpty,
@@ -3185,7 +3208,7 @@ extension MetalRenderer {
         livePaperTexture = texture
         return true
     }
-    
+
     /// Uploads any CGImage as an RGBA8 texture usable by the live kernels.
     private static func makeRGBA8Texture(from image: CGImage, device: MTLDevice?) -> MTLTexture? {
         guard let device = device else { return nil }

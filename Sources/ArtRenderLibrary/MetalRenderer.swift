@@ -316,6 +316,7 @@ internal final class LiveBinRefLayer {
     
     // Samplers
     internal let linearSampler: MTLSamplerState?
+    internal let paperSampler: MTLSamplerState?
     
     // Configuration
     internal var tileSize = 32  // Coarse tile size for spatial indexing (override via ART_TILE_SIZE for tuning)
@@ -390,6 +391,19 @@ internal final class LiveBinRefLayer {
         samplerDescriptor.normalizedCoordinates = true
         
         self.linearSampler = device.makeSamplerState(descriptor: samplerDescriptor)
+        
+        // Paper-texture sampler: repeat wrap + base-level sampling so the paper
+        // kernel reads stable, document-anchored tiles (see the kernel comments).
+        let paperSamplerDescriptor = MTLSamplerDescriptor()
+        paperSamplerDescriptor.minFilter = .linear
+        paperSamplerDescriptor.magFilter = .linear
+        paperSamplerDescriptor.mipFilter = .notMipmapped
+        paperSamplerDescriptor.sAddressMode = .repeat
+        paperSamplerDescriptor.tAddressMode = .repeat
+        paperSamplerDescriptor.rAddressMode = .repeat
+        paperSamplerDescriptor.normalizedCoordinates = true
+        
+        self.paperSampler = device.makeSamplerState(descriptor: paperSamplerDescriptor)
         
         // Now create pipelines after sampler is available
         do {
